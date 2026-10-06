@@ -3,6 +3,8 @@ import argparse
 import base64
 import datetime as dt
 import dataclasses
+from contextlib import contextmanager
+from collections import deque
 import enum
 from email.parser import BytesParser
 from email.policy import default as email_policy_default
@@ -169,14 +171,82 @@ def now_ts():
     return int(time.time())
 
 
-def atomic_write_text(path, text, mode=None):
+def close_terminal_process(pid, fd):
+    """The terminal reader owns both the PTY descriptor and child reaping."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+        try:
+            # Reap first so an already exited child is never signalled again.
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except ChildProcessError:
+            return
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    return
+            except ChildProcessError:
+                return
+            time.sleep(0.05)
+    # SIGKILL has been sent; collect the child rather than leaving a zombie.
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def expire_ssh_http_sessions():
+    now = now_ts()
+    with SSH_HTTP_LOCK:
+        for sid, session in list(SSH_HTTP_SESSIONS.items()):
+            with session["lock"]:
+                expired = now - session["last_seen"] > 15 * 60
+                closed = not session["alive"] and now - session.get("closed_at", now) > 60
+                if expired or closed:
+                    session["alive"] = False
+                    SSH_HTTP_SESSIONS.pop(sid, None)
+
+
+def stop_ssh_http_sessions():
+    with SSH_HTTP_LOCK:
+        sessions = list(SSH_HTTP_SESSIONS.values())
+        SSH_HTTP_SESSIONS.clear()
+        for session in sessions:
+            with session["lock"]:
+                session["alive"] = False
+    for session in sessions:
+        thread = session.get("thread")
+        if thread and thread.ident is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+
+@contextmanager
+def atomic_output_path(path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    if mode is not None:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False) as output:
+            tmp = Path(output.name)
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def atomic_write_text(path, text, mode=None):
+    with atomic_output_path(path) as tmp:
+        tmp.write_text(text, encoding="utf-8")
+        if mode is not None:
+            os.chmod(tmp, mode)
 
 
 def iso_time(ts):
@@ -1127,13 +1197,16 @@ def oauth_fetch_json(url, method="GET", headers=None, data=None):
             body = response.read().decode("utf-8", "replace")
             return json.loads(body or "{}")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
         try:
-            detail = json.loads(body or "{}")
-        except Exception:
-            detail = {"error": body[:400] or exc.reason}
-        message = detail.get("error_description") or detail.get("error") or detail.get("message") or exc.reason
-        raise ValueError(str(message or "OAuth HTTP error"))
+            body = exc.read().decode("utf-8", "replace")
+            try:
+                detail = json.loads(body or "{}")
+            except Exception:
+                detail = {"error": body[:400] or exc.reason}
+            message = detail.get("error_description") or detail.get("error") or detail.get("message") or exc.reason
+            raise ValueError(str(message or "OAuth HTTP error"))
+        finally:
+            exc.close()
     except Exception as exc:
         raise ValueError(str(exc))
 
@@ -2310,8 +2383,9 @@ def push_payload_for_notification(item):
 def send_web_push(subscription, payload):
     if not web_push_ready():
         return "unavailable"
+    response = None
     try:
-        webpush(
+        response = webpush(
             subscription_info={
                 "endpoint": subscription.get("endpoint"),
                 "keys": subscription.get("keys") or {},
@@ -2339,6 +2413,9 @@ def send_web_push(subscription, payload):
         if detail:
             return f"error:{status_code or exc.__class__.__name__}:{detail}"
         return f"error:{status_code or exc.__class__.__name__}"
+    finally:
+        if response is not None:
+            response.close()
 
 
 def push_result_message(result, subscription=None):
@@ -3027,11 +3104,21 @@ def encode_router_notes_entries(entries):
     )
 
 
+@contextmanager
 def connect(db_path=DB_PATH):
+    """Own the connection: commit/rollback the transaction, then always close.
+
+    SQLite's native context manager handles transactions only; it does not close
+    the connection. Keep every DB operation inside this managed context.
+    """
     ensure_state()
     conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db(conn):
@@ -3373,30 +3460,19 @@ def copy_sqlite_backup(src_path, dst_path):
     src_path.parent.mkdir(parents=True, exist_ok=True)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     if not src_path.exists():
-        conn = connect(src_path)
-        try:
+        with connect(src_path) as conn:
             init_db(conn)
-        finally:
-            conn.close()
-    source = sqlite3.connect(str(src_path))
-    dest = sqlite3.connect(str(dst_path))
-    try:
+    with connect(src_path) as source, connect(dst_path) as dest:
         source.backup(dest)
-    finally:
-        dest.close()
-        source.close()
 
 
 def write_private_bytes(path, data, mode=0o600):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_bytes(data)
-    try:
-        os.chmod(tmp, mode)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    with atomic_output_path(path) as tmp:
+        tmp.write_bytes(data)
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
 
 
 def create_hub_backup(out_path, db_path=DB_PATH):
@@ -3427,17 +3503,16 @@ def create_hub_backup(out_path, db_path=DB_PATH):
             "files": files,
         }
         (tmp_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_archive = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(tmp_dir / "manifest.json", arcname="manifest.json")
-            for item in state_dir.iterdir():
-                if item.is_file():
-                    tar.add(item, arcname=f"state/{item.name}")
-        try:
-            os.chmod(tmp_archive, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp_archive, out_path)
+        with atomic_output_path(out_path) as tmp_archive:
+            with tarfile.open(tmp_archive, "w:gz") as tar:
+                tar.add(tmp_dir / "manifest.json", arcname="manifest.json")
+                for item in state_dir.iterdir():
+                    if item.is_file():
+                        tar.add(item, arcname=f"state/{item.name}")
+            try:
+                os.chmod(tmp_archive, 0o600)
+            except OSError:
+                pass
     return {"path": str(out_path), "filename": out_path.name, "files": files}
 
 
@@ -3538,12 +3613,9 @@ def restore_hub_backup(archive_path, db_path=DB_PATH, vps_host="", public_url=""
             write_private_bytes(target, src.read_bytes())
             restored_files.append(str(target))
     rewritten = {}
-    conn = connect(db_path)
-    try:
+    with connect(db_path) as conn:
         init_db(conn)
         rewritten = rewrite_router_endpoints(conn, vps_host=vps_host, public_url=public_url)
-    finally:
-        conn.close()
     xray = None
     try:
         xray = reload_vps_xray(db_path)
@@ -4044,12 +4116,9 @@ def make_router_xray_config(row):
 def reload_vps_xray(db_path=DB_PATH):
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
-    conn = connect(db_path)
-    try:
+    with connect(db_path) as conn:
         init_db(conn)
         rows = list_router_rows(conn)
-    finally:
-        conn.close()
     config = make_server_xray_config(rows)
     atomic_write_text(out, json.dumps(config, ensure_ascii=False, indent=2) + "\n", mode=0o600)
     try:
@@ -13613,10 +13682,11 @@ class App:
         self.router_monitor_stop = threading.Event()
         self.router_monitor_thread = None
 
+    @contextmanager
     def conn(self):
-        conn = connect(self.db_path)
-        init_db(conn)
-        return conn
+        with connect(self.db_path) as conn:
+            init_db(conn)
+            yield conn
 
     def snapshot_router_states(self):
         with self.conn() as conn:
@@ -13649,12 +13719,16 @@ class App:
 
     def router_state_monitor_loop(self):
         interval = max(3, int(os.environ.get("OWRT_REMOTE_ROUTER_NOTIFY_POLL", "5")))
-        self.prime_router_state_snapshot()
+        try:
+            self.prime_router_state_snapshot()
+        except Exception as exc:
+            print(f"WARNING: router state monitor initialization error: {exc}", file=sys.stderr)
         while not self.router_monitor_stop.wait(interval):
             try:
                 self.check_router_state_changes()
             except Exception as exc:
                 print(f"WARNING: router state monitor error: {exc}", file=sys.stderr)
+            expire_ssh_http_sessions()
 
     def start_router_state_monitor(self):
         if self.router_monitor_thread and self.router_monitor_thread.is_alive():
@@ -13665,6 +13739,9 @@ class App:
 
     def stop_router_state_monitor(self):
         self.router_monitor_stop.set()
+        thread = self.router_monitor_thread
+        if thread and thread.ident is not None and thread is not threading.current_thread():
+            thread.join(timeout=10)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -13891,19 +13968,33 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
             chunks = []
             while True:
-                line = self.rfile.readline().strip()
-                if not line:
-                    continue
+                raw_line = self.rfile.readline()
+                if not raw_line:
+                    raise ValueError("incomplete chunked request body")
+                line = raw_line.strip()
                 size = int(line.split(b";", 1)[0], 16)
+                if size < 0:
+                    raise ValueError("negative chunk size")
                 if size == 0:
-                    while self.rfile.readline().strip():
-                        pass
+                    while True:
+                        trailer = self.rfile.readline()
+                        if not trailer:
+                            raise ValueError("incomplete chunked request trailers")
+                        if trailer == b"\r\n":
+                            break
                     break
-                chunks.append(self.rfile.read(size))
-                self.rfile.read(2)
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                    raise ValueError("incomplete chunked request data")
+                chunks.append(chunk)
             return b"".join(chunks)
         length = int(self.headers.get("Content-Length", "0") or "0")
-        return self.rfile.read(length) if length else b""
+        if length < 0:
+            raise ValueError("negative content length")
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            raise ValueError("incomplete request body")
+        return body
 
     def read_payload(self):
         body = self.read_body()
@@ -15358,15 +15449,19 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
             return None
         askpass_dir = Path(tempfile.mkdtemp(prefix="owrt-askpass-"))
         askpass_script = askpass_dir / "askpass.sh"
-        askpass_script.write_text(
-            "#!/bin/sh\nprintf '%s\\n' \"$OWRT_REMOTE_SSH_PASSWORD\"\n",
-            encoding="utf-8",
-        )
-        os.chmod(askpass_script, 0o700)
-        env["SSH_ASKPASS"] = str(askpass_script)
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        env["DISPLAY"] = env.get("DISPLAY") or "owrt-remote:0"
-        env["OWRT_REMOTE_SSH_PASSWORD"] = password
+        try:
+            askpass_script.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$OWRT_REMOTE_SSH_PASSWORD\"\n",
+                encoding="utf-8",
+            )
+            os.chmod(askpass_script, 0o700)
+            env["SSH_ASKPASS"] = str(askpass_script)
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = env.get("DISPLAY") or "owrt-remote:0"
+            env["OWRT_REMOTE_SSH_PASSWORD"] = password
+        except BaseException:
+            shutil.rmtree(askpass_dir)
+            raise
         return askpass_dir
 
     def normalize_wol_mac(self, value):
@@ -15389,8 +15484,8 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         password = str(ssh_password or "")
         env, args = self.ssh_exec_args(port, allow_password=bool(password))
         askpass_dir = self.prepare_ssh_askpass(env, password)
-        argv = args + ["sh", "-s", "--"] + [str(item) for item in (script_args or [])]
         try:
+            argv = args + ["sh", "-s", "--"] + [str(item) for item in (script_args or [])]
             result = subprocess.run(
                 argv,
                 input=str(script),
@@ -16148,13 +16243,19 @@ exit 127
                 os._exit(127)
         return pid, fd
 
-    def ssh_http_reader(self, sid):
-        session = SSH_HTTP_SESSIONS.get(sid)
+    def ssh_http_reader(self, sid, session=None):
+        # Pass ownership directly: the map may be cleared before the thread runs.
+        if session is None:
+            with SSH_HTTP_LOCK:
+                session = SSH_HTTP_SESSIONS.get(sid)
         if not session:
             return
         fd = session["fd"]
         try:
             while True:
+                with session["lock"]:
+                    if not session["alive"] or now_ts() - session["last_seen"] > 15 * 60:
+                        break
                 ready, _, _ = select.select([fd], [], [], 0.5)
                 if fd not in ready:
                     with session["lock"]:
@@ -16171,31 +16272,35 @@ exit 127
                     break
                 with session["lock"]:
                     session["buffer"].append(data.decode("utf-8", errors="replace"))
-                    session["last_seen"] = now_ts()
         finally:
             with session["lock"]:
                 session["alive"] = False
+                session["closed_at"] = now_ts()
                 session["buffer"].append("\r\n[" + session.get("close_notice", "SSH соединение закрыто") + "]\r\n")
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.waitpid(session["pid"], os.WNOHANG)
-            except OSError:
-                pass
+            close_terminal_process(session["pid"], fd)
+
+    def launch_ssh_http_reader(self, session):
+        sid = session["id"]
+        try:
+            thread = threading.Thread(target=self.ssh_http_reader, args=(sid, session), daemon=True)
+            session["thread"] = thread
+            with SSH_HTTP_LOCK:
+                SSH_HTTP_SESSIONS[sid] = session
+            thread.start()
+        except BaseException:
+            with SSH_HTTP_LOCK:
+                SSH_HTTP_SESSIONS.pop(sid, None)
+            close_terminal_process(session["pid"], session["fd"])
+            raise
 
     def start_ssh_http_session(self, router_id, port):
         env, args = self.ssh_args(port)
-        pid, fd = self.spawn_terminal_pty(env, args, "pty недоступен на VPS", "не удалось открыть SSH pty", "ssh")
         sid = secrets.token_urlsafe(24)
         session = {
             "id": sid,
             "router_id": router_id,
             "port": port,
-            "pid": pid,
-            "fd": fd,
-            "buffer": [],
+            "buffer": deque(maxlen=256),
             "alive": True,
             "created": now_ts(),
             "last_seen": now_ts(),
@@ -16203,22 +16308,18 @@ exit 127
             "label": "SSH",
             "close_notice": "SSH соединение закрыто",
         }
-        with SSH_HTTP_LOCK:
-            SSH_HTTP_SESSIONS[sid] = session
-        threading.Thread(target=self.ssh_http_reader, args=(sid,), daemon=True).start()
+        session["pid"], session["fd"] = self.spawn_terminal_pty(env, args, "pty недоступен на VPS", "не удалось открыть SSH pty", "ssh")
+        self.launch_ssh_http_reader(session)
         return session
 
     def start_vps_http_session(self):
         env, args = self.vps_shell_args()
-        pid, fd = self.spawn_terminal_pty(env, args, "pty недоступен на VPS", "не удалось открыть VPS pty", "vps-shell")
         sid = secrets.token_urlsafe(24)
         session = {
             "id": sid,
             "router_id": VPS_TERMINAL_ID,
             "port": 0,
-            "pid": pid,
-            "fd": fd,
-            "buffer": [],
+            "buffer": deque(maxlen=256),
             "alive": True,
             "created": now_ts(),
             "last_seen": now_ts(),
@@ -16226,9 +16327,8 @@ exit 127
             "label": "VPS terminal",
             "close_notice": "VPS terminal закрыт",
         }
-        with SSH_HTTP_LOCK:
-            SSH_HTTP_SESSIONS[sid] = session
-        threading.Thread(target=self.ssh_http_reader, args=(sid,), daemon=True).start()
+        session["pid"], session["fd"] = self.spawn_terminal_pty(env, args, "pty недоступен на VPS", "не удалось открыть VPS pty", "vps-shell")
+        self.launch_ssh_http_reader(session)
         return session
 
     def ssh_http_session(self):
@@ -16292,17 +16392,24 @@ exit 127
         data = payload.get("data", "")
         if not isinstance(data, str):
             data = str(data)
-        with session["lock"]:
-            alive = bool(session["alive"])
-            fd = session["fd"]
-        if not alive:
-            self.send_json(409, {"ok": False, "error": "terminal session closed"})
-            return
+        fd = None
         try:
+            with session["lock"]:
+                if session["alive"]:
+                    session["last_seen"] = now_ts()
+                    # Own a temporary descriptor while writing, so reader cleanup
+                    # cannot close/reuse it and terminal output remains unblocked.
+                    fd = os.dup(session["fd"])
+            if fd is None:
+                self.send_json(409, {"ok": False, "error": "terminal session closed"})
+                return
             write_pty_all(fd, data)
             self.send_json(200, {"ok": True})
         except Exception as exc:
             self.send_json(500, {"ok": False, "error": str(exc)})
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def ssh_http_resize(self, sid, payload=None):
         with SSH_HTTP_LOCK:
@@ -16312,7 +16419,12 @@ exit 127
             return
         if payload is None:
             payload = self.read_payload()
-        ok = set_pty_size(session["fd"], payload.get("rows", 24), payload.get("cols", 80))
+        with session["lock"]:
+            if not session["alive"]:
+                self.send_json(409, {"ok": False, "error": "terminal session closed"})
+                return
+            session["last_seen"] = now_ts()
+            ok = set_pty_size(session["fd"], payload.get("rows", 24), payload.get("cols", 80))
         self.send_json(200, {"ok": bool(ok)})
 
     def ssh_http_write_short(self):
@@ -16333,10 +16445,6 @@ exit 127
             return
         with session["lock"]:
             session["alive"] = False
-        try:
-            os.kill(session["pid"], signal.SIGHUP)
-        except OSError:
-            pass
         self.send_json(200, {"ok": True})
 
     def ssh_session_action(self, path):
@@ -16380,8 +16488,8 @@ exit 127
         except Exception as exc:
             ws_send_frame(self.connection, f"{exc}\r\n")
             return
-        ws_send_frame(self.connection, "")
         try:
+            ws_send_frame(self.connection, "")
             while True:
                 ready, _, _ = select.select([self.connection, fd], [], [], 0.25)
                 if fd in ready:
@@ -16415,18 +16523,7 @@ exit 127
             except Exception:
                 pass
         finally:
-            try:
-                os.kill(pid, signal.SIGHUP)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except OSError:
-                pass
+            close_terminal_process(pid, fd)
 
     def run_ssh_session(self, router_id, port):
         env, args = self.ssh_args(port)
@@ -17483,11 +17580,11 @@ exit 127
                 try:
                     backend = http.client.HTTPConnection("127.0.0.1", port, timeout=PROXY_TIMEOUT)
                     backend.request(self.command, target, body=body, headers=headers)
-                    resp = backend.getresponse()
-                    resp_status = resp.status
-                    resp_raw_headers = resp.getheaders()
-                    resp_body = resp.read()
-                    content_type = resp.getheader("Content-Type", "")
+                    with backend.getresponse() as resp:
+                        resp_status = resp.status
+                        resp_raw_headers = resp.getheaders()
+                        resp_body = resp.read()
+                        content_type = resp.getheader("Content-Type", "")
                     last_exc = None
                     break
                 except Exception as exc:
@@ -18029,6 +18126,9 @@ class HubHTTPServer(ThreadingHTTPServer):
     def get_request(self):
         request, client_address = super().get_request()
         try:
+            # Bound incomplete HTTP/TLS/WebSocket reads without expiring an idle
+            # terminal (the terminal's select loop only reads when data arrives).
+            request.settimeout(90)
             request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
@@ -18037,19 +18137,23 @@ class HubHTTPServer(ThreadingHTTPServer):
 
 def make_http_server(app, host, port, tls_cert="", tls_key=""):
     server = HubHTTPServer((host, port), Handler)
-    server.app = app
-    server.is_tls = False
-    if tls_cert and tls_key:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.set_alpn_protocols(["http/1.1"])
-        context.load_cert_chain(tls_cert, tls_key)
-        server.socket = context.wrap_socket(
-            server.socket,
-            server_side=True,
-            do_handshake_on_connect=False,
-        )
-        server.is_tls = True
-    return server
+    try:
+        server.app = app
+        server.is_tls = False
+        if tls_cert and tls_key:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.set_alpn_protocols(["http/1.1"])
+            context.load_cert_chain(tls_cert, tls_key)
+            server.socket = context.wrap_socket(
+                server.socket,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
+            server.is_tls = True
+        return server
+    except BaseException:
+        server.server_close()
+        raise
 
 
 def cmd_serve(args):
@@ -18057,52 +18161,57 @@ def cmd_serve(args):
     with app.conn():
         pass
     record_hub_start_event()
-    app.start_router_state_monitor()
     auth = load_auth()
     server = make_http_server(app, args.host, args.port)
     extra_servers = []
-    tls_ports = parse_extra_ports(args.tls_ports) if args.tls_cert and args.tls_key else []
-    tls_port_set = set(tls_ports)
-    for port in parse_extra_ports(args.extra_ports):
-        if port == args.port:
-            continue
-        if port in tls_port_set:
-            print(f"WARNING: port {port} skipped for plain HTTP because TLS is enabled on it", file=sys.stderr)
-            continue
+
+    def start_extra(port, tls=False):
+        extra = make_http_server(app, args.host, port, args.tls_cert if tls else "", args.tls_key if tls else "")
         try:
-            extra_server = make_http_server(app, args.host, port)
-        except OSError as exc:
-            print(f"WARNING: extra port {port} not started: {exc}", file=sys.stderr)
-            continue
-        extra_servers.append(extra_server)
-        thread = threading.Thread(target=extra_server.serve_forever, daemon=True)
-        thread.start()
-        print(f"{APP_NAME} also listening on http://{args.host}:{port}")
-    if args.tls_cert and args.tls_key:
+            thread = threading.Thread(target=extra.serve_forever, daemon=True)
+            thread.start()
+        except BaseException:
+            extra.server_close()
+            raise
+        extra_servers.append((extra, thread))
+
+    try:
+        app.start_router_state_monitor()
+        tls_ports = parse_extra_ports(args.tls_ports) if args.tls_cert and args.tls_key else []
+        tls_port_set = set(tls_ports)
+        for port in parse_extra_ports(args.extra_ports):
+            if port == args.port:
+                continue
+            if port in tls_port_set:
+                print(f"WARNING: port {port} skipped for plain HTTP because TLS is enabled on it", file=sys.stderr)
+                continue
+            try:
+                start_extra(port)
+            except OSError as exc:
+                print(f"WARNING: extra port {port} not started: {exc}", file=sys.stderr)
+                continue
+            print(f"{APP_NAME} also listening on http://{args.host}:{port}")
         for port in tls_ports:
             try:
-                tls_server = make_http_server(app, args.host, port, args.tls_cert, args.tls_key)
-            except OSError as exc:
+                start_extra(port, tls=True)
+            except (OSError, ssl.SSLError) as exc:
                 print(f"WARNING: HTTPS port {port} not started: {exc}", file=sys.stderr)
                 continue
-            except ssl.SSLError as exc:
-                print(f"WARNING: HTTPS cert/key error: {exc}", file=sys.stderr)
-                continue
-            extra_servers.append(tls_server)
-            thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
-            thread.start()
             print(f"{APP_NAME} also listening on https://{args.host}:{port}")
-    print(f"{APP_NAME} listening on http://{args.host}:{args.port}")
-    print(f"HUB_LOGIN: {auth.get('username', 'admin')}")
-    print(f"AGENT_TOKEN: {app.agent_token}")
-    try:
+        print(f"{APP_NAME} listening on http://{args.host}:{args.port}")
+        print(f"HUB_LOGIN: {auth.get('username', 'admin')}")
+        print(f"AGENT_TOKEN: {app.agent_token}")
         server.serve_forever()
     except KeyboardInterrupt:
         print("")
     finally:
         app.stop_router_state_monitor()
-        for extra_server in extra_servers:
+        stop_ssh_http_sessions()
+        for extra_server, thread in extra_servers:
             extra_server.shutdown()
+            extra_server.server_close()
+            thread.join(timeout=5)
+        server.server_close()
 
 
 def parser():
