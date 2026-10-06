@@ -145,7 +145,7 @@ password: admin
 <h3> VPS: поставить Hub, Xray, firewall и HTTPS одной командой</h3>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/install-vps.sh?v=$(date +%s)" | sudo sh
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/install-vps.sh?v=$(date +%s)" | sudo sh
 ```
 
 Установщик спросит:
@@ -165,7 +165,7 @@ hub.example.com
 <h3> OpenWrt: поставить Remote Hub на роутер</h3>
 
 ```sh
-wget -O - "https://hub.freedev.app/install.sh?v=$(date +%s)" | sh
+wget -O - "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/install.sh?v=$(date +%s)" | sh
 ```
 
 Проверка на роутере:
@@ -426,7 +426,7 @@ flowchart LR
 </div>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/install-vps.sh?v=$(date +%s)" | sudo env RESET_LOGIN=0 sh
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/install-vps.sh?v=$(date +%s)" | sudo env RESET_LOGIN=0 sh
 ```
 
 <div align="center">
@@ -436,7 +436,7 @@ curl -fsSL "https://hub.freedev.app/vps/install-vps.sh?v=$(date +%s)" | sudo env
 </div>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- YOUR_VPS_IP
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- YOUR_VPS_IP
 ```
 
 </details>
@@ -482,7 +482,7 @@ Hub работает внутри на <code>80</code> и <code>8088</code>, а 
 </div>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- YOUR_VPS_IP
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- YOUR_VPS_IP
 ```
 
 <div align="center">
@@ -492,7 +492,7 @@ curl -fsSL "https://hub.freedev.app/vps/enable-https.sh?v=$(date +%s)" | sudo sh
 </div>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/enable-https.sh?v=$(date +%s)" | sudo EMAIL="you@example.com" sh -s -- hub.example.com
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/enable-https.sh?v=$(date +%s)" | sudo EMAIL="you@example.com" sh -s -- hub.example.com
 ```
 
 <div align="center">
@@ -719,7 +719,7 @@ sudo ss -lntp | grep -E ':(80|443|8088)'
 <summary align="center"><b> Удалить Hub с VPS полностью</b></summary>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/uninstall-vps.sh?v=$(date +%s)" | sudo sh
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/uninstall-vps.sh?v=$(date +%s)" | sudo sh
 ```
 
 <div align="center">
@@ -743,7 +743,7 @@ nginx-конфиг HTTPS, certbot renewal hook и старые TLS override-фа
 </div>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/uninstall-vps.sh?v=$(date +%s)" | sudo env PURGE=0 sh
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/uninstall-vps.sh?v=$(date +%s)" | sudo env PURGE=0 sh
 ```
 
 <div align="center">
@@ -753,7 +753,7 @@ curl -fsSL "https://hub.freedev.app/vps/uninstall-vps.sh?v=$(date +%s)" | sudo e
 </div>
 
 ```sh
-curl -fsSL "https://hub.freedev.app/vps/uninstall-vps.sh?v=$(date +%s)" | sudo env REMOVE_XRAY=1 sh
+curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/uninstall-vps.sh?v=$(date +%s)" | sudo env REMOVE_XRAY=1 sh
 ```
 
 </details>
@@ -762,7 +762,7 @@ curl -fsSL "https://hub.freedev.app/vps/uninstall-vps.sh?v=$(date +%s)" | sudo e
 <summary align="center"><b> Удалить агент с OpenWrt полностью</b></summary>
 
 ```sh
-wget -O - "https://hub.freedev.app/uninstall.sh?v=$(date +%s)" | PURGE=1 sh
+wget -O - "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/uninstall.sh?v=$(date +%s)" | PURGE=1 sh
 ```
 
 <div align="center">
@@ -787,7 +787,7 @@ rpcd ACL<br>
 </div>
 
 ```sh
-wget -O - "https://hub.freedev.app/uninstall.sh?v=$(date +%s)" | sh
+wget -O - "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/uninstall.sh?v=$(date +%s)" | sh
 ```
 
 </details>

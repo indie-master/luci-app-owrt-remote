@@ -4,7 +4,7 @@ export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 
 CONFIG="owrtremote"
 SECTION="main"
-XRAY_RELEASE_BASE_URL="${XRAY_RELEASE_BASE_URL:-https://hub.freedev.app/xray-core/releases/latest/download}"
+XRAY_RELEASE_BASE_URL="${XRAY_RELEASE_BASE_URL:-https://github.com/XTLS/Xray-core/releases/latest/download}"
 
 log() {
 	printf '%s\n' "$*" >&2

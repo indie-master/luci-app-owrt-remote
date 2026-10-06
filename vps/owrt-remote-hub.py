@@ -65,7 +65,7 @@ except Exception:
 
 
 APP_NAME = "OpenWrt Remote Hub"
-RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://hub.freedev.app").rstrip("/")
+RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main").rstrip("/")
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 BRAND_THEME_COLOR = "#24192f"
@@ -4279,7 +4279,7 @@ def vps_terminal_commands(host):
     return [
         {
             "title": "Обновить Hub",
-            "note": "Свежий hub.py с hub.freedev.app; обновление уходит в отдельный systemd-run",
+            "note": "Свежий hub.py из GitHub; обновление уходит в отдельный systemd-run",
             "command": f'u=owrt-remote-selfupdate-$(date +%s); systemd-run --unit=\"$u\" --collect /bin/sh -lc \'v=$(date +%s); curl -fsSL -o /opt/owrt-remote/owrt-remote-hub.py \"{RAW_REPO_BASE}/vps/owrt-remote-hub.py?v=$v\" && chmod +x /opt/owrt-remote/owrt-remote-hub.py && systemctl restart owrt-remote\' && echo \"$u started; reopen VPS terminal in 3-5 sec\"',
         },
         {
@@ -4857,7 +4857,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
                   </div>
                   <div class="backupCmd">
                     <strong>2. Поднять Hub на новой VPS</strong>
-                    <pre>curl -fsSL "https://hub.freedev.app/vps/install-vps.sh?v=$(date +%s)" | sh</pre>
+                    <pre>curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/install-vps.sh?v=$(date +%s)" | sh</pre>
                   </div>
                   <div class="backupCmd">
                     <strong>3. Перенести архив на новую VPS</strong>

@@ -5,7 +5,7 @@ APP_NAME="OpenWrt Remote Hub"
 STATE_DIR="${OWRT_REMOTE_STATE_DIR:-/var/lib/owrt-remote}"
 PURGE="${PURGE:-1}"
 REMOVE_XRAY="${REMOVE_XRAY:-0}"
-XRAY_REMOVE_SCRIPT_URL="${XRAY_REMOVE_SCRIPT_URL:-https://hub.freedev.app/xray-install/install-release.sh}"
+XRAY_REMOVE_SCRIPT_URL="${XRAY_REMOVE_SCRIPT_URL:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}"
 
 if [ "$(id -u)" -eq 0 ]; then
 	SUDO=""
