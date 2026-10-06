@@ -4539,7 +4539,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div class="brand">
       <div class="desktopHeader">
         <div class="desktopHeaderTop">
-          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v108</span></span></h1>
+          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v109</span></span></h1>
           <div class="routerSearchDock" id="routerSearchDock">
             <button class="routerSearchToggle" id="routerSearchToggle" type="button" aria-expanded="false" aria-controls="routerSearchPanel" data-active="false">
               <span>Поиск роутеров</span>
@@ -4891,7 +4891,7 @@ systemctl restart owrt-remote-xray</pre>
       </div>
     </div>
     <div class="mobileSearchDock" id="mobileRouterSearchDock">
-      <span class="mobileSearchVersion">v108</span>
+      <span class="mobileSearchVersion">v109</span>
       <button class="routerSearchToggle mobilePanelToggle primary" id="mobileRouterSearchToggle" type="button" aria-expanded="false" aria-controls="mobileRouterSearchPanel" data-active="false">
         <span>Поиск роутеров</span>
       </button>
@@ -7546,7 +7546,7 @@ function render(list) {{
     const detailsId = 'router-details-' + String(r.id).replace(/[^a-zA-Z0-9_-]/g, '-');
     const collapseCards = mobileCardsMq.matches && !expandedCardDetails.has(detailsId);
     const groupHeading = idx === 0 || groupName(groupedList[idx - 1].group_id) !== groupName(r.group_id)
-      ? `<div class="routerGroupHeading"><span>${{escapeHtml(groupName(r.group_id))}}</span><em>${{groupedList.filter((item) => groupName(item.group_id) === groupName(r.group_id)).length}} роут.</em></div>`
+      ? `<div class="routerGroupHeading"><span>${{escapeHtml(groupName(r.group_id))}}</span><em>${{groupedList.filter((item) => groupName(item.group_id) === groupName(r.group_id)).length}} роутера</em></div>`
       : '';
     const metricsHtml = [
       renderModelMetric(model, modelGetsLegendBadge(model)),
@@ -7565,7 +7565,7 @@ function render(list) {{
         <div class="status ${{stateClass}}"><i></i>${{stateText}}</div>
       </div>
       <div class="nameRow"><div class="name">${{escapeHtml(r.name)}}</div>${{renameButton}}</div>
-      ${{collapseCards ? `<button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="false">Открыть данные</button>` : ''}}
+      ${{mobileCardsMq.matches ? `<button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="${{collapseCards ? 'false' : 'true'}}">${{collapseCards ? 'Открыть данные' : 'Скрыть данные'}}</button>` : ''}}
       <div class="cardBody" id="${{escapeAttr(detailsId)}}"${{collapseCards ? ' hidden' : ''}}>
       <div class="metrics">
         ${{metricsHtml}}
@@ -7734,7 +7734,7 @@ render = function(list) {{
     const groupOpen = openRouterGroups.has(groupKey);
     const groupCount = groupedList.filter((item) => groupName(item.group_id) === groupName(r.group_id)).length;
     const groupHeading = idx === 0 || groupName(groupedList[idx - 1].group_id) !== groupName(r.group_id)
-      ? `<div class="routerGroupHeading"><span>${{escapeHtml(groupName(r.group_id))}} <em>${{groupCount}} роут.</em></span><button class="btn routerGroupToggle" type="button" data-router-group-toggle="${{escapeAttr(groupKey)}}" aria-expanded="${{groupOpen ? 'true' : 'false'}}">${{groupOpen ? 'Скрыть группу' : 'Открыть группу'}}</button></div>`
+      ? `<div class="routerGroupHeading"><span>${{escapeHtml(groupName(r.group_id))}} <em>${{groupCount}} роутера</em></span><button class="btn routerGroupToggle" type="button" data-router-group-toggle="${{escapeAttr(groupKey)}}" aria-expanded="${{groupOpen ? 'true' : 'false'}}">${{groupOpen ? 'Скрыть группу' : 'Открыть группу'}}</button></div>`
       : '';
     const groupStart = idx === 0 || groupName(groupedList[idx - 1].group_id) !== groupName(r.group_id)
       ? `<section class="routerGroupSection" data-router-group-section="${{escapeAttr(groupKey)}}">${{groupHeading}}<div class="routerGroupCards"${{groupOpen ? '' : ' hidden'}}>`
@@ -7760,7 +7760,7 @@ render = function(list) {{
       </div>
       <div class="nameRow"><div class="name">${{escapeHtml(r.name)}}</div>${{renameButton}}</div>
       ${{groupSelectHtml}}
-      ${{collapseCards ? `<button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="false">Открыть данные</button>` : ''}}
+      ${{mobileCardsMq.matches ? `<button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="${{collapseCards ? 'false' : 'true'}}">${{collapseCards ? 'Открыть данные' : 'Скрыть данные'}}</button>` : ''}}
       <div class="cardBody" id="${{escapeAttr(detailsId)}}"${{collapseCards ? ' hidden' : ''}}>
       ${{notesPreview ? `<div class="notesPreview"><strong>Заметки:</strong> <span>${{escapeHtml(notesPreview)}}</span></div>` : ''}}
       <div class="metrics">
@@ -12241,7 +12241,7 @@ button:hover{{filter:brightness(1.06)}}
       <form class="login" method="post" action="/login">
     {error_html}
     <span class="brand">
-      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v108</span></span></h1>
+      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v109</span></span></h1>
     </span>
     <label for="hubUsername">Логин</label>
     <input id="hubUsername" name="username" autocomplete="off" autofocus required>
@@ -12713,7 +12713,7 @@ body::after{{content:"";position:fixed;inset:0;pointer-events:none;background:li
                 <circle cx="65" cy="59" r="3" fill="#E5F2FF"/>
               </svg>
             </div>
-            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v108</span></h2>
+            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v109</span></h2>
           </div>
         </div>
         <div class="brandBottom">
