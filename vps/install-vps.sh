@@ -273,7 +273,7 @@ print_result() {
 	if [ "${HTTPS_OK:-0}" != "1" ]; then
 		info ""
 		info "Включить HTTPS вручную:"
-		info '  curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- '"$host"
+		info '  curl -fsSL "https://gitlab.com/kzolotarev95/luci-app-owrt-remote/-/raw/main/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- '"$host"
 	fi
 	info "============================================================"
 }
