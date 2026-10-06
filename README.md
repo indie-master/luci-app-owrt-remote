@@ -426,7 +426,7 @@ flowchart LR
 </div>
 
 ```sh
-curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/install-vps.sh?v=$(date +%s)" | sudo env RESET_LOGIN=0 sh
+curl -fsSL "https://gitlab.com/kzolotarev95/luci-app-owrt-remote/-/raw/main/vps/install-vps.sh?v=$(date +%s)" | sudo env RESET_LOGIN=0 sh
 ```
 
 <div align="center">
@@ -436,7 +436,7 @@ curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/
 </div>
 
 ```sh
-curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- YOUR_VPS_IP
+curl -fsSL "https://gitlab.com/kzolotarev95/luci-app-owrt-remote/-/raw/main/vps/enable-https.sh?v=$(date +%s)" | sudo sh -s -- YOUR_VPS_IP
 ```
 
 </details>
