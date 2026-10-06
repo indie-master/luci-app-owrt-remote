@@ -5,6 +5,7 @@ APP_NAME="OpenWrt Remote Hub"
 STATE_DIR="${OWRT_REMOTE_STATE_DIR:-/var/lib/owrt-remote}"
 PURGE="${PURGE:-1}"
 REMOVE_XRAY="${REMOVE_XRAY:-0}"
+XRAY_REMOVE_SCRIPT_URL="${XRAY_REMOVE_SCRIPT_URL:-https://hub.freedev.app/xray-install/install-release.sh}"
 
 if [ "$(id -u)" -eq 0 ]; then
 	SUDO=""
@@ -44,7 +45,7 @@ remove_xray_binary() {
 		return
 	fi
 	info "Удаляю Xray binary через официальный installer..."
-	$SUDO bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove >/dev/null 2>&1 || true
+	$SUDO bash -c "$(curl -fsSL "$XRAY_REMOVE_SCRIPT_URL")" @ remove >/dev/null 2>&1 || true
 }
 
 main() {

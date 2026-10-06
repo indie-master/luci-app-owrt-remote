@@ -4,6 +4,7 @@ export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 
 CONFIG="owrtremote"
 SECTION="main"
+XRAY_RELEASE_BASE_URL="${XRAY_RELEASE_BASE_URL:-https://hub.freedev.app/xray-core/releases/latest/download}"
 
 log() {
 	printf '%s\n' "$*" >&2
@@ -443,7 +444,7 @@ install_xray_tmp() {
 	dir="/tmp/owrt-xray"
 	zip="$dir/xray.zip"
 	asset="$(xray_release_asset)" || die "не знаю готовый Xray asset для $(uname -m 2>/dev/null)"
-	url="https://github.com/XTLS/Xray-core/releases/latest/download/$asset"
+	url="$XRAY_RELEASE_BASE_URL/$asset"
 
 	mkdir -p /var/lock /var/run "$dir"
 	if ! command -v unzip >/dev/null 2>&1; then
@@ -991,7 +992,7 @@ install_xray_tmp() {
 		log "unknown Xray asset for $(uname -m 2>/dev/null)"
 		return 1
 	}
-	url="https://github.com/XTLS/Xray-core/releases/latest/download/$asset"
+	url="$XRAY_RELEASE_BASE_URL/$asset"
 
 	mkdir -p /var/lock /var/run "$dir"
 	if ! command -v unzip >/dev/null 2>&1; then

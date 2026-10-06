@@ -65,7 +65,7 @@ except Exception:
 
 
 APP_NAME = "OpenWrt Remote Hub"
-RAW_REPO_BASE = "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main"
+RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://hub.freedev.app").rstrip("/")
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 BRAND_THEME_COLOR = "#24192f"
@@ -3066,7 +3066,19 @@ def init_db(conn):
         )
         """
     )
+    conn.execute(
+        """
+        create table if not exists router_groups (
+            id text primary key,
+            name text not null,
+            sort_order integer not null default 0,
+            created_at integer not null,
+            updated_at integer not null
+        )
+        """
+    )
     ensure_column(conn, "routers", "custom_name", "text not null default ''")
+    ensure_column(conn, "routers", "group_id", "text not null default ''")
     ensure_column(conn, "routers", "deleted_at", "integer not null default 0")
     ensure_column(conn, "routers", "ssh_entry_port", "integer not null default 0")
     ensure_column(conn, "routers", "ssh_vless_uuid", "text not null default ''")
@@ -3090,6 +3102,45 @@ def init_db(conn):
                 (ssh_uuid, ssh_tag, row["id"]),
             )
     conn.commit()
+
+
+def clean_router_group_id(value):
+    return str(value or "").strip()[:80]
+
+
+def clean_router_group_name(value):
+    return " ".join(str(value or "").split())[:120]
+
+
+def list_router_groups(conn):
+    rows = conn.execute(
+        """
+        select g.id, g.name, g.sort_order, g.created_at, g.updated_at,
+               count(r.id) as router_count
+        from router_groups g
+        left join routers r on r.group_id = g.id and coalesce(r.deleted_at, 0) = 0
+        group by g.id
+        order by g.sort_order, lower(g.name), g.id
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def router_group_exists(conn, group_id):
+    group_id = clean_router_group_id(group_id)
+    if not group_id:
+        return True
+    return bool(conn.execute("select 1 from router_groups where id = ?", (group_id,)).fetchone())
+
+
+def make_router_group_id(conn, name):
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower(), flags=re.ASCII).strip("-") or "group"
+    candidate = base[:64]
+    suffix = 2
+    while conn.execute("select 1 from router_groups where id = ?", (candidate,)).fetchone():
+        candidate = f"{base[:55]}-{suffix}"
+        suffix += 1
+    return candidate
 
 
 def ensure_column(conn, table, column, definition):
@@ -3549,6 +3600,7 @@ def upsert_router(conn, values):
         "id": router_id,
         "name": values.get("name") or router_id,
         "role": values.get("role") or "node",
+        "group_id": clean_router_group_id(keep_str("group_id", "")),
         "entry_port": keep_int("entry_port", 0),
         "vps_host": keep_str("vps_host", ""),
         "vless_port": keep_int("vless_port", DEFAULT_VLESS_PORT),
@@ -3580,6 +3632,7 @@ def upsert_router(conn, values):
             update routers set
                 name = :name,
                 role = :role,
+                group_id = :group_id,
                 entry_port = :entry_port,
                 vps_host = :vps_host,
                 vless_port = :vless_port,
@@ -3608,13 +3661,13 @@ def upsert_router(conn, values):
         conn.execute(
             """
             insert into routers (
-                id, name, role, entry_port, vps_host, vless_port, vless_uuid,
+                id, name, role, group_id, entry_port, vps_host, vless_port, vless_uuid,
                 vless_encryption, vless_decryption, vless_flow, reverse_tag,
                 public_url, admin_host, admin_port, ssh_entry_port, ssh_vless_uuid,
                 ssh_reverse_tag, ssh_host, ssh_port, notes,
                 created_at, updated_at, deleted_at
             ) values (
-                :id, :name, :role, :entry_port, :vps_host, :vless_port, :vless_uuid,
+                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vless_uuid,
                 :vless_encryption, :vless_decryption, :vless_flow, :reverse_tag,
                 :public_url, :admin_host, :admin_port, :ssh_entry_port, :ssh_vless_uuid,
                 :ssh_reverse_tag, :ssh_host, :ssh_port, :notes,
@@ -4226,7 +4279,7 @@ def vps_terminal_commands(host):
     return [
         {
             "title": "Обновить Hub",
-            "note": "Свежий hub.py из main; обновление уходит в отдельный systemd-run",
+            "note": "Свежий hub.py с hub.freedev.app; обновление уходит в отдельный systemd-run",
             "command": f'u=owrt-remote-selfupdate-$(date +%s); systemd-run --unit=\"$u\" --collect /bin/sh -lc \'v=$(date +%s); curl -fsSL -o /opt/owrt-remote/owrt-remote-hub.py \"{RAW_REPO_BASE}/vps/owrt-remote-hub.py?v=$v\" && chmod +x /opt/owrt-remote/owrt-remote-hub.py && systemctl restart owrt-remote\' && echo \"$u started; reopen VPS terminal in 3-5 sec\"',
         },
         {
@@ -4447,7 +4500,7 @@ body::before{{content:"";position:fixed;inset:-25%;z-index:0;pointer-events:none
 .wrap{{position:relative;z-index:1;max-width:1220px;margin:0 auto;padding:22px}}.top{{display:grid;align-items:flex-start;justify-items:start;gap:8px;border-bottom:1px solid var(--line);padding:20px 0 18px}}
 .brand{{display:flex;align-items:center;gap:14px;width:100%;min-width:0}}
 h1{{margin:0;font-size:29px;line-height:1.2;letter-spacing:0}}.appBanner{{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:36px;min-width:132px;padding:8px 14px;border:1px solid rgba(34,211,238,.38);border-radius:999px;background:linear-gradient(110deg,rgba(34,211,238,.14),rgba(124,58,237,.24),rgba(236,72,153,.14));color:#f3e8ff;text-decoration:none;font-weight:800;font-size:13px;line-height:1;white-space:nowrap;box-shadow:0 10px 24px rgba(124,58,237,.16),inset 0 1px 0 rgba(255,255,255,.10);overflow:hidden}}.appBanner::before{{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.20),transparent);transform:translateX(-120%);animation:bannerShine 6.2s ease-in-out infinite}}.appBanner span{{position:relative}}.appBannerVersion{{color:#fb7185;text-shadow:0 0 12px rgba(251,113,133,.35)}}.muted{{color:var(--muted)}}.top p{{margin:4px 0 0}}.links,.headerActions{{display:flex;align-items:center;gap:8px}}.links{{margin-top:0;flex-wrap:nowrap}}.links a,.badge{{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:36px;min-width:132px;padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.08);color:#f3e8ff;text-decoration:none;font-weight:800;font-size:13px;line-height:1;white-space:nowrap;overflow:hidden}}.headerActions{{position:relative;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));align-self:flex-start;justify-content:flex-start;align-content:flex-start;flex:1 1 auto;min-width:0;gap:8px;padding-top:0;max-width:none}}.headerActions .badge,.headerActions .btn{{width:100%;min-height:36px;min-width:0;padding:8px 10px;border-radius:999px;font-weight:800;font-size:12px;line-height:1;white-space:nowrap}}.headerActions .btn[href="/logout"]{{margin-left:0}}.badge{{background:rgba(255,255,255,.08);color:#f3e8ff;box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}}.nethavenTop{{border-color:rgba(34,211,238,.46);background:linear-gradient(110deg,rgba(14,165,233,.20),rgba(168,85,247,.22),rgba(34,197,94,.14));color:#ecfeff;box-shadow:0 10px 24px rgba(14,165,233,.14),inset 0 1px 0 rgba(255,255,255,.10)}}.nethavenTop::before{{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.24),transparent);transform:translateX(-120%);animation:bannerShine 6.2s ease-in-out infinite;pointer-events:none}}.authToggle{{cursor:pointer}}.dot{{width:9px;height:9px;border-radius:999px;background:var(--red);box-shadow:0 0 13px rgba(251,113,133,.72)}}.dot.on{{background:var(--green);box-shadow:0 0 13px rgba(34,197,94,.75)}}.dot.warn{{background:var(--amber);box-shadow:0 0 13px rgba(245,158,11,.75)}}
- .toolbar{{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1.25fr) minmax(88px,.46fr) minmax(92px,.48fr) minmax(0,1.1fr) minmax(116px,.58fr);gap:8px;margin:18px 0;padding:14px 16px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.045)),var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 18px 46px rgba(0,0,0,.20);backdrop-filter:blur(10px);width:100%;max-width:100%;box-sizing:border-box}}.toolbar>*{{width:100%;min-width:0}}.toolbar input,.toolbar select{{background:rgba(255,255,255,.08);border-color:var(--line);color:#f3e8ff;box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}}.toolbar input::placeholder{{color:#b9adc9}}
+  .toolbar{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) minmax(84px,.52fr) minmax(100px,.65fr) minmax(0,1fr) minmax(0,1fr) minmax(116px,.68fr);gap:8px;margin:18px 0;padding:14px 16px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.045)),var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 18px 46px rgba(0,0,0,.20);backdrop-filter:blur(10px);width:100%;max-width:100%;box-sizing:border-box}}.toolbar>*{{width:100%;min-width:0}}.toolbar input,.toolbar select{{background:rgba(255,255,255,.08);border-color:var(--line);color:#f3e8ff;box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}}.toolbar input::placeholder{{color:#b9adc9}}
 .authMenu{{position:absolute;right:0;top:calc(100% + 10px);z-index:60;width:min(640px,calc(100vw - 44px));max-height:min(820px,calc(100svh - 120px));overflow:auto;padding:16px;background:linear-gradient(180deg,rgba(255,255,255,.09),rgba(255,255,255,.05)),rgba(19,14,32,.96);border:1px solid var(--line);border-radius:8px;box-shadow:0 24px 70px rgba(0,0,0,.36);backdrop-filter:blur(12px);scrollbar-width:thin}}.authMenu[hidden]{{display:none}}.authMenu>h2,.authMenu>p{{display:none}}.authMenuHead{{position:relative;display:block}}.authMenuHead>div{{min-width:0}}.authMenuHead p{{display:none}}.authMenu h2{{margin:0 0 4px;font-size:18px}}.authMenuClose{{display:none;position:absolute;top:14px;right:14px;min-height:34px;padding:7px 12px;border-radius:999px;white-space:nowrap}}.authMenu p{{margin:0 0 12px;color:var(--muted)}}.authGrid{{display:grid;grid-template-columns:1fr;gap:10px}}.authGrid .wide{{grid-column:1/-1}}.msg{{margin-top:10px;color:#bbf7d0;font-weight:750}}.msg.bad{{color:#fecdd3}}.formMsg{{margin:-8px 0 18px;padding:10px 12px;border:1px solid rgba(34,197,94,.34);border-radius:8px;background:rgba(34,197,94,.12);color:#bbf7d0;font-weight:800}}.formMsg.bad{{border-color:rgba(251,113,133,.4);background:rgba(251,113,133,.13);color:#fecdd3}}
 .authGroup{{margin-top:14px;border:1px solid rgba(34,211,238,.22);border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03)),rgba(15,10,26,.78);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}}.authGroupSummary{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;cursor:pointer;list-style:none}}.authGroupSummary::-webkit-details-marker{{display:none}}.authGroupTitle strong{{display:block;color:#f7f2ff;font-size:15px;font-weight:900;line-height:1.15}}.authGroupTitle span{{display:block;margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35}}.authGroupChevron{{display:inline-flex;align-items:center;justify-content:center;flex:0 0 28px;width:28px;height:28px;border:1px solid rgba(34,211,238,.24);border-radius:999px;background:rgba(34,211,238,.08);color:#dbeafe;font-size:16px;line-height:1;transition:transform .18s ease,background .18s ease,border-color .18s ease}}.authGroup[open] .authGroupChevron{{transform:rotate(180deg);background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.24)}}.authGroupBody{{padding:0 14px 14px;border-top:1px solid rgba(255,255,255,.08)}}.authGroupBody>.authPasswordSection{{margin-top:14px;padding-top:0;border-top:0}}.authGroupBody>.authOverview{{margin-top:0;padding-top:14px;border-top:0}}.authGroupBody>.sessionBox{{margin-top:14px;padding-top:0;border-top:0}}.authGroupBody>.notifyBox{{margin-top:14px;padding-top:0;border-top:0}}.authGroupBody>.backupBox{{margin-top:14px;padding-top:0;border-top:0}}.authOverview{{display:grid;gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}}.authPills{{display:flex;flex-wrap:wrap;gap:8px}}.authPill{{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border:1px solid rgba(34,211,238,.24);border-radius:999px;background:rgba(34,211,238,.08);color:#dbeafe;font-size:12px;font-weight:850}}.authPill.off{{border-color:rgba(255,255,255,.10);background:rgba(255,255,255,.06);color:#c4b5fd}}.authSection{{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}}.authSectionHead{{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px}}.authSectionHead h3{{margin:0;font-size:15px}}.authSectionHead p{{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.35}}.authSectionState{{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:6px 10px;border:1px solid rgba(34,197,94,.30);border-radius:999px;background:rgba(34,197,94,.12);color:#bbf7d0;font-size:12px;font-weight:850;white-space:nowrap}}.authSectionState.off{{border-color:rgba(255,255,255,.10);background:rgba(255,255,255,.06);color:#c4b5fd}}.authSectionState.warn{{border-color:rgba(251,191,36,.28);background:rgba(251,191,36,.11);color:#fde68a}}.authFields{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}.authFields .wide{{grid-column:1/-1}}.authFields input,.authFields textarea{{width:100%;min-width:0}}.authFields textarea{{min-height:92px;resize:vertical}}.authActions{{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}}.authActions .sessionBtn,.authActions .btn,.authActions button{{flex:1 1 180px}}.authHint{{margin:8px 0 0;color:var(--muted);font-size:12px;line-height:1.35}}.authRememberToggle{{display:inline-flex;align-items:center;gap:8px;min-height:34px;padding:7px 11px;border:1px solid rgba(255,255,255,.10);border-radius:999px;background:rgba(255,255,255,.05);color:var(--muted);font-size:12px;font-weight:750;cursor:pointer;user-select:none}}.authRememberToggle input{{width:14px;height:14px;margin:0;flex:0 0 14px;accent-color:#22c55e}}.authSecretBox{{margin-top:10px;padding:10px;border:1px solid rgba(34,211,238,.24);border-radius:8px;background:rgba(34,211,238,.08)}}.authSecretBox strong{{display:block;margin-bottom:6px;font-size:12px;color:#f7f2ff}}.authSecretValue{{margin:0;padding:9px 10px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(0,0,0,.18);color:#c4b5fd;font:12px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word}}.authList{{display:grid;gap:8px;margin-top:10px}}.authRow{{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:start;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.055);padding:9px}}.authRowAll{{border-style:dashed;background:linear-gradient(135deg,rgba(34,211,238,.10),rgba(34,197,94,.08),rgba(255,255,255,.04))}}.authRowTitle{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-weight:900}}.authRowMeta{{margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35;word-break:break-word}}.authRowKey{{margin-top:7px;padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(0,0,0,.18);color:#c4b5fd;font:11px/1.35 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-all}}.authRouterFlags{{justify-content:flex-end}}.authFlagPill{{gap:6px;min-height:30px;padding:5px 8px;cursor:pointer;user-select:none;touch-action:manipulation}}.authFlagPill input{{width:14px;height:14px;margin:0;flex:0 0 14px;accent-color:#22c55e}}.authFlagPill span{{font-size:11px;font-weight:900;line-height:1}}.authEmpty{{padding:10px;border:1px dashed var(--line);border-radius:8px;color:var(--muted);text-align:center}}.authDanger{{color:#fecdd3}}.authSocialIdentity{{display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:center}}.authSocialAvatar{{width:38px;height:38px;border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.05);display:grid;place-items:center;color:#dbeafe;font-size:15px;font-weight:900}}.authSocialAvatar img{{display:block;width:100%;height:100%;object-fit:cover}}.authSocialName{{font-weight:900;color:#f7f2ff}}.authSocialHandle{{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.35;word-break:break-word}}
 .sessionBox{{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}}.sessionHead{{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}}.sessionHead h3{{margin:0;font-size:15px}}.sessionList{{display:grid;gap:8px;max-height:260px;overflow:auto;padding-right:2px}}.sessionRow{{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.055);padding:9px;text-align:left}}.sessionTitle{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-weight:900}}.sessionMeta{{margin-top:3px;color:var(--muted);font-size:12px;line-height:1.35;word-break:break-word}}.sessionCurrent{{border:1px solid rgba(34,197,94,.38);border-radius:999px;padding:2px 7px;color:#bbf7d0;background:rgba(34,197,94,.13);font-size:11px}}.sessionBtn{{padding:7px 9px;font-size:12px;border-radius:999px}}.sessionEmpty{{padding:10px;border:1px dashed var(--line);border-radius:8px;color:var(--muted);text-align:center}}
@@ -4456,7 +4509,7 @@ h1{{margin:0;font-size:29px;line-height:1.2;letter-spacing:0}}.appBanner{{positi
 input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding:10px 11px;background:rgba(8,5,18,.72);color:var(--text)}}button,.btn{{border:1px solid rgba(255,255,255,.10);border-radius:8px;padding:10px 13px;background:rgba(255,255,255,.10);color:#f7f2ff;font-weight:850;text-decoration:none;cursor:pointer;display:inline-flex;justify-content:center;align-items:center}}.authToggle{{border-radius:999px;padding:8px 14px;background:rgba(255,255,255,.08);color:#f3e8ff}}button.primary,.btn.primary{{background:var(--blue);color:#fff;box-shadow:0 10px 22px rgba(124,58,237,.22)}}button.bad,.btn.bad{{background:rgba(251,113,133,.16);color:#fecdd3}}.btn.good{{background:rgba(34,197,94,.16);color:#bbf7d0}}.btn.disabled{{opacity:.45;cursor:not-allowed}}
 .summary{{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}}.miniStat{{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:36px;min-width:132px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.07);padding:8px 12px;color:#ddd6fe;font-weight:800;font-size:13px;line-height:1;white-space:nowrap}}
 .routerStats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:start;gap:8px;margin:0 0 10px}}.statCard{{position:relative;min-height:54px;overflow:hidden;border:1px solid var(--line);border-radius:8px;padding:8px 10px 7px;background:linear-gradient(180deg,rgba(255,255,255,.075),rgba(255,255,255,.04)),var(--panel);box-shadow:0 8px 20px rgba(0,0,0,.14);text-align:center;box-sizing:border-box}}.statCard::before{{content:"";position:absolute;inset:0 0 auto 0;height:2px;background:var(--cyan)}}.statCard span{{display:block;color:var(--muted);font-size:10px;font-weight:850;text-transform:uppercase;letter-spacing:.035em}}.statCard strong{{display:block;margin-top:0;font-size:22px;line-height:1;color:#f7f2ff}}.statCard em{{display:block;min-width:0;margin-top:2px;padding:0 2px;color:#c4b5fd;font-style:normal;font-size:10px;line-height:1.15}}.statCard.online::before{{background:var(--green)}}.statCard.online strong{{color:#bbf7d0}}.statCard.offline::before{{background:var(--red)}}.statCard.offline strong{{color:#fecdd3}}.statCard.total::before{{background:var(--cyan)}}.statCard.total strong{{color:#a5f3fc}}.statCardHead{{display:flex;align-items:center;justify-content:center;min-height:14px}}.statCard.has-popover{{overflow:visible;z-index:12}}.statValueRow,.offlineStatRow{{position:relative;display:flex;align-items:center;justify-content:center;min-height:20px;margin-top:3px}}.offlineMoreBtn{{position:absolute;right:6px;top:50%;transform:translateY(-50%);display:inline-flex;align-items:center;justify-content:center;min-height:22px;padding:0 8px;border:1px solid rgba(251,113,133,.34);border-radius:999px;background:rgba(251,113,133,.12);color:#fecdd3;font-size:10px;font-weight:900;line-height:1;cursor:pointer;white-space:nowrap}}.offlineMoreBtn[aria-expanded="true"]{{background:rgba(251,113,133,.18);border-color:rgba(251,113,133,.48)}}.offlinePopover{{position:absolute;top:calc(100% + 8px);right:6px;width:min(340px,calc(100vw - 30px));padding:10px;border:1px solid rgba(251,113,133,.28);border-radius:12px;background:linear-gradient(180deg,rgba(49,28,44,.98),rgba(30,18,40,.98));box-shadow:0 22px 50px rgba(0,0,0,.34);text-align:left;z-index:25}}.offlinePopover[hidden]{{display:none!important}}.offlineList{{display:grid;gap:6px;max-height:170px;overflow:auto;padding-right:2px}}.offlineItem{{border:1px solid rgba(251,113,133,.18);border-radius:8px;padding:7px 8px;background:rgba(251,113,133,.08)}}.offlineName{{display:block;color:#fdf2f8;font-size:11px;font-weight:900;line-height:1.25;text-transform:none;letter-spacing:0}}
-.cards{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}.card{{position:relative;min-height:246px;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.045)),var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;box-shadow:0 18px 46px rgba(0,0,0,.28);backdrop-filter:blur(10px)}}.card::before{{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--green)}}.card.online{{border-color:rgba(34,197,94,.45);box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 0 1px rgba(34,197,94,.10),0 0 34px rgba(34,197,94,.10)}}.card.off{{border-color:rgba(251,113,133,.42);box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 0 1px rgba(251,113,133,.08),0 0 30px rgba(251,113,133,.08)}}.card.off::before{{background:var(--red)}}.card.warn::before{{background:var(--amber)}}.card.main{{grid-column:span 1}}
+.cards{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}.routerGroupCards{{grid-column:1 / -1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}.routerGroupSection{{grid-column:1 / -1;display:grid;gap:8px;min-width:0}}.routerGroupSection>.routerGroupCards[hidden]{{display:none!important}}.routerGroupHeading{{grid-column:1 / -1;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;margin-top:6px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.05);color:#e9d5ff;font-weight:900}}.routerGroupHeading em{{font-size:11px;color:var(--muted);font-style:normal;font-weight:700}}.routerGroupToggle{{min-width:92px;padding:7px 10px;font-size:11px}}.routerGroupItem{{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-top:1px solid var(--line)}}.routerGroupItem:first-child{{border-top:0}}.routerGroupItem em{{margin-left:6px;color:var(--muted);font-style:normal;font-size:11px}}.routerGroupsPanel{{margin:12px 0;padding:14px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.045)}}.routerGroupsHead span{{display:block;margin-top:4px;color:var(--muted);font-size:12px}}.routerGroupsControls{{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-top:12px}}button.routerGroupsToggle{{display:flex;width:100%;min-height:46px;margin:12px 0 10px;padding:13px 16px;box-sizing:border-box;border-radius:8px;background:transparent;color:var(--muted);box-shadow:none}}.routerGroupsToggle:hover,.routerGroupsToggle:focus-visible{{background:rgba(255,255,255,.05);border-color:var(--line);color:var(--text);box-shadow:none}}.routerGroupForm{{display:flex;gap:8px;flex:1 1 340px}}.routerGroupForm input,.routerGroupFilterLabel select,.routerCardGroup select{{min-height:36px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);padding:8px 10px}}.routerGroupForm input{{flex:1}}.routerGroupFilterLabel{{display:grid;gap:4px;color:var(--muted);font-size:11px}}.routerGroupList{{margin-top:10px}}.routerCardGroup{{display:grid;gap:6px;width:100%;margin-top:10px;padding:5px 0;color:var(--muted);font-size:11px}}.routerGroupPickerHead{{display:flex;align-items:center;justify-content:center;gap:8px}}.routerGroupPickerToggle{{min-height:30px;padding:6px 14px;border-radius:8px;background:rgba(255,255,255,.06);color:var(--muted);font-size:11px;line-height:1}}.routerGroupPickerToggle:hover,.routerGroupPickerToggle:focus-visible{{background:rgba(255,255,255,.10);color:var(--text);border-color:var(--line)}}.routerGroupPickerOptions{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:6px;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.12)}}.routerGroupPickerOptions[hidden]{{display:none!important}}.routerGroupChoice{{width:100%;min-height:32px;padding:7px 8px;border-radius:8px;background:rgba(255,255,255,.05);color:var(--muted);font-size:11px;text-align:left}}.routerGroupChoice:hover,.routerGroupChoice:focus-visible{{background:rgba(255,255,255,.10);color:var(--text);border-color:var(--line)}}.routerGroupChoice.active{{background:rgba(124,58,237,.26);border-color:rgba(167,139,250,.48);color:#f7f2ff}}.routerCardGroup select{{flex:1;min-height:32px;padding:5px 8px}}.card{{position:relative;min-height:246px;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.045)),var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;box-shadow:0 18px 46px rgba(0,0,0,.28);backdrop-filter:blur(10px)}}.card::before{{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--green)}}.card.online{{border-color:rgba(34,197,94,.45);box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 0 1px rgba(34,197,94,.10),0 0 34px rgba(34,197,94,.10)}}.card.off{{border-color:rgba(251,113,133,.42);box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 0 1px rgba(251,113,133,.08),0 0 30px rgba(251,113,133,.08)}}.card.off::before{{background:var(--red)}}.card.warn::before{{background:var(--amber)}}.card.main{{grid-column:span 1}}
 @keyframes onlineGlow{{0%,100%{{transform:scale(.9);opacity:.55}}50%{{transform:scale(1.08);opacity:1}}}}@keyframes offlineGlow{{0%,100%{{transform:scale(.88);opacity:.34}}50%{{transform:scale(1.08);opacity:.9}}}}
 @keyframes bannerShine{{0%,45%{{transform:translateX(-120%)}}72%,100%{{transform:translateX(120%)}}}}
 .cardTop{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}
@@ -4466,8 +4519,8 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
 .trafficControls{{grid-template-columns:repeat(2,minmax(0,1fr))}}.trafficPasswordField{{grid-column:1}}.trafficStatusField{{grid-column:2}}.trafficActionBtn{{width:100%;min-width:0;padding:8px 8px;font-size:10px;letter-spacing:.01em;white-space:nowrap}}.trafficStatusField .wolMeta{{font-size:10px;line-height:1.22}}.trafficDangerBtn{{border-color:rgba(251,113,133,.34)!important;background:linear-gradient(180deg,rgba(251,113,133,.18),rgba(251,113,133,.08))!important;color:#ffe4e6!important}}.trafficDangerBtn:hover{{border-color:rgba(251,113,133,.54)!important;background:linear-gradient(180deg,rgba(251,113,133,.24),rgba(251,113,133,.12))!important}}
 .wolField input,.wolPickerToggle{{width:100%;min-width:0;min-height:38px;padding:0 12px;border:1px solid rgba(34,211,238,.24);border-radius:10px;background:linear-gradient(180deg,rgba(52,38,74,.96),rgba(34,26,52,.96));color:#f5f3ff;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}}.wolField input:focus,.wolPickerToggle:focus,.wolPickerToggle:focus-visible{{border-color:rgba(34,211,238,.60);box-shadow:0 0 0 3px rgba(34,211,238,.12),inset 0 1px 0 rgba(255,255,255,.05)}}.wolDeviceField{{grid-column:1/-1;width:100%}}.wolPickerToggle{{display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;cursor:pointer;touch-action:manipulation}}.wolPickerToggle[disabled]{{opacity:.55;cursor:not-allowed}}.wolPickerValue{{display:grid;gap:2px;min-width:0;flex:1}}.wolPickerValue strong{{display:block;min-width:0;color:#f5f3ff;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.wolPickerValue small{{display:block;min-width:0;color:#c4b5fd;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.wolPickerChevron{{flex:0 0 auto;color:#c4b5fd;font-size:15px;line-height:1}}.wolPickerList{{display:grid;gap:8px;max-height:240px;overflow:auto;padding:8px;border:1px solid rgba(34,211,238,.24);border-radius:12px;background:rgba(17,12,29,.88);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}}.wolDeviceBtn{{width:100%;display:grid;gap:3px;padding:10px 12px;border:1px solid rgba(167,139,250,.18);border-radius:10px;background:rgba(255,255,255,.04);color:#f5f3ff;text-align:left;cursor:pointer;touch-action:manipulation;transition:border-color .15s ease,background .15s ease,transform .15s ease}}.wolDeviceBtn:hover,.wolDeviceBtn:focus-visible{{border-color:rgba(34,211,238,.48);background:rgba(34,211,238,.12)}}.wolDeviceBtn:active{{transform:scale(.99)}}.wolDeviceBtn.active{{border-color:rgba(59,130,246,.62);background:rgba(59,130,246,.18);box-shadow:0 0 0 1px rgba(59,130,246,.16)}}.wolDeviceName{{display:block;color:#f5f3ff;font-size:13px;font-weight:800;line-height:1.3}}.wolDeviceMeta{{display:block;color:#c4b5fd;font-size:11px;line-height:1.35;word-break:break-word}}.wolPickerEmpty{{padding:14px 12px;border:1px dashed rgba(167,139,250,.20);border-radius:10px;background:rgba(255,255,255,.03);color:#c4b5fd;text-align:center}}.metric.memory-ok strong,.metric.flash-ok strong,.metric.memory-warn strong,.metric.flash-warn strong,.metric.memory-bad strong,.metric.flash-bad strong{{color:#f3e8ff}}.metric.memory-ok .metric-accent,.metric.flash-ok .metric-accent{{color:#bbf7d0}}.metric.memory-warn .metric-accent,.metric.flash-warn .metric-accent{{color:#fde68a}}.metric.memory-bad .metric-accent,.metric.flash-bad .metric-accent{{color:#fecdd3}}.metric-line{{display:block}}.metric-accent{{font-weight:inherit}}
 .seasonalFx{{position:fixed;inset:0;display:block;width:100vw;height:100vh;z-index:0;pointer-events:none;opacity:.9;mix-blend-mode:screen}}.desktopHeader{{--hdr-col-1:124px;--hdr-col-2:124px;--hdr-col-3:156px;--hdr-col-4:124px;--hdr-col-5:144px;--hdr-col-6:144px;--hdr-col-7:144px;--hdr-col-8:144px;--top-col-1:256px;--top-col-2:288px;--top-col-3:144px;display:grid;gap:8px;width:max-content;max-width:100%;margin-left:15px}}.desktopHeaderTop{{display:grid;grid-template-columns:var(--top-col-1) var(--top-col-2) var(--top-col-3);align-items:flex-start;gap:8px;width:max-content;max-width:100%;justify-self:start}}.desktopHeaderTop>.appBanner{{width:var(--top-col-1);min-width:var(--top-col-1);max-width:var(--top-col-1)}}.desktopHeaderTop>.routerSearchDock{{width:var(--top-col-2);min-width:var(--top-col-2);max-width:var(--top-col-2)}}.desktopHeaderTop>#seasonDock{{width:var(--top-col-3);min-width:var(--top-col-3);max-width:var(--top-col-3)}}.desktopHeaderBottom{{display:grid;grid-template-columns:var(--hdr-col-1) var(--hdr-col-2) var(--hdr-col-3) var(--hdr-col-4) var(--hdr-col-5) var(--hdr-col-6) var(--hdr-col-7) var(--hdr-col-8);gap:8px;width:max-content;max-width:100%;align-items:start;justify-self:start}}.desktopHeader .appBanner{{grid-column:auto;width:100%;min-width:0}}.desktopHeader .links{{display:grid;grid-column:1/span 3;grid-template-columns:var(--hdr-col-1) var(--hdr-col-2) var(--hdr-col-3);gap:8px;margin-top:0}}.desktopHeader .links a{{width:100%;min-width:0}}.routerSearchDock{{position:relative;display:block;grid-column:auto;width:100%;min-width:0;max-width:100%}}.mobileSearchDock{{display:none;width:100%;position:relative}}.routerSearchToggle{{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:36px;width:100%;padding:8px 14px;border:1px solid rgba(34,211,238,.30);border-radius:999px;background:linear-gradient(110deg,rgba(34,211,238,.12),rgba(124,58,237,.22),rgba(236,72,153,.12));color:#f3e8ff;font-size:13px;font-weight:800;line-height:1;box-shadow:0 10px 24px rgba(124,58,237,.16),inset 0 1px 0 rgba(255,255,255,.10)}}.routerSearchToggle[data-active="true"],.routerSearchToggle[aria-expanded="true"]{{border-color:rgba(34,211,238,.52);box-shadow:0 14px 30px rgba(34,211,238,.14),inset 0 1px 0 rgba(255,255,255,.12)}}.routerSearchToggleIcon{{flex:0 0 auto;color:#c4b5fd;font-size:14px;line-height:1}}.mobileSearchVersion{{display:inline-flex;align-items:center;justify-content:center;min-height:20px;padding:0 7px;border:1px solid rgba(251,113,133,.34);border-radius:999px;background:rgba(251,113,133,.14);color:#fecdd3;font-size:10px;font-weight:900;line-height:1;letter-spacing:.04em;box-shadow:0 0 14px rgba(251,113,133,.14)}}.mobileSearchDock>.mobileSearchVersion{{display:flex;width:fit-content;margin:0 auto 6px}}#routerSearchToggle,#seasonToggle{{border:1px solid var(--line);background:rgba(255,255,255,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.06);color:#f3e8ff}}#routerSearchToggle[data-active="true"],#routerSearchToggle[aria-expanded="true"],#seasonToggle[data-open="true"],#seasonToggle[aria-expanded="true"]{{border-color:var(--line);background:rgba(255,255,255,.11);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}}#routerSearchToggle .routerSearchToggleIcon,#seasonToggle .routerSearchToggleIcon{{color:#ddd6fe}}.routerSearchPanel{{position:absolute;top:calc(100% + 10px);left:0;z-index:55;width:min(296px,calc(100vw - 24px))}}.routerSearchPanel[hidden]{{display:none!important}}.routerSearchCard{{display:grid;grid-template-rows:auto auto auto;align-content:start;gap:8px;width:100%;min-height:82px;padding:12px;border:1px solid rgba(34,211,238,.26);border-radius:18px;background:linear-gradient(180deg,rgba(255,255,255,.09),rgba(255,255,255,.045)),rgba(19,14,32,.96);box-shadow:0 18px 42px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(10px)}}.routerSearchHead{{display:flex;align-items:center;justify-content:space-between;gap:8px}}.routerSearchTitle{{display:block;color:#f3e8ff;font-size:12px;font-weight:900;line-height:1.1}}.routerSearchClear{{min-height:24px;padding:0 9px;border:1px solid rgba(167,139,250,.24);border-radius:999px;background:rgba(255,255,255,.06);color:#ddd6fe;font-size:11px;font-weight:850;cursor:pointer}}.routerSearchClear[disabled]{{opacity:.42;cursor:not-allowed}}.routerSearchField{{display:flex;align-items:center;gap:8px;min-height:38px;padding:0 12px;border:1px solid rgba(34,211,238,.26);border-radius:999px;background:linear-gradient(110deg,rgba(34,211,238,.08),rgba(124,58,237,.14),rgba(236,72,153,.08));box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}}.routerSearchField:focus-within{{border-color:rgba(34,211,238,.54);box-shadow:0 0 0 3px rgba(34,211,238,.10),inset 0 1px 0 rgba(255,255,255,.08)}}.routerSearchField input{{width:100%;padding:0;border:0;background:transparent;color:#f7f2ff;box-shadow:none;outline:none;font-size:13px;font-weight:700}}.routerSearchField input::placeholder{{color:#b9adc9}}.routerSearchIcon{{flex:0 0 auto;color:#c4b5fd;font-size:14px;line-height:1}}.routerSearchMeta{{min-height:14px;color:#c4b5fd;font-size:11px;font-weight:800;line-height:1.2}}.seasonDock{{display:grid;gap:6px;width:100%;padding:9px 10px;border:1px solid rgba(251,191,36,.18);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035)),rgba(19,14,32,.90);box-shadow:0 12px 28px rgba(0,0,0,.18);backdrop-filter:blur(10px)}}.seasonLabel{{display:flex;align-items:center;justify-content:center;text-align:center;gap:8px;color:#fde68a;font-size:11px;font-weight:900;line-height:1.1;text-transform:uppercase;letter-spacing:.04em}}.seasonSwitch{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}}.seasonBtn{{min-height:30px;padding:6px 8px;border:1px solid rgba(251,191,36,.22);border-radius:999px;background:rgba(255,255,255,.06);color:#f7f2ff;font-size:11px;font-weight:850;line-height:1;cursor:pointer;transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease,color .15s ease}}.seasonBtn:hover,.seasonBtn:focus-visible{{border-color:rgba(34,211,238,.50);background:rgba(34,211,238,.12);color:#ecfeff}}.seasonBtn[data-active="true"]{{border-color:rgba(251,191,36,.52);background:linear-gradient(110deg,rgba(251,191,36,.22),rgba(34,211,238,.10),rgba(168,85,247,.14));box-shadow:0 10px 20px rgba(251,191,36,.14),inset 0 1px 0 rgba(255,255,255,.08);color:#fff7cc}}.seasonBtn:active{{transform:scale(.98)}}#seasonDock{{position:relative;display:block;grid-column:auto;width:100%;min-width:0;max-width:none;padding:0;border:0;background:none;box-shadow:none;backdrop-filter:none;align-self:start}}.seasonToggle{{min-height:36px;padding:8px 12px;font-size:13px;line-height:1;white-space:normal;text-align:center}}.seasonToggleText{{display:block}}.seasonPanel{{position:absolute;top:calc(100% + 10px);left:0;z-index:56;width:min(320px,calc(100vw - 24px))}}.seasonPanel[hidden]{{display:none!important}}.seasonCard{{display:grid;gap:8px;width:100%;padding:12px;border:1px solid rgba(251,191,36,.18);border-radius:18px;background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.035)),rgba(19,14,32,.95);box-shadow:0 18px 42px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(12px)}}.headerActions{{display:grid;grid-column:4/span 5;grid-template-columns:var(--hdr-col-4) var(--hdr-col-5) var(--hdr-col-6) var(--hdr-col-7) var(--hdr-col-8);align-self:flex-start;justify-content:flex-start;align-content:flex-start;min-width:0;gap:8px;padding-top:0;max-width:none}}.card{{text-align:center}}.cardTop{{align-items:center;justify-content:center;flex-direction:column}}.tagRow,.actions{{justify-content:center}}.name{{display:inline-flex;align-items:center;justify-content:center;max-width:220px;min-height:34px;margin:0;padding:7px 10px;border:1px solid rgba(251,191,36,.48);border-radius:999px;background:linear-gradient(135deg,rgba(251,191,36,.32),rgba(245,158,11,.22),rgba(255,255,255,.07));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#fff;font-size:13px;line-height:1;font-weight:900;text-shadow:0 0 16px rgba(251,191,36,.42);box-shadow:0 10px 24px rgba(245,158,11,.10),inset 0 1px 0 rgba(255,255,255,.12)}}.metric{{text-align:center}}.metric.span2{{grid-column:1/-1}}
-@media(max-width:980px){{.cards{{grid-template-columns:repeat(2,minmax(0,1fr))}}.toolbar{{grid-template-columns:1fr 1fr}}.card.main{{grid-column:span 1}}.top{{justify-items:stretch}}.desktopHeader,.desktopHeaderTop,.desktopHeaderBottom{{width:100%;max-width:none}}.desktopHeader{{--hdr-col-1:minmax(0,1fr);--hdr-col-2:minmax(0,1fr);--hdr-col-3:minmax(0,1.35fr);--hdr-col-4:minmax(0,1fr);--hdr-col-5:minmax(0,1fr);--hdr-col-6:minmax(0,1fr);--hdr-col-7:minmax(0,1fr);--hdr-col-8:minmax(0,1fr)}}.headerActions{{width:100%}}}}
-@media(max-width:680px){{body{{font-size:13px;background-attachment:scroll}}.wrap{{padding:10px}}.top{{gap:12px;padding:14px 0;align-items:flex-start}}.brand,.brand>div{{width:100%}}h1{{font-size:22px;line-height:1.18}}.appBanner{{width:auto;max-width:100%;justify-content:center;min-height:36px;padding:8px 12px}}.links,.headerActions,.summary,.mobileOwnerTools{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:8px;max-width:none}}.links{{margin-top:10px}}.links a,.badge,.headerActions .btn,.mobileOwnerTools .btn,.mobileOwnerTools .badge,.miniStat{{width:100%;min-width:0;padding:9px 10px;font-size:12px}}.headerStack{{margin-top:0;width:100%;min-width:0}}.headerStack .badge{{width:100%;min-width:0}}.authMenu{{position:fixed;left:10px;right:10px;top:74px;width:auto;max-height:calc(100svh - 90px);overflow:auto}}.authMenuHead{{min-height:40px;padding:0 104px 8px 0}}.authMenu h2{{margin:2px 104px 0 0;line-height:1.2}}.authMenuClose{{display:inline-flex;top:0;right:0;min-height:32px;padding:6px 12px}}.cards,.toolbar,.authGrid{{grid-template-columns:1fr}}.authRow{{grid-template-columns:1fr;gap:7px;padding:8px}}.authRowTitle{{font-size:13px}}.authRowMeta{{font-size:11px;line-height:1.3}}.authRouterFlags{{justify-content:flex-start;gap:6px}}.authFlagPill{{min-height:25px;padding:3px 7px;gap:5px}}.authFlagPill input{{width:12px;height:12px;flex-basis:12px}}.authFlagPill span{{font-size:10px}}.routerStats{{grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-bottom:7px}}.statCard{{min-height:52px;padding:7px 6px}}.statCard span{{font-size:8px;letter-spacing:.015em}}.statCard strong{{font-size:20px}}.statCard em{{display:none}}.statCardHead{{min-height:16px}}.statValueRow,.offlineStatRow{{min-height:20px;margin-top:4px}}.offlineMoreBtn{{right:2px;min-height:16px;padding:0 5px;font-size:7px}}.offlinePopover{{right:3px;width:min(230px,calc(100vw - 20px));padding:8px}}.offlineItem{{padding:6px 7px}}.offlineName{{font-size:10px}}.toolbar{{padding:10px;margin:12px 0}}.card.main{{grid-column:span 1}}.card{{padding:12px;min-height:0}}.card>.metaLine,.card>.tagRow{{display:none}}.nameRow{{gap:6px;margin-top:10px}}.nameRow::before{{flex-basis:26px;width:26px;height:26px}}.name{{font-size:12px;max-width:190px}}.nameEditBtn{{flex-basis:26px;width:26px;height:26px}}.mobilePanelToggle,.routerFormToggle{{display:inline-flex}}.routerSearchDock{{width:100%}}.seasonDock{{width:100%}}#mobileSeasonDock{{width:100%;min-width:0;max-width:none;padding:0;border:0;background:none;box-shadow:none;backdrop-filter:none}}.routerSearchToggle,.seasonToggle{{width:100%}}.routerSearchPanel,.seasonPanel{{position:static;width:100%;margin-top:8px}}.routerSearchCard,.seasonCard{{width:100%;min-height:0;padding:10px 11px;border-radius:16px}}.routerSearchTitle{{font-size:11px}}.routerSearchField{{min-height:36px}}.routerSearchMeta{{text-align:center}}.metrics{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}}.metric{{padding:8px}}.diagnosticPanel{{padding:12px}}.diagnosticTop{{gap:8px}}.diagnosticTop h2{{font-size:17px}}.diagnosticLead{{font-size:11px}}.diagnosticGrid{{grid-template-columns:1fr;gap:10px}}.diagnosticGrid label{{font-size:13px}}.diagnosticGrid textarea{{min-height:118px;padding:12px 13px;font-size:15px;line-height:1.35}}.diagBlock{{padding:11px}}.actions{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}.actions .btn,.actions button{{width:100%;min-width:0;padding:9px 8px;font-size:12px}}.wolControls,.trafficControls{{grid-template-columns:1fr}}.wolField span,.wolMeta{{text-align:center}}.wolControls .btn,.wolControls button,.trafficControls .btn,.trafficControls button{{width:100%}}.trafficSummary{{justify-content:center}}.trafficViewport{{max-height:360px;padding-right:0}}.trafficRowTop{{grid-template-columns:1fr}}.trafficTotalBadge{{min-width:0;text-align:left}}}}
+@media(max-width:980px){{.cards,.routerGroupCards{{grid-template-columns:repeat(2,minmax(0,1fr))}}.toolbar{{grid-template-columns:1fr 1fr}}.card.main{{grid-column:span 1}}.top{{justify-items:stretch}}.desktopHeader,.desktopHeaderTop,.desktopHeaderBottom{{width:100%;max-width:none}}.desktopHeader{{--hdr-col-1:minmax(0,1fr);--hdr-col-2:minmax(0,1fr);--hdr-col-3:minmax(0,1.35fr);--hdr-col-4:minmax(0,1fr);--hdr-col-5:minmax(0,1fr);--hdr-col-6:minmax(0,1fr);--hdr-col-7:minmax(0,1fr);--hdr-col-8:minmax(0,1fr)}}.headerActions{{width:100%}}}}
+@media(max-width:680px){{body{{font-size:13px;background-attachment:scroll}}.wrap{{padding:10px}}.top{{gap:12px;padding:14px 0;align-items:flex-start}}.brand,.brand>div{{width:100%}}h1{{font-size:22px;line-height:1.18}}.appBanner{{width:auto;max-width:100%;justify-content:center;min-height:36px;padding:8px 12px}}.links,.headerActions,.summary,.mobileOwnerTools{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:8px;max-width:none}}.links{{margin-top:10px}}.links a,.badge,.headerActions .btn,.mobileOwnerTools .btn,.mobileOwnerTools .badge,.miniStat{{width:100%;min-width:0;padding:9px 10px;font-size:12px}}.headerStack{{margin-top:0;width:100%;min-width:0}}.headerStack .badge{{width:100%;min-width:0}}.authMenu{{position:fixed;left:10px;right:10px;top:74px;width:auto;max-height:calc(100svh - 90px);overflow:auto}}.authMenuHead{{min-height:40px;padding:0 104px 8px 0}}.authMenu h2{{margin:2px 104px 0 0;line-height:1.2}}.authMenuClose{{display:inline-flex;top:0;right:0;min-height:32px;padding:6px 12px}}.cards,.routerGroupCards,.toolbar,.authGrid{{grid-template-columns:1fr}}.authRow{{grid-template-columns:1fr;gap:7px;padding:8px}}.authRowTitle{{font-size:13px}}.authRowMeta{{font-size:11px;line-height:1.3}}.authRouterFlags{{justify-content:flex-start;gap:6px}}.authFlagPill{{min-height:25px;padding:3px 7px;gap:5px}}.authFlagPill input{{width:12px;height:12px;flex-basis:12px}}.authFlagPill span{{font-size:10px}}.routerStats{{grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-bottom:7px}}.statCard{{min-height:52px;padding:7px 6px}}.statCard span{{font-size:8px;letter-spacing:.015em}}.statCard strong{{font-size:20px}}.statCard em{{display:none}}.statCardHead{{min-height:16px}}.statValueRow,.offlineStatRow{{min-height:20px;margin-top:4px}}.offlineMoreBtn{{right:2px;min-height:16px;padding:0 5px;font-size:7px}}.offlinePopover{{right:3px;width:min(230px,calc(100vw - 20px));padding:8px}}.offlineItem{{padding:6px 7px}}.offlineName{{font-size:10px}}.toolbar{{padding:10px;margin:12px 0}}.card.main{{grid-column:span 1}}.card{{padding:12px;min-height:0}}.card>.metaLine,.card>.tagRow{{display:none}}.nameRow{{gap:6px;margin-top:10px}}.nameRow::before{{flex-basis:26px;width:26px;height:26px}}.name{{font-size:12px;max-width:190px}}.nameEditBtn{{flex-basis:26px;width:26px;height:26px}}.mobilePanelToggle,.routerFormToggle{{display:inline-flex}}.routerSearchDock{{width:100%}}.seasonDock{{width:100%}}#mobileSeasonDock{{width:100%;min-width:0;max-width:none;padding:0;border:0;background:none;box-shadow:none;backdrop-filter:none}}.routerSearchToggle,.seasonToggle{{width:100%}}.routerSearchPanel,.seasonPanel{{position:static;width:100%;margin-top:8px}}.routerSearchCard,.seasonCard{{width:100%;min-height:0;padding:10px 11px;border-radius:16px}}.routerSearchTitle{{font-size:11px}}.routerSearchField{{min-height:36px}}.routerSearchMeta{{text-align:center}}.metrics{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}}.metric{{padding:8px}}.diagnosticPanel{{padding:12px}}.diagnosticTop{{gap:8px}}.diagnosticTop h2{{font-size:17px}}.diagnosticLead{{font-size:11px}}.diagnosticGrid{{grid-template-columns:1fr;gap:10px}}.diagnosticGrid label{{font-size:13px}}.diagnosticGrid textarea{{min-height:118px;padding:12px 13px;font-size:15px;line-height:1.35}}.diagBlock{{padding:11px}}.actions{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}.actions .btn,.actions button{{width:100%;min-width:0;padding:9px 8px;font-size:12px}}.wolControls,.trafficControls{{grid-template-columns:1fr}}.wolField span,.wolMeta{{text-align:center}}.wolControls .btn,.wolControls button,.trafficControls .btn,.trafficControls button{{width:100%}}.trafficSummary{{justify-content:center}}.trafficViewport{{max-height:360px;padding-right:0}}.trafficRowTop{{grid-template-columns:1fr}}.trafficTotalBadge{{min-width:0;text-align:left}}}}
 @media(max-width:680px){{.desktopHeader{{display:none}}#hubMenuPanelHost{{display:block;width:100%}}#hubMenuPanelHost:empty{{display:none}}.mobileOwnerTools{{display:grid;margin:0 0 8px}}.mobileOwnerTools[hidden]{{display:none!important}}.top{{padding:6px 0 0;gap:0}}.mobileSearchDock{{display:block;margin:0}}.mobilePanelToggle,.routerFormToggle,.actionToggle{{width:100%;min-height:38px;margin:7px 0;padding:9px 12px;border-radius:999px;font-size:12px;line-height:1}}.actionToggle{{display:inline-flex}}body.preload-mobile-panels .headerActions,body.preload-mobile-panels .routerFormWrap,body.preload-mobile-panels .routerStats,body.preload-mobile-panels .mobileOwnerTools{{display:none!important}}.card .actions.mobileCollapsed:not(.open){{display:none}}.cardTop{{gap:0}}}}
 @media(max-width:680px){{.headerActions .badge,.headerActions .btn,.mobileOwnerTools .badge,.mobileOwnerTools .btn{{width:100%;min-width:0;max-width:none}}}}
 @media(max-width:420px){{.links,.headerActions,.summary,.actions,.mobileOwnerTools{{grid-template-columns:1fr}}.metrics{{grid-template-columns:1fr}}.metric.span2{{grid-column:span 1}}}}
@@ -4476,7 +4529,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
 @media(max-width:900px),(pointer:coarse){{.trafficPanel{{width:min(100%,340px);justify-self:center;padding:10px 10px 9px;gap:9px}}.trafficControls{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:6px;align-items:start}}.trafficPanel .wolField{{gap:4px;font-size:11px}}.trafficPanel .wolField span{{text-align:center}}.trafficPanel .wolField input{{min-height:34px;padding:0 10px;font-size:13px}}.trafficStatusField .wolMeta{{display:flex;align-items:center;justify-content:center;min-height:34px;padding:0 4px;font-size:11px;line-height:1.18;text-align:center}}.trafficPanel .btn{{min-height:34px;padding:7px 8px;font-size:11px}}.trafficSummary{{justify-content:center}}.trafficSummaryChip{{min-height:22px;padding:0 8px;font-size:9.5px}}.trafficViewport{{max-height:min(44svh,390px);padding-top:4px}}.trafficList{{gap:6px}}.trafficRow{{gap:6px;padding:8px}}.trafficRowTop{{grid-template-columns:1fr;gap:7px}}.trafficIdentity{{text-align:center!important}}.trafficName{{display:block;width:100%;font-size:13px;text-align:center!important}}.trafficMetaLine{{font-size:10px;line-height:1.33;text-align:center!important}}.trafficTotalBadge{{display:grid;width:fit-content;min-width:140px;max-width:198px;justify-self:center!important;margin:0 auto;place-self:center;padding:6px 12px;text-align:center!important}}.trafficTotalBadge span{{font-size:9px}}.trafficTotalBadge strong{{font-size:12px}}.trafficStats{{gap:5px}}.trafficStat{{padding:6px 6px}}.trafficStat span{{font-size:9px}}.trafficStat strong{{font-size:11px}}}}
 @media(max-width:680px){{.trafficPanel{{width:min(100%,332px);padding:9px 9px 8px;border-radius:10px}}.trafficControls{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:6px}}.trafficPanel .wolField{{gap:4px;font-size:11px}}.trafficPanel .wolField input{{min-height:32px;padding:0 9px;font-size:12.5px}}.trafficStatusField .wolMeta{{min-height:32px;font-size:11px;line-height:1.18}}.trafficPanel .btn{{min-height:32px;padding:6px 7px;font-size:11px}}.trafficSummaryChip{{min-height:20px;padding:0 7px;font-size:9px}}.trafficViewport{{max-height:min(42svh,350px)}}.trafficIdentity{{text-align:center!important}}.trafficName{{font-size:12px;text-align:center!important}}.trafficMetaLine{{font-size:10px;line-height:1.28;text-align:center!important}}.trafficTotalBadge{{display:grid;width:fit-content;min-width:130px;max-width:180px;justify-self:center!important;margin:0 auto;place-self:center;padding:6px 10px;text-align:center!important}}.trafficTotalBadge strong{{font-size:11px}}.trafficStat{{padding:6px 5px}}.trafficStat strong{{font-size:11px}}}}
 @media(max-width:420px){{.trafficPanel{{width:100%}}.trafficControls{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:5px}}.trafficStatusField,.trafficPasswordField{{grid-column:auto}}.trafficStatusField .wolMeta{{padding:6px 8px}}.trafficTotalBadge{{min-width:118px;max-width:168px}}}}
-#diagnosticBuild,.btn[data-diagnose]{{display:none!important}}
+@media(max-width:680px){{.routerCardGroup{{margin-top:10px;padding:5px 0;gap:6px}}.routerGroupPickerHead{{min-height:30px}}.routerGroupPickerToggle{{min-height:30px;padding:6px 14px;font-size:11px}}.routerGroupPickerOptions{{width:100%;box-sizing:border-box;grid-template-columns:1fr;gap:6px;padding:6px}}.routerGroupChoice{{min-height:32px;padding:7px 8px;font-size:11px}}}}#diagnosticBuild,.btn[data-diagnose]{{display:none!important}}
 </style>
 </head>
 <body class="preload-mobile-panels">
@@ -4486,7 +4539,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div class="brand">
       <div class="desktopHeader">
         <div class="desktopHeaderTop">
-          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v107</span></span></h1>
+          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v108</span></span></h1>
           <div class="routerSearchDock" id="routerSearchDock">
             <button class="routerSearchToggle" id="routerSearchToggle" type="button" aria-expanded="false" aria-controls="routerSearchPanel" data-active="false">
               <span>Поиск роутеров</span>
@@ -4804,7 +4857,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
                   </div>
                   <div class="backupCmd">
                     <strong>2. Поднять Hub на новой VPS</strong>
-                    <pre>curl -fsSL "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main/vps/install-vps.sh?v=$(date +%s)" | sh</pre>
+                    <pre>curl -fsSL "https://hub.freedev.app/vps/install-vps.sh?v=$(date +%s)" | sh</pre>
                   </div>
                   <div class="backupCmd">
                     <strong>3. Перенести архив на новую VPS</strong>
@@ -4838,7 +4891,7 @@ systemctl restart owrt-remote-xray</pre>
       </div>
     </div>
     <div class="mobileSearchDock" id="mobileRouterSearchDock">
-      <span class="mobileSearchVersion">v107</span>
+      <span class="mobileSearchVersion">v108</span>
       <button class="routerSearchToggle mobilePanelToggle primary" id="mobileRouterSearchToggle" type="button" aria-expanded="false" aria-controls="mobileRouterSearchPanel" data-active="false">
         <span>Поиск роутеров</span>
       </button>
@@ -4898,12 +4951,26 @@ systemctl restart owrt-remote-xray</pre>
     <input name="id" placeholder="router id: node-2" autocomplete="off" required>
     <input name="name" placeholder="Название роутера" required>
     <select name="role"><option value="node">node</option><option value="main">main</option></select>
+    <select name="group_id" id="routerGroupInput"><option value="">Без группы</option></select>
     <input name="entry_port" placeholder="18080" inputmode="numeric" required>
     <input name="vps_host" placeholder="VPS IP/domain" required>
     <button class="primary">Добавить</button>
   </form>
   <div id="routerMsg" class="formMsg" hidden></div>
   </div>
+  <button class="routerGroupsToggle primary" id="routerGroupsToggle" type="button" aria-expanded="false" aria-controls="routerGroupsPanel" {'hidden' if not is_owner else ''}>Открыть группы роутеров</button>
+  <section class="routerGroupsPanel" id="routerGroupsPanel" hidden>
+    <div class="routerGroupsHead"><div><strong>Группы роутеров</strong><span>Создай группу и назначь её роутерам в карточках.</span></div></div>
+    <div class="routerGroupsControls">
+      <form id="routerGroupForm" class="routerGroupForm">
+        <input id="routerGroupNameInput" name="name" placeholder="Например: Дом" autocomplete="off" required>
+        <button class="primary" type="submit">Создать группу</button>
+      </form>
+      <label class="routerGroupFilterLabel">Показать<select id="routerGroupFilter"><option value="">Все группы</option></select></label>
+    </div>
+    <div class="routerGroupList" id="routerGroupList"></div>
+    <div class="formMsg" id="routerGroupMsg" hidden></div>
+  </section>
 
   <button class="mobilePanelToggle primary" id="routerStatsToggle" type="button" hidden>Открыть статистику</button>
   <section id="routerStats" class="routerStats" aria-label="Статистика роутеров"></section>
@@ -4950,6 +5017,13 @@ const routerFormWrap = document.getElementById('routerFormWrap');
 const routerForm = document.getElementById('routerForm');
 const routerFormToggle = document.getElementById('routerFormToggle');
 const routerMsg = document.getElementById('routerMsg');
+const routerGroupsPanel = document.getElementById('routerGroupsPanel');
+const routerGroupsToggle = document.getElementById('routerGroupsToggle');
+const routerGroupForm = document.getElementById('routerGroupForm');
+const routerGroupNameInput = document.getElementById('routerGroupNameInput');
+const routerGroupFilter = document.getElementById('routerGroupFilter');
+const routerGroupList = document.getElementById('routerGroupList');
+const routerGroupMsg = document.getElementById('routerGroupMsg');
 const routerSearchDock = document.getElementById('routerSearchDock');
 const routerSearchToggle = document.getElementById('routerSearchToggle');
 const routerSearchPanel = document.getElementById('routerSearchPanel');
@@ -4974,6 +5048,7 @@ const seasonSwitches = Array.from(document.querySelectorAll('.seasonSwitch')).fi
 const routerIdInput = routerForm && routerForm.elements ? routerForm.elements.namedItem('id') : null;
 const routerNameInput = routerForm && routerForm.elements ? routerForm.elements.namedItem('name') : null;
 const routerRoleInput = routerForm && routerForm.elements ? routerForm.elements.namedItem('role') : null;
+const routerGroupInput = routerForm && routerForm.elements ? routerForm.elements.namedItem('group_id') : null;
 const routerEntryPortInput = routerForm && routerForm.elements ? routerForm.elements.namedItem('entry_port') : null;
 const routerVpsHostInput = routerForm && routerForm.elements ? routerForm.elements.namedItem('vps_host') : null;
 const diagnosticPanel = document.getElementById('diagnosticPanel');
@@ -4987,6 +5062,8 @@ const diagnosticBuild = document.getElementById('diagnosticBuild');
 const diagnosticSummary = document.getElementById('diagnosticSummary');
 const diagnosticBlocks = document.getElementById('diagnosticBlocks');
 const expandedActionPanels = new Set();
+const expandedCardDetails = new Set();
+const expandedGroupPickers = new Set();
 const diagnosticDrafts = new Map();
 const noteStateByRouter = new Map();
 const wolStateByRouter = new Map();
@@ -5001,6 +5078,10 @@ let recentWolPointerActionTs = 0;
 let activeDiagnosticRouterId = '';
 let offlineStatsExpanded = false;
 let routerSearchQuery = '';
+let routerGroupFilterValue = '';
+let routerGroups = [];
+const openRouterGroups = new Set(['__ungrouped__']);
+let routerGroupsPanelOpen = false;
 let lastRouterSearchTrigger = null;
 const SEASON_EFFECT_KEY = 'owrtRemote:seasonEffectMode';
 const SEASON_EFFECT_MODES = new Set(['off', 'snow', 'rain', 'cosmos', 'embers', 'orbit', 'prism', 'pulse', 'laser', 'aurora', 'matrix', 'nebula', 'fireworks', 'vortex', 'comet']);
@@ -5186,9 +5267,18 @@ function saveWolPassword(routerId, value) {{
 }}
 
 function syncExpandedActionPanels(list) {{
-  const validIds = new Set((Array.isArray(list) ? list : []).map(r => actionPanelId(r.id)));
+  const routers = Array.isArray(list) ? list : [];
+  const validActionIds = new Set(routers.map(r => actionPanelId(r.id)));
+  const validDetailIds = new Set(routers.map(r => 'router-details-' + String(r.id).replace(/[^a-zA-Z0-9_-]/g, '-')));
+  const validGroupPickerIds = new Set(routers.map(r => String(r.id || '')));
   for (const id of Array.from(expandedActionPanels)) {{
-    if (!validIds.has(id)) expandedActionPanels.delete(id);
+    if (!validActionIds.has(id)) expandedActionPanels.delete(id);
+  }}
+  for (const id of Array.from(expandedCardDetails)) {{
+    if (!validDetailIds.has(id)) expandedCardDetails.delete(id);
+  }}
+  for (const id of Array.from(expandedGroupPickers)) {{
+    if (!validGroupPickerIds.has(id)) expandedGroupPickers.delete(id);
   }}
 }}
 
@@ -5651,8 +5741,11 @@ function routerMatchesSearch(router, query) {{
 
 function filteredRouters(list = window.ROUTERS || []) {{
   const query = normalizeRouterSearch(routerSearchQuery);
-  if (!query) return list;
-  return list.filter((router) => routerMatchesSearch(router, query));
+  return list.filter((router) => {{
+    if (routerGroupFilterValue && String(router.group_id || '') !== routerGroupFilterValue) return false;
+    if (!query) return true;
+    return routerMatchesSearch(router, query);
+  }});
 }}
 
 function updateRouterSearchMeta(total, visible) {{
@@ -5663,6 +5756,60 @@ function updateRouterSearchMeta(total, visible) {{
   routerSearchMetas.forEach((meta) => {{
     meta.textContent = text;
   }});
+}}
+
+function groupName(groupId) {{
+  const group = routerGroups.find((item) => String(item.id) === String(groupId || ''));
+  return group ? String(group.name || group.id) : 'Без группы';
+}}
+
+function groupOptionsHtml(selected = '') {{
+  return ['<option value="">Без группы</option>'].concat(routerGroups.map((group) =>
+    `<option value="${{escapeAttr(group.id)}}"${{String(group.id) === String(selected || '') ? ' selected' : ''}}>${{escapeHtml(group.name)}}</option>`
+  )).join('');
+}}
+
+function groupPickerButtonsHtml(routerId, selected = '') {{
+  const current = String(selected || '');
+  const options = [{{id: '', name: 'Без группы'}}].concat(routerGroups.map((group) => ({{
+    id: String(group.id || ''),
+    name: String(group.name || group.id || '')
+  }})));
+  return options.map((group) => `<button class="routerGroupChoice${{group.id === current ? ' active' : ''}}" type="button" data-router-group-choice="${{escapeAttr(group.id)}}" data-router-id="${{escapeAttr(routerId)}}" aria-pressed="${{group.id === current ? 'true' : 'false'}}">${{escapeHtml(group.name)}}</button>`).join('');
+}}
+
+function renderRouterGroups() {{
+  const owner = authIsOwner();
+  if (routerGroupsPanel) routerGroupsPanel.hidden = !owner || !routerGroupsPanelOpen;
+  if (routerGroupsToggle) {{
+    routerGroupsToggle.hidden = !owner;
+    routerGroupsToggle.setAttribute('aria-expanded', routerGroupsPanelOpen ? 'true' : 'false');
+    routerGroupsToggle.textContent = routerGroupsPanelOpen ? 'Скрыть группы роутеров' : 'Открыть группы роутеров';
+  }}
+  if (!owner) return;
+  const filterValue = routerGroupFilterValue;
+  if (routerGroupFilter) routerGroupFilter.innerHTML = '<option value="">Все группы</option>' + routerGroups.map((group) => `<option value="${{escapeAttr(group.id)}}">${{escapeHtml(group.name)}} (${{Number(group.router_count || 0)}})</option>`).join('');
+  if (routerGroupFilter) routerGroupFilter.value = filterValue;
+  if (routerGroupInput) routerGroupInput.innerHTML = groupOptionsHtml(routerGroupInput.value);
+  if (routerGroupList) routerGroupList.innerHTML = routerGroups.length
+    ? routerGroups.map((group) => `<div class="routerGroupItem"><span>${{escapeHtml(group.name)}} <em>${{Number(group.router_count || 0)}}</em></span><button class="btn" type="button" data-router-group-delete="${{escapeAttr(group.id)}}">Удалить</button></div>`).join('')
+    : '<span class="metaLine">Групп пока нет.</span>';
+}}
+
+function showRouterGroupMsg(text, bad = false) {{
+  if (!routerGroupMsg) return;
+  routerGroupMsg.hidden = !text;
+  routerGroupMsg.className = bad ? 'formMsg bad' : 'formMsg';
+  routerGroupMsg.textContent = text || '';
+}}
+
+async function loadRouterGroups() {{
+  const res = await fetch('/api/router-groups', {{cache: 'no-store'}});
+  if (!res.ok) return;
+  const data = await res.json().catch(() => ({{}}));
+  routerGroups = Array.isArray(data.groups) ? data.groups : [];
+  renderRouterGroups();
+  renderRouterView();
 }}
 
 function loadSeasonEffectMode() {{
@@ -7349,7 +7496,8 @@ function render(list) {{
     cards.innerHTML = '<div class="empty">Пока нет роутеров. Добавь первый, например <b>main</b>.</div>';
     return;
   }}
-  cards.innerHTML = list.map(r => {{
+  const groupedList = list.slice().sort((a, b) => groupName(a.group_id).localeCompare(groupName(b.group_id), 'ru') || String(a.name || a.id).localeCompare(String(b.name || b.id), 'ru'));
+  cards.innerHTML = groupedList.map((r, idx) => {{
     const permissions = r.permissions && typeof r.permissions === 'object' ? r.permissions : {{}};
     const role = String(r.role || 'node');
     const isMain = role === 'main';
@@ -7368,7 +7516,7 @@ function render(list) {{
     const temperature = temperatureValueForRouter(r);
     const access = r.access_url || r.public_url;
     const adminButton = online && !!permissions.admin
-      ? `<a class="btn" href="${{escapeAttr(access)}}">Админка</a>`
+      ? `<a class="btn" data-admin-link="true" href="${{escapeAttr(access)}}" target="_blank" rel="noopener noreferrer" onclick="window.open(this.href, '_blank', 'noopener,noreferrer'); return false;">Админка</a>`
       : `<span class="btn disabled">Админка</span>`;
     const sshReady = online && ssh === 'running' && Number(r.ssh_entry_port || 0) > 0;
     const sshButton = sshReady
@@ -7395,6 +7543,11 @@ function render(list) {{
       : `<span class="nameEditBtn disabled" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path fill="currentColor" d="M3 17.25V21h3.75l11-11.03-3.75-3.75zm17.71-10.04a1.003 1.003 0 0 0 0-1.42l-2.5-2.5a1.003 1.003 0 0 0-1.42 0l-1.96 1.96 3.75 3.75z"/></svg></span>`;
     const actionsId = actionPanelId(r.id);
     const actionsOpen = expandedActionPanels.has(actionsId);
+    const detailsId = 'router-details-' + String(r.id).replace(/[^a-zA-Z0-9_-]/g, '-');
+    const collapseCards = mobileCardsMq.matches && !expandedCardDetails.has(detailsId);
+    const groupHeading = idx === 0 || groupName(groupedList[idx - 1].group_id) !== groupName(r.group_id)
+      ? `<div class="routerGroupHeading"><span>${{escapeHtml(groupName(r.group_id))}}</span><em>${{groupedList.filter((item) => groupName(item.group_id) === groupName(r.group_id)).length}} роут.</em></div>`
+      : '';
     const metricsHtml = [
       renderModelMetric(model, modelGetsLegendBadge(model)),
       metric('Система', release),
@@ -7407,12 +7560,12 @@ function render(list) {{
       metricHtml('Температура', formatTemperatureHtml(temperature), tempClass(temperature)),
       metric('Нагрузка', load, 'span2')
     ].join('');
-    return `<article class="card ${{isMain ? 'main' : ''}} ${{online ? 'online' : 'off'}}">
+    return `${{groupHeading}}<article class="card ${{isMain ? 'main' : ''}} ${{online ? 'online' : 'off'}}">
       <div class="cardTop">
         <div class="status ${{stateClass}}"><i></i>${{stateText}}</div>
       </div>
       <div class="nameRow"><div class="name">${{escapeHtml(r.name)}}</div>${{renameButton}}</div>
-      <button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="${{collapseCards ? 'false' : 'true'}}">${{collapseCards ? 'Открыть' : 'Скрыть'}}</button>
+      ${{collapseCards ? `<button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="false">Открыть данные</button>` : ''}}
       <div class="cardBody" id="${{escapeAttr(detailsId)}}"${{collapseCards ? ' hidden' : ''}}>
       <div class="metrics">
         ${{metricsHtml}}
@@ -7522,7 +7675,8 @@ render = function(list) {{
     cards.innerHTML = '<div class="empty">Пока нет роутеров. Добавь первый, например <b>main</b>.</div>';
     return;
   }}
-  cards.innerHTML = list.map(r => {{
+  const groupedList = list.slice().sort((a, b) => groupName(a.group_id).localeCompare(groupName(b.group_id), 'ru') || String(a.name || a.id).localeCompare(String(b.name || b.id), 'ru'));
+  cards.innerHTML = groupedList.map((r, idx) => {{
     const permissions = r.permissions && typeof r.permissions === 'object' ? r.permissions : {{}};
     const role = String(r.role || 'node');
     const isMain = role === 'main';
@@ -7541,7 +7695,7 @@ render = function(list) {{
     const temperature = temperatureValueForRouter(r);
     const access = r.access_url || r.public_url;
     const adminButton = online && !!permissions.admin
-      ? `<a class="btn" href="${{escapeAttr(access)}}">Админка</a>`
+      ? `<a class="btn" data-admin-link="true" href="${{escapeAttr(access)}}" target="_blank" rel="noopener noreferrer" onclick="window.open(this.href, '_blank', 'noopener,noreferrer'); return false;">Админка</a>`
       : `<span class="btn disabled">Админка</span>`;
     const sshReady = online && ssh === 'running' && Number(r.ssh_entry_port || 0) > 0;
     const sshButton = sshReady
@@ -7568,6 +7722,26 @@ render = function(list) {{
       : `<span class="nameEditBtn disabled" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path fill="currentColor" d="M3 17.25V21h3.75l11-11.03-3.75-3.75zm17.71-10.04a1.003 1.003 0 0 0 0-1.42l-2.5-2.5a1.003 1.003 0 0 0-1.42 0l-1.96 1.96 3.75 3.75z"/></svg></span>`;
     const actionsId = actionPanelId(r.id);
     const actionsOpen = expandedActionPanels.has(actionsId);
+    const detailsId = 'router-details-' + String(r.id).replace(/[^a-zA-Z0-9_-]/g, '-');
+    const collapseCards = mobileCardsMq.matches && !expandedCardDetails.has(detailsId);
+    const routerKey = String(r.id || '');
+    const groupPickerOpen = expandedGroupPickers.has(routerKey);
+    const selectedGroupName = groupName(r.group_id);
+    const groupSelectHtml = authIsOwner()
+      ? `<div class="routerCardGroup"><div class="routerGroupPickerHead"><button class="routerGroupPickerToggle" type="button" data-router-group-picker-toggle="${{escapeAttr(routerKey)}}" aria-expanded="${{groupPickerOpen ? 'true' : 'false'}}">${{groupPickerOpen ? 'Скрыть группы' : 'Открыть группы'}}</button></div><div class="routerGroupPickerOptions" data-router-group-options="${{escapeAttr(routerKey)}}"${{groupPickerOpen ? '' : ' hidden'}}>${{groupPickerButtonsHtml(routerKey, r.group_id)}}</div></div>`
+      : '';
+    const groupKey = String(r.group_id || '__ungrouped__');
+    const groupOpen = openRouterGroups.has(groupKey);
+    const groupCount = groupedList.filter((item) => groupName(item.group_id) === groupName(r.group_id)).length;
+    const groupHeading = idx === 0 || groupName(groupedList[idx - 1].group_id) !== groupName(r.group_id)
+      ? `<div class="routerGroupHeading"><span>${{escapeHtml(groupName(r.group_id))}} <em>${{groupCount}} роут.</em></span><button class="btn routerGroupToggle" type="button" data-router-group-toggle="${{escapeAttr(groupKey)}}" aria-expanded="${{groupOpen ? 'true' : 'false'}}">${{groupOpen ? 'Скрыть группу' : 'Открыть группу'}}</button></div>`
+      : '';
+    const groupStart = idx === 0 || groupName(groupedList[idx - 1].group_id) !== groupName(r.group_id)
+      ? `<section class="routerGroupSection" data-router-group-section="${{escapeAttr(groupKey)}}">${{groupHeading}}<div class="routerGroupCards"${{groupOpen ? '' : ' hidden'}}>`
+      : '';
+    const groupEnd = idx === groupedList.length - 1 || groupName(groupedList[idx + 1].group_id) !== groupName(r.group_id)
+      ? '</div></section>'
+      : '';
     const metricsHtml = [
       renderModelMetric(model, modelGetsLegendBadge(model)),
       metric('Система', release),
@@ -7580,11 +7754,14 @@ render = function(list) {{
       metricHtml('Температура', formatTemperatureHtml(temperature), tempClass(temperature)),
       metric('Нагрузка', load, 'span2')
     ].join('');
-    return `<article class="card ${{isMain ? 'main' : ''}} ${{online ? 'online' : 'off'}}">
+    return `${{groupStart}}<article class="card ${{isMain ? 'main' : ''}} ${{online ? 'online' : 'off'}}">
       <div class="cardTop">
         <div class="status ${{stateClass}}"><i></i>${{stateText}}</div>
       </div>
       <div class="nameRow"><div class="name">${{escapeHtml(r.name)}}</div>${{renameButton}}</div>
+      ${{groupSelectHtml}}
+      ${{collapseCards ? `<button class="mobileToggle" type="button" data-card-toggle="${{escapeAttr(detailsId)}}" aria-expanded="false">Открыть данные</button>` : ''}}
+      <div class="cardBody" id="${{escapeAttr(detailsId)}}"${{collapseCards ? ' hidden' : ''}}>
       ${{notesPreview ? `<div class="notesPreview"><strong>Заметки:</strong> <span>${{escapeHtml(notesPreview)}}</span></div>` : ''}}
       <div class="metrics">
         ${{metricsHtml}}
@@ -7601,7 +7778,8 @@ render = function(list) {{
       </div>
       ${{wolReady ? renderWolPanelResponsive(r) : ''}}
       ${{trafficReady ? renderTrafficPanel(r) : ''}}
-    </article>`;
+      </div>
+    </article>${{groupEnd}}`;
   }}).join('');
   syncActionToggleStates();
 }};
@@ -7975,6 +8153,7 @@ function fillRouterForm(force = false) {{
   if (routerEntryPortInput && (force || !routerEntryPortInput.value)) routerEntryPortInput.value = String(nextEntryPort(list));
   if (routerVpsHostInput && (force || !routerVpsHostInput.value)) routerVpsHostInput.value = defaultVpsHost(list);
   if (routerRoleInput && (force || !routerRoleInput.value)) routerRoleInput.value = id === 'main' ? 'main' : 'node';
+  if (routerGroupInput && (force || !routerGroupInput.value)) routerGroupInput.value = '';
 }}
 
 function showRouterMsg(text, bad = false) {{
@@ -8147,6 +8326,7 @@ async function loadRouters() {{
   if (res.ok) {{
     const data = await res.json();
     window.ROUTERS = data.routers;
+    renderRouterGroups();
     syncRouterNotesState(window.ROUTERS);
     if (shouldDeferRouterRender()) pendingRouterRender = true;
     else renderRouterView();
@@ -8154,6 +8334,43 @@ async function loadRouters() {{
     refreshDiagnosticPanel();
   }}
 }}
+
+if (routerGroupFilter) routerGroupFilter.addEventListener('change', () => {{
+  routerGroupFilterValue = routerGroupFilter.value || '';
+  renderRouterView();
+}});
+if (routerGroupsToggle) routerGroupsToggle.addEventListener('click', () => {{
+  routerGroupsPanelOpen = !routerGroupsPanelOpen;
+  renderRouterGroups();
+}});
+if (routerGroupForm) routerGroupForm.addEventListener('submit', async (ev) => {{
+  ev.preventDefault();
+  const name = String(routerGroupNameInput?.value || '').trim();
+  if (!name) return;
+  const res = await fetch('/api/router-groups/save', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{name}})}});
+  const data = await res.json().catch(() => ({{}}));
+  if (!res.ok || !data.ok) {{ showRouterGroupMsg(data.error || 'Не удалось создать группу', true); return; }}
+  routerGroups = Array.isArray(data.groups) ? data.groups : routerGroups;
+  routerGroupNameInput.value = '';
+  showRouterGroupMsg('Группа создана.');
+  renderRouterGroups();
+  renderRouterView();
+}});
+if (routerGroupList) routerGroupList.addEventListener('click', async (ev) => {{
+  const button = ev.target.closest('[data-router-group-delete]');
+  if (!button) return;
+  const id = String(button.dataset.routerGroupDelete || '');
+  const group = routerGroups.find((item) => String(item.id) === id);
+  if (!group || !window.confirm(`Удалить группу «${{group.name}}»? Роутеры останутся и перейдут в «Без группы».`)) return;
+  const res = await fetch('/api/router-groups/delete', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{id}})}});
+  const data = await res.json().catch(() => ({{}}));
+  if (!res.ok || !data.ok) {{ showRouterGroupMsg(data.error || 'Не удалось удалить группу', true); return; }}
+  routerGroups = Array.isArray(data.groups) ? data.groups : [];
+  if (routerGroupFilterValue === id) routerGroupFilterValue = '';
+  showRouterGroupMsg('Группа удалена. Роутеры сняты с группы.');
+  renderRouterGroups();
+  await loadRouters();
+}});
 
 routerForm.addEventListener('submit', async (ev) => {{
   ev.preventDefault();
@@ -8193,6 +8410,60 @@ routerForm.addEventListener('submit', async (ev) => {{
   }} else {{
     showRouterMsg(await res.text(), true);
   }}
+}});
+
+
+
+cards.addEventListener('click', async (ev) => {{
+  const pickerToggle = ev.target.closest('[data-router-group-picker-toggle]');
+  if (pickerToggle) {{
+    ev.preventDefault();
+    ev.stopPropagation();
+    const routerId = String(pickerToggle.dataset.routerGroupPickerToggle || '');
+    const options = cards.querySelector(`[data-router-group-options="${{CSS.escape(routerId)}}"]`);
+    if (!options) return;
+    const open = options.hidden;
+    options.hidden = !open;
+    expandedGroupPickers[open ? 'add' : 'delete'](routerId);
+    pickerToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    pickerToggle.textContent = open ? 'Скрыть группы' : 'Открыть группы';
+    return;
+  }}
+  const choice = ev.target.closest('[data-router-group-choice]');
+  if (choice) {{
+    ev.preventDefault();
+    ev.stopPropagation();
+    const routerId = String(choice.dataset.routerId || '');
+    const groupId = String(choice.dataset.routerGroupChoice || '');
+    const res = await fetch('/api/router/' + encodeURIComponent(routerId) + '/group', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{group_id: groupId}})
+    }});
+    const data = await res.json().catch(() => ({{}}));
+    if (!res.ok || !data.ok) {{ showRouterMsg(data.error || 'Не удалось назначить группу', true); return; }}
+    const target = (window.ROUTERS || []).find((item) => String(item.id) === routerId);
+    if (target) target.group_id = groupId;
+    expandedGroupPickers.add(routerId);
+    renderRouterGroups();
+    renderRouterView();
+    return;
+  }}
+  const toggle = ev.target.closest('[data-router-group-toggle]');
+  if (!toggle) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const section = toggle.closest('[data-router-group-section]');
+  const groupCards = section && section.querySelector('.routerGroupCards');
+  if (!groupCards) return;
+  const key = String(toggle.dataset.routerGroupToggle || '');
+  const isOpen = groupCards.hidden;
+  groupCards.hidden = !isOpen;
+  section?.classList.toggle('groupClosed', !isOpen);
+  toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  toggle.textContent = isOpen ? 'Скрыть группу' : 'Открыть группу';
+  if (isOpen) openRouterGroups.add(key);
+  else openRouterGroups.delete(key);
 }});
 
 routerStats.addEventListener('click', (ev) => {{
@@ -8290,8 +8561,10 @@ cards.addEventListener('click', async (ev) => {{
     const body = document.getElementById(toggleId);
     if (!body) return;
     body.hidden = !body.hidden;
+    if (body.hidden) expandedCardDetails.delete(toggleId);
+    else expandedCardDetails.add(toggleId);
     ev.target.setAttribute('aria-expanded', body.hidden ? 'false' : 'true');
-    ev.target.textContent = body.hidden ? 'Открыть' : 'Скрыть';
+    ev.target.textContent = body.hidden ? 'Открыть данные' : 'Скрыть данные';
     return;
   }}
   const actionsToggleId = ev.target?.dataset?.actionsToggle;
@@ -10905,6 +11178,7 @@ if (authMeta && typeof authMeta === 'object' && Object.keys(authMeta).length) {{
   renderAuthMeta();
   syncOwnerChrome();
 }}
+loadRouterGroups().catch(() => {{}});
 const clientVersionRedirecting = ensureClientVersion();
 if (!clientVersionRedirecting) {{
   loadAuthMeta({{silent: true}}).catch(() => {{}});
@@ -11967,7 +12241,7 @@ button:hover{{filter:brightness(1.06)}}
       <form class="login" method="post" action="/login">
     {error_html}
     <span class="brand">
-      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v107</span></span></h1>
+      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v108</span></span></h1>
     </span>
     <label for="hubUsername">Логин</label>
     <input id="hubUsername" name="username" autocomplete="off" autofocus required>
@@ -12439,7 +12713,7 @@ body::after{{content:"";position:fixed;inset:0;pointer-events:none;background:li
                 <circle cx="65" cy="59" r="3" fill="#E5F2FF"/>
               </svg>
             </div>
-            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v107</span></h2>
+            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v108</span></h2>
           </div>
         </div>
         <div class="brandBottom">
@@ -16387,6 +16661,11 @@ exit 127
                     (profile or {}).get("username") or current_username(),
                     list_hub_sessions(session_token_value, self.current_or_owner_session_scope()),
                     list_notifications(0, 40) if not profile or profile.get("is_owner") else [],
+                    {
+                        "username": (profile or {}).get("username") or current_username(),
+                        "is_owner": bool(profile and profile.get("is_owner")),
+                        "can_add_router": bool(profile and account_can_add_router(profile)),
+                    },
                 ).encode("utf-8"),
                 "text/html; charset=utf-8",
                 extra_headers,
@@ -16396,6 +16675,11 @@ exit 127
             with self.app.conn() as conn:
                 routers = self.visible_routers(conn)
             self.send_json(200, {"routers": routers})
+            return
+        if path == "/api/router-groups":
+            with self.app.conn() as conn:
+                groups = list_router_groups(conn)
+            self.send_json(200, {"groups": groups})
             return
         if path == "/api/backup/download":
             if not self.require_owner():
@@ -16811,6 +17095,81 @@ exit 127
             except Exception as exc:
                 self.send_text(500, str(exc))
             return
+        if path == "/api/router-groups/save":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                payload = self.read_payload()
+                name = clean_router_group_name(payload.get("name"))
+                group_id = clean_router_group_id(payload.get("id"))
+                if not name:
+                    raise ValueError("Название группы не должно быть пустым")
+                with self.app.conn() as conn:
+                    if group_id:
+                        row = conn.execute("select * from router_groups where id = ?", (group_id,)).fetchone()
+                        if not row:
+                            raise ValueError("Группа не найдена")
+                        duplicate = conn.execute(
+                            "select 1 from router_groups where lower(name) = lower(?) and id != ?",
+                            (name, group_id),
+                        ).fetchone()
+                        if duplicate:
+                            raise ValueError("Группа с таким названием уже есть")
+                        conn.execute("update router_groups set name = ?, updated_at = ? where id = ?", (name, now_ts(), group_id))
+                    else:
+                        duplicate = conn.execute("select 1 from router_groups where lower(name) = lower(?)", (name,)).fetchone()
+                        if duplicate:
+                            raise ValueError("Группа с таким названием уже есть")
+                        group_id = make_router_group_id(conn, name)
+                        ts = now_ts()
+                        conn.execute(
+                            "insert into router_groups (id, name, sort_order, created_at, updated_at) values (?, ?, ?, ?, ?)",
+                            (group_id, name, len(list_router_groups(conn)), ts, ts),
+                        )
+                    conn.commit()
+                    groups = list_router_groups(conn)
+                self.send_json(200, {"ok": True, "groups": groups})
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if path == "/api/router-groups/delete":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                payload = self.read_payload()
+                group_id = clean_router_group_id(payload.get("id"))
+                if not group_id:
+                    raise ValueError("Не указана группа")
+                with self.app.conn() as conn:
+                    deleted = conn.execute("delete from router_groups where id = ?", (group_id,)).rowcount
+                    if deleted:
+                        conn.execute("update routers set group_id = '', updated_at = ? where group_id = ?", (now_ts(), group_id))
+                        conn.commit()
+                    groups = list_router_groups(conn)
+                self.send_json(200, {"ok": True, "deleted": bool(deleted), "groups": groups})
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if path.startswith("/api/router/") and path.endswith("/group"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                router_id = urllib.parse.unquote(path.split("/")[3])
+                payload = self.read_payload()
+                group_id = clean_router_group_id(payload.get("group_id"))
+                with self.app.conn() as conn:
+                    row = get_active_router(conn, router_id)
+                    if not row:
+                        raise ValueError("Роутер не найден")
+                    if not router_group_exists(conn, group_id):
+                        raise ValueError("Группа не найдена")
+                    conn.execute("update routers set group_id = ?, updated_at = ? where id = ?", (group_id, now_ts(), router_id))
+                    conn.commit()
+                    router = row_to_router(get_router(conn, router_id))
+                self.send_json(200, {"ok": True, "router": router})
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            return
         if path == "/api/router":
             if not self.require_add_router(json_mode=True):
                 return
@@ -16818,6 +17177,7 @@ exit 127
                 current = self.current_account_profile(touch=False) or {}
                 payload = self.read_payload()
                 router_id = clean_router_id(payload.get("id"))
+                payload["group_id"] = clean_router_group_id(payload.get("group_id"))
                 entry_port = int(payload.get("entry_port") or 0)
                 ssh_entry_port = int(payload.get("ssh_entry_port") or (entry_port + 1000))
                 if entry_port <= 0:
@@ -16844,6 +17204,9 @@ exit 127
                             409,
                             f"ssh_entry_port {ssh_entry_port} уже занят роутером '{ssh_port_owner['id']}'. Поставь entry_port так, чтобы entry_port + 1000 был свободен.",
                         )
+                        return
+                    if not router_group_exists(conn, payload["group_id"]):
+                        self.send_text(400, "Группа роутера не найдена")
                         return
                     payload["ssh_entry_port"] = ssh_entry_port
                     row = upsert_router(conn, payload)
