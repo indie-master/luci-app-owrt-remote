@@ -13,6 +13,7 @@ import hashlib
 import html
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -110,6 +111,10 @@ SESSION_TTL_SECONDS = int(os.environ.get("OWRT_REMOTE_SESSION_TTL", str(30 * 24 
 CAPTCHA_TTL_SECONDS = 600
 CAPTCHA_MODE_DIGITS = "digits"
 CAPTCHA_MODE_RECAPTCHA = "recaptcha"
+CAPTCHA_MODE_RECAPTCHA_V3 = "recaptcha_v3"
+CAPTCHA_RECAPTCHA_MODES = (CAPTCHA_MODE_RECAPTCHA, CAPTCHA_MODE_RECAPTCHA_V3)
+RECAPTCHA_V3_ACTION = "login"
+RECAPTCHA_V3_MIN_SCORE = 0.5
 ROUTER_ACCESS_FLAGS = ("A", "B", "G")
 ROUTER_ACCESS_LABELS = {
     "A": "Web only",
@@ -605,12 +610,25 @@ def default_captcha_state():
         "mode": CAPTCHA_MODE_DIGITS,
         "site_key": "",
         "secret_key": "",
+        "min_score": RECAPTCHA_V3_MIN_SCORE,
     }
 
 
 def sanitize_captcha_mode(value):
     value = str(value or "").strip().lower()
-    return CAPTCHA_MODE_RECAPTCHA if value == CAPTCHA_MODE_RECAPTCHA else CAPTCHA_MODE_DIGITS
+    return value if value in CAPTCHA_RECAPTCHA_MODES else CAPTCHA_MODE_DIGITS
+
+
+def parse_recaptcha_score(value):
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        score = float(value)
+        if not math.isfinite(score) or not 0 <= score <= 1:
+            raise ValueError
+        return score
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Порог reCAPTCHA v3 должен быть числом от 0 до 1") from None
 
 
 def sanitize_captcha_state(item):
@@ -619,6 +637,10 @@ def sanitize_captcha_state(item):
     clean["mode"] = sanitize_captcha_mode(item.get("mode"))
     clean["site_key"] = str(item.get("site_key") or "").strip()[:240]
     clean["secret_key"] = str(item.get("secret_key") or "").strip()[:512]
+    try:
+        clean["min_score"] = parse_recaptcha_score(item.get("min_score", RECAPTCHA_V3_MIN_SCORE))
+    except ValueError:
+        clean["min_score"] = RECAPTCHA_V3_MIN_SCORE
     return clean
 
 
@@ -626,7 +648,7 @@ def effective_captcha_state(auth=None):
     auth = normalize_auth_state(auth or load_auth())
     state = sanitize_captcha_state(auth.get("captcha"))
     configured = bool(state.get("site_key") and state.get("secret_key"))
-    effective_mode = CAPTCHA_MODE_RECAPTCHA if state.get("mode") == CAPTCHA_MODE_RECAPTCHA and configured else CAPTCHA_MODE_DIGITS
+    effective_mode = state["mode"] if state["mode"] in CAPTCHA_RECAPTCHA_MODES and configured else CAPTCHA_MODE_DIGITS
     state["configured"] = configured
     state["effective_mode"] = effective_mode
     return state
@@ -996,6 +1018,7 @@ def admin_auth_meta(auth=None):
             "configured": bool(captcha.get("configured")),
             "site_key": auth.get("captcha", {}).get("site_key", ""),
             "secret_key": auth.get("captcha", {}).get("secret_key", ""),
+            "min_score": captcha["min_score"],
         },
         "passkeys": [
             {
@@ -2767,7 +2790,7 @@ def verify_captcha(token, answer):
         return False
 
 
-def verify_recaptcha_token(secret_key, response_token, remote_ip="", expected_hostname=""):
+def verify_recaptcha_token(secret_key, response_token, remote_ip="", expected_hostname="", expected_action="", min_score=RECAPTCHA_V3_MIN_SCORE):
     secret_key = str(secret_key or "").strip()
     response_token = str(response_token or "").strip()
     if not secret_key or not response_token:
@@ -2782,7 +2805,9 @@ def verify_recaptcha_token(secret_key, response_token, remote_ip="", expected_ho
         result = oauth_fetch_json(RECAPTCHA_VERIFY_URL, method="POST", data=payload)
     except Exception as exc:
         return False, f"Не удалось проверить Google reCAPTCHA: {exc}"
-    if not result.get("success"):
+    if not isinstance(result, dict):
+        return False, "Google reCAPTCHA вернула некорректный ответ"
+    if result.get("success") is not True:
         errors = result.get("error-codes", [])
         detail = ", ".join(str(item) for item in errors if str(item).strip())
         if "timeout-or-duplicate" in errors:
@@ -2790,20 +2815,46 @@ def verify_recaptcha_token(secret_key, response_token, remote_ip="", expected_ho
         return False, f"Google reCAPTCHA отклонена{': ' + detail if detail else ''}"
     actual_hostname = str(result.get("hostname") or "").strip().lower()
     expected_hostname = str(expected_hostname or "").strip().lower()
-    if expected_hostname and actual_hostname and actual_hostname != expected_hostname:
+    if expected_hostname and actual_hostname != expected_hostname:
         return False, f"Google reCAPTCHA выдана для другого хоста: {actual_hostname}"
+    if expected_action:
+        if str(result.get("action") or "") != expected_action:
+            return False, "Google reCAPTCHA v3 выдана для другого действия"
+        try:
+            if not isinstance(result.get("score"), (int, float)):
+                raise ValueError
+            score = parse_recaptcha_score(result["score"])
+            threshold = parse_recaptcha_score(min_score)
+        except ValueError:
+            return False, "Google reCAPTCHA v3 вернула некорректную оценку"
+        if score < threshold:
+            return False, "Google reCAPTCHA v3 отклонила вход. Попробуй ещё раз или используй другой способ входа."
     return True, ""
 
 
 def login_recaptcha_script(auth=None):
     state = effective_captcha_state(auth)
-    if state.get("effective_mode") != CAPTCHA_MODE_RECAPTCHA:
+    if state.get("effective_mode") not in CAPTCHA_RECAPTCHA_MODES:
         return ""
+    if state["effective_mode"] == CAPTCHA_MODE_RECAPTCHA_V3:
+        site_key = urllib.parse.quote(state["site_key"], safe="")
+        return f'<script src="https://www.google.com/recaptcha/api.js?render={site_key}" async defer></script>'
     return '<script src="https://www.google.com/recaptcha/api.js" async defer></script>'
+
+
+def recaptcha_v3_captcha_html(auth=None):
+    state = effective_captcha_state(auth)
+    site_key = html.escape(state["site_key"], quote=True)
+    return f'''<div class="captchaSection captchaSectionRecaptcha">
+      <div class="captchaHeading">Защита Google reCAPTCHA v3</div>
+      <input type="hidden" name="g-recaptcha-response" value="" data-recaptcha-v3-site-key="{site_key}" data-recaptcha-action="{RECAPTCHA_V3_ACTION}">
+    </div>'''
 
 
 def legacy_login_captcha_html(auth=None):
     state = effective_captcha_state(auth)
+    if state["effective_mode"] == CAPTCHA_MODE_RECAPTCHA_V3:
+        return recaptcha_v3_captcha_html(auth)
     if state.get("effective_mode") == CAPTCHA_MODE_RECAPTCHA:
         safe_site_key = html.escape(state.get("site_key", ""), quote=True)
         return f"""
@@ -2823,6 +2874,8 @@ def legacy_login_captcha_html(auth=None):
 
 def modern_login_captcha_html(auth=None):
     state = effective_captcha_state(auth)
+    if state["effective_mode"] == CAPTCHA_MODE_RECAPTCHA_V3:
+        return recaptcha_v3_captcha_html(auth)
     if state.get("effective_mode") == CAPTCHA_MODE_RECAPTCHA:
         safe_site_key = html.escape(state.get("site_key", ""), quote=True)
         return f"""
@@ -4608,7 +4661,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div class="brand">
       <div class="desktopHeader">
         <div class="desktopHeaderTop">
-          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v109</span></span></h1>
+          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v110</span></span></h1>
           <div class="routerSearchDock" id="routerSearchDock">
             <button class="routerSearchToggle" id="routerSearchToggle" type="button" aria-expanded="false" aria-controls="routerSearchPanel" data-active="false">
               <span>Поиск роутеров</span>
@@ -4960,7 +5013,7 @@ systemctl restart owrt-remote-xray</pre>
       </div>
     </div>
     <div class="mobileSearchDock" id="mobileRouterSearchDock">
-      <span class="mobileSearchVersion">v109</span>
+      <span class="mobileSearchVersion">v110</span>
       <button class="routerSearchToggle mobilePanelToggle primary" id="mobileRouterSearchToggle" type="button" aria-expanded="false" aria-controls="mobileRouterSearchPanel" data-active="false">
         <span>Поиск роутеров</span>
       </button>
@@ -8872,6 +8925,8 @@ const authUsernameField = authForm && authForm.elements ? authForm.elements.name
 let authCaptchaModeField = null;
 let authCaptchaSiteKeyField = null;
 let authCaptchaSecretKeyField = null;
+let authCaptchaMinScoreField = null;
+let authCaptchaDraftDirty = false;
 const authMsg = document.getElementById('authMsg');
 const authSummary = document.getElementById('authSummary');
 const totpState = document.getElementById('totpState');
@@ -9499,16 +9554,22 @@ function ensureCaptchaSettingsFields() {{
     const wrap = document.createElement('div');
     wrap.className = 'wide';
     wrap.dataset.captchaConfig = 'true';
+    wrap.addEventListener('input', () => {{ authCaptchaDraftDirty = true; }});
+    wrap.addEventListener('change', () => {{ authCaptchaDraftDirty = true; }});
     wrap.innerHTML = `
       <div style="display:grid;gap:8px;padding:10px 12px;border:1px solid rgba(148,163,184,.18);border-radius:8px;background:rgba(255,255,255,.03)">
         <strong style="font-size:13px">Капча на экране входа</strong>
-        <span style="color:var(--muted);font-size:12px;line-height:1.45">Можно оставить цифровую капчу или переключить вход на Google reCAPTCHA v2 Checkbox. Ключ должен быть выпущен для текущего домена.</span>
+        <span style="color:var(--muted);font-size:12px;line-height:1.45">Цифры, Google reCAPTCHA v2 Checkbox или v3 без галочки. Используй ключи выбранной версии, выпущенные для домена панели.</span>
         <select class="wide" name="captcha_mode">
           <option value="{CAPTCHA_MODE_DIGITS}">Капча: цифры</option>
           <option value="{CAPTCHA_MODE_RECAPTCHA}">Капча: Google reCAPTCHA v2 Checkbox</option>
+          <option value="{CAPTCHA_MODE_RECAPTCHA_V3}">Капча: Google reCAPTCHA v3</option>
         </select>
-        <input class="wide" name="captcha_site_key" placeholder="reCAPTCHA v2 Site Key">
-        <input class="wide" name="captcha_secret_key" placeholder="reCAPTCHA v2 Secret Key">
+        <input class="wide" name="captcha_site_key" placeholder="reCAPTCHA Site Key" aria-label="reCAPTCHA Site Key">
+        <input class="wide" name="captcha_secret_key" placeholder="reCAPTCHA Secret Key" aria-label="reCAPTCHA Secret Key">
+        <label class="wide" data-captcha-score hidden>Минимальная оценка v3 (0–1)
+          <input class="wide" name="captcha_min_score" type="number" min="0" max="1" step="0.01" value="{RECAPTCHA_V3_MIN_SCORE}">
+        </label>
       </div>
     `;
     const saveBtn = authForm.querySelector('button');
@@ -9517,6 +9578,32 @@ function ensureCaptchaSettingsFields() {{
   authCaptchaModeField = authForm.elements ? authForm.elements.namedItem('captcha_mode') : null;
   authCaptchaSiteKeyField = authForm.elements ? authForm.elements.namedItem('captcha_site_key') : null;
   authCaptchaSecretKeyField = authForm.elements ? authForm.elements.namedItem('captcha_secret_key') : null;
+  authCaptchaMinScoreField = authForm.elements ? authForm.elements.namedItem('captcha_min_score') : null;
+  if (authCaptchaModeField && !authCaptchaModeField.dataset.captchaBound) {{
+    authCaptchaModeField.dataset.captchaBound = 'true';
+    authCaptchaModeField.addEventListener('change', () => updateCaptchaSettingsMode(true));
+  }}
+}}
+
+function updateCaptchaSettingsMode(clearKeys = false) {{
+  if (!authCaptchaModeField) return;
+  const isGoogle = ['{CAPTCHA_MODE_RECAPTCHA}', '{CAPTCHA_MODE_RECAPTCHA_V3}'].includes(authCaptchaModeField.value);
+  const isV3 = authCaptchaModeField.value === '{CAPTCHA_MODE_RECAPTCHA_V3}';
+  const version = isV3 ? 'v3' : 'v2';
+  const scoreLabel = authForm.querySelector('[data-captcha-score]');
+  if (scoreLabel) scoreLabel.hidden = !isV3;
+  if (authCaptchaMinScoreField) authCaptchaMinScoreField.disabled = !isV3;
+  if (clearKeys) authCaptchaDraftDirty = true;
+  [authCaptchaSiteKeyField, authCaptchaSecretKeyField].forEach((field) => {{
+    if (!field) return;
+    field.hidden = !isGoogle;
+    field.disabled = !isGoogle;
+    field.required = isGoogle;
+    if (clearKeys || !isGoogle) field.value = '';
+  }});
+  if ((clearKeys || !isGoogle) && authCaptchaMinScoreField) authCaptchaMinScoreField.value = {RECAPTCHA_V3_MIN_SCORE};
+  if (authCaptchaSiteKeyField) authCaptchaSiteKeyField.placeholder = `reCAPTCHA ${{version}} Site Key`;
+  if (authCaptchaSecretKeyField) authCaptchaSecretKeyField.placeholder = `reCAPTCHA ${{version}} Secret Key`;
 }}
 
 function authB64urlToBytes(value) {{
@@ -9729,23 +9816,29 @@ function renderAuthMeta() {{
   const captchaMeta = meta.captcha && typeof meta.captcha === 'object' ? meta.captcha : {{}};
   const captchaMode = String(captchaMeta.mode || '{CAPTCHA_MODE_DIGITS}');
   const captchaConfigured = !!captchaMeta.configured;
-  const captchaPillText = captchaMode === '{CAPTCHA_MODE_RECAPTCHA}'
-    ? (captchaConfigured ? 'Google reCAPTCHA v2' : 'reCAPTCHA v2 без ключей')
+  const captchaIsGoogle = ['{CAPTCHA_MODE_RECAPTCHA}', '{CAPTCHA_MODE_RECAPTCHA_V3}'].includes(captchaMode);
+  const captchaVersion = captchaMode === '{CAPTCHA_MODE_RECAPTCHA_V3}' ? 'v3' : 'v2';
+  const captchaPillText = captchaIsGoogle
+    ? (captchaConfigured ? `Google reCAPTCHA ${{captchaVersion}}` : `reCAPTCHA ${{captchaVersion}} без ключей`)
     : 'Капча: цифры';
   const socialEntries = Object.entries(meta.social || {{}})
     .filter(([, item]) => Number(item && item.linked_count || 0) > 0)
     .map(([provider, item]) => `<span class="authPill">${{escapeHtml((item && item.label) || socialProviderUi[provider]?.label || 'OAuth')}}: ${{Number(item && item.linked_count || 0)}}</span>`);
   authSummary.innerHTML = [
     '<span class="authPill">Пароль</span>',
-    `<span class="authPill ${{captchaMode === '{CAPTCHA_MODE_RECAPTCHA}' && !captchaConfigured ? 'off' : ''}}">${{captchaPillText}}</span>`,
+    `<span class="authPill ${{captchaIsGoogle && !captchaConfigured ? 'off' : ''}}">${{captchaPillText}}</span>`,
     `<span class="authPill ${{totpEnabled ? '' : 'off'}}">${{totpEnabled ? '2FA включена' : '2FA выключена'}}</span>`,
     `<span class="authPill ${{passkeyCount ? '' : 'off'}}">Passkey: ${{passkeyCount}}</span>`,
     `<span class="authPill ${{sshCount ? '' : 'off'}}">ED25519: ${{sshCount}}</span>`,
     ...socialEntries
   ].join('');
-  if (authCaptchaModeField) authCaptchaModeField.value = captchaMode === '{CAPTCHA_MODE_RECAPTCHA}' ? '{CAPTCHA_MODE_RECAPTCHA}' : '{CAPTCHA_MODE_DIGITS}';
-  if (authCaptchaSiteKeyField && document.activeElement !== authCaptchaSiteKeyField) authCaptchaSiteKeyField.value = captchaMeta.site_key || '';
-  if (authCaptchaSecretKeyField && document.activeElement !== authCaptchaSecretKeyField) authCaptchaSecretKeyField.value = captchaMeta.secret_key || '';
+  if (!authCaptchaDraftDirty) {{
+    if (authCaptchaModeField && document.activeElement !== authCaptchaModeField) authCaptchaModeField.value = captchaIsGoogle ? captchaMode : '{CAPTCHA_MODE_DIGITS}';
+    if (authCaptchaSiteKeyField && document.activeElement !== authCaptchaSiteKeyField) authCaptchaSiteKeyField.value = captchaMeta.site_key || '';
+    if (authCaptchaSecretKeyField && document.activeElement !== authCaptchaSecretKeyField) authCaptchaSecretKeyField.value = captchaMeta.secret_key || '';
+    if (authCaptchaMinScoreField && document.activeElement !== authCaptchaMinScoreField) authCaptchaMinScoreField.value = captchaMeta.min_score ?? {RECAPTCHA_V3_MIN_SCORE};
+  }}
+  updateCaptchaSettingsMode();
   totpState.textContent = totpEnabled ? '2FA включена' : '2FA выключена';
   totpState.className = 'authSectionState' + (totpEnabled ? '' : ' off');
   passkeySummary.textContent = passkeyCount ? `Passkey: ${{passkeyCount}}` : '0 ключей';
@@ -11004,18 +11097,20 @@ authMenu.addEventListener('click', async (ev) => {{
 authForm.addEventListener('submit', async (ev) => {{
   ev.preventDefault();
   ev.stopImmediatePropagation();
+  const form = ev.currentTarget;
   setAuthMessage('');
-  const body = new URLSearchParams(new FormData(ev.currentTarget));
+  const body = new URLSearchParams(new FormData(form));
   const res = await fetch('/api/auth', {{method: 'POST', body}});
   const text = await res.text();
   if (res.ok) {{
-    const nextCurrentPassword = ev.currentTarget.password.value ? String(ev.currentTarget.password.value || '') : String(ev.currentTarget.current_password.value || '');
+    const nextCurrentPassword = form.password.value ? String(form.password.value || '') : String(form.current_password.value || '');
     if (ownerPasswordRememberEnabled()) setOwnerPasswordRememberEnabled(true, nextCurrentPassword);
     setAuthMessage(text || 'Доступ обновлен');
-    restoreOwnerPasswordInput(ev.currentTarget.current_password, nextCurrentPassword);
-    ev.currentTarget.password.value = '';
-    ev.currentTarget.password_confirm.value = '';
+    restoreOwnerPasswordInput(form.current_password, nextCurrentPassword);
+    form.password.value = '';
+    form.password_confirm.value = '';
     authUsernameDraftDirty = false;
+    authCaptchaDraftDirty = false;
     await loadAuthMeta({{silent: true, forceUsername: true}}).catch(() => {{}});
   }} else {{
     setAuthMessage(text || 'Не удалось сохранить', true);
@@ -12310,7 +12405,7 @@ button:hover{{filter:brightness(1.06)}}
       <form class="login" method="post" action="/login">
     {error_html}
     <span class="brand">
-      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v109</span></span></h1>
+      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v110</span></span></h1>
     </span>
     <label for="hubUsername">Логин</label>
     <input id="hubUsername" name="username" autocomplete="off" autofocus required>
@@ -12782,7 +12877,7 @@ body::after{{content:"";position:fixed;inset:0;pointer-events:none;background:li
                 <circle cx="65" cy="59" r="3" fill="#E5F2FF"/>
               </svg>
             </div>
-            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v109</span></h2>
+            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v110</span></h2>
           </div>
         </div>
         <div class="brandBottom">
@@ -13074,6 +13169,48 @@ let loginAuthMeta = {initial_login_meta_json};
 let sshTicket = '';
 let loginSubmitInFlight = false;
 
+async function prepareLoginRecaptcha() {{
+  const tokenField = passwordLoginForm.querySelector('[data-recaptcha-v3-site-key]');
+  if (!tokenField) return;
+  tokenField.value = '';
+  setLoginRuntimeStatus('Проверяю Google reCAPTCHA v3...', 'info');
+  const token = await new Promise((resolve, reject) => {{
+    let finished = false;
+    let pollId = null;
+    const finish = (error, value) => {{
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timeoutId);
+      window.clearTimeout(pollId);
+      if (error) reject(error); else resolve(value);
+    }};
+    const timeoutId = window.setTimeout(() => finish(new Error('Google reCAPTCHA v3 не ответила. Проверь доступ к Google и попробуй ещё раз.')), 12000);
+    const execute = () => {{
+      if (finished) return;
+      if (!window.grecaptcha || typeof window.grecaptcha.ready !== 'function' || typeof window.grecaptcha.execute !== 'function') {{
+        pollId = window.setTimeout(execute, 100);
+        return;
+      }}
+      try {{
+        window.grecaptcha.ready(() => {{
+          if (finished) return;
+          try {{
+            Promise.resolve(window.grecaptcha.execute(tokenField.dataset.recaptchaV3SiteKey, {{action: tokenField.dataset.recaptchaAction}}))
+              .then((value) => value ? finish(null, value) : finish(new Error('Google reCAPTCHA v3 не выдала токен. Попробуй ещё раз.')))
+              .catch(() => finish(new Error('Не удалось пройти Google reCAPTCHA v3. Проверь ключи и попробуй ещё раз.')));
+          }} catch (err) {{
+            finish(new Error('Не удалось запустить Google reCAPTCHA v3. Проверь ключи и попробуй ещё раз.'));
+          }}
+        }});
+      }} catch (err) {{
+        finish(new Error('Не удалось загрузить Google reCAPTCHA v3. Попробуй ещё раз.'));
+      }}
+    }};
+    execute();
+  }});
+  tokenField.value = token;
+}}
+
 function setActiveAuthTab(name) {{
   const activeTab = name === 'quick' ? 'quick' : 'password';
   authTabButtons.forEach((button) => {{
@@ -13289,16 +13426,18 @@ if (passwordLoginForm) {{
       hubOtp.setCustomValidity('');
     }}
     if (passwordLoginForm.reportValidity && !passwordLoginForm.reportValidity()) return;
-    if (!window.FormData || !window.fetch || !window.AbortController) {{
-      passwordLoginForm.submit();
-      return;
-    }}
     loginSubmitInFlight = true;
     if (passwordLoginSubmitBtn) passwordLoginSubmitBtn.disabled = true;
-    setLoginRuntimeStatus('Проверяю вход и сохраняю сессию...', 'info');
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 20000);
+    let timeoutId = null;
     try {{
+      await prepareLoginRecaptcha();
+      if (!window.FormData || !window.fetch || !window.AbortController) {{
+        passwordLoginForm.submit();
+        return;
+      }}
+      setLoginRuntimeStatus('Проверяю вход и сохраняю сессию...', 'info');
+      const controller = new AbortController();
+      timeoutId = window.setTimeout(() => controller.abort(), 20000);
       const response = await fetch(passwordLoginForm.action || '/login', {{
         method: 'POST',
         body: new FormData(passwordLoginForm),
@@ -13342,6 +13481,11 @@ if (passwordLoginForm) {{
       setLoginRuntimeStatus(message, 'bad');
     }} finally {{
       window.clearTimeout(timeoutId);
+      const tokenField = passwordLoginForm.querySelector('[data-recaptcha-v3-site-key]');
+      if (tokenField) tokenField.value = '';
+      if (!tokenField && window.grecaptcha && typeof window.grecaptcha.reset === 'function') {{
+        try {{ window.grecaptcha.reset(); }} catch (err) {{ /* Widget may still be loading. */ }}
+      }}
       loginSubmitInFlight = false;
       if (passwordLoginSubmitBtn) passwordLoginSubmitBtn.disabled = false;
     }}
@@ -13646,7 +13790,7 @@ def login_html(error=""):
     auth = normalize_auth_state(load_auth())
     page = _base_login_html(error)
     state = effective_captcha_state(auth)
-    if state.get("effective_mode") != CAPTCHA_MODE_RECAPTCHA:
+    if state.get("effective_mode") not in CAPTCHA_RECAPTCHA_MODES:
         return page
     replacement = modern_login_captcha_html(auth)
     page, count = re.subn(
@@ -13996,7 +14140,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("incomplete request body")
         return body
 
-    def read_payload(self):
+    def read_payload(self, *, keep_blank_values=False):
         body = self.read_body()
         ctype = self.headers.get("Content-Type", "")
         if "application/json" in ctype:
@@ -14027,7 +14171,7 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 payload[name] = raw.decode(part.get_content_charset() or "utf-8", errors="replace")
             return payload
-        parsed = urllib.parse.parse_qs(body.decode("utf-8"))
+        parsed = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=keep_blank_values)
         return {k: v[-1] for k, v in parsed.items()}
 
     def session_cookie(self, token):
@@ -14096,7 +14240,7 @@ class Handler(BaseHTTPRequestHandler):
     def verify_login_captcha(self, payload, auth=None):
         auth = normalize_auth_state(auth or load_auth())
         state = effective_captcha_state(auth)
-        if state.get("effective_mode") == CAPTCHA_MODE_RECAPTCHA:
+        if state.get("effective_mode") in CAPTCHA_RECAPTCHA_MODES:
             token = (
                 (payload or {}).get("g-recaptcha-response")
                 or (payload or {}).get("recaptcha_token")
@@ -14107,6 +14251,8 @@ class Handler(BaseHTTPRequestHandler):
                 token,
                 remote_ip=self.client_ip(),
                 expected_hostname=self.request_host_name(),
+                expected_action=RECAPTCHA_V3_ACTION if state["effective_mode"] == CAPTCHA_MODE_RECAPTCHA_V3 else "",
+                min_score=state["min_score"],
             )
         captcha_token = (payload or {}).get("captcha_token", "")
         captcha_answer = (payload or {}).get("captcha_answer", "")
@@ -14464,7 +14610,7 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         self.send_text(200, "Доступ к Hub обновлен")
 
     def update_auth(self):
-        payload = self.read_payload()
+        payload = self.read_payload(keep_blank_values=True)
         auth = normalize_auth_state(load_auth())
         current_password = payload.get("current_password", "")
         if not verify_login(auth.get("username", ""), current_password):
@@ -14473,9 +14619,22 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         username = payload.get("username", auth.get("username", "admin"))
         new_password = payload.get("password", "")
         confirm = payload.get("password_confirm", "")
-        captcha_mode = sanitize_captcha_mode(payload.get("captcha_mode"))
-        captcha_site_key = str(payload.get("captcha_site_key") or "").strip()
-        captcha_secret_key = str(payload.get("captcha_secret_key") or "").strip()
+        previous_captcha = sanitize_captcha_state(auth.get("captcha"))
+        captcha_mode = sanitize_captcha_mode(payload.get("captcha_mode", previous_captcha["mode"]))
+        same_captcha_mode = captcha_mode == previous_captcha["mode"]
+        captcha_site_key = str(payload.get("captcha_site_key", previous_captcha["site_key"] if same_captcha_mode else "") or "").strip()
+        captcha_secret_key = str(payload.get("captcha_secret_key", previous_captcha["secret_key"] if same_captcha_mode else "") or "").strip()
+        captcha_min_score = previous_captcha["min_score"] if same_captcha_mode else RECAPTCHA_V3_MIN_SCORE
+        if captcha_mode == CAPTCHA_MODE_DIGITS:
+            captcha_site_key = ""
+            captcha_secret_key = ""
+            captcha_min_score = RECAPTCHA_V3_MIN_SCORE
+        if captcha_mode == CAPTCHA_MODE_RECAPTCHA_V3:
+            try:
+                captcha_min_score = parse_recaptcha_score(payload.get("captcha_min_score", captcha_min_score))
+            except ValueError as exc:
+                self.send_text(400, str(exc))
+                return
         if new_password:
             if new_password != confirm:
                 self.send_text(400, "Новый пароль и повтор не совпадают")
@@ -14483,8 +14642,9 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
             if len(new_password) < MIN_PASSWORD_LENGTH:
                 self.send_text(400, f"Новый пароль должен быть минимум {MIN_PASSWORD_LENGTH} символа")
                 return
-        if captcha_mode == CAPTCHA_MODE_RECAPTCHA and not (captcha_site_key and captcha_secret_key):
-            self.send_text(400, "Для Google reCAPTCHA v2 Checkbox нужны Site Key и Secret Key")
+        if captcha_mode in CAPTCHA_RECAPTCHA_MODES and not (captcha_site_key and captcha_secret_key):
+            version = "v3" if captcha_mode == CAPTCHA_MODE_RECAPTCHA_V3 else "v2 Checkbox"
+            self.send_text(400, f"Для Google reCAPTCHA {version} нужны Site Key и Secret Key")
             return
         auth["username"] = clean_username(username)
         if new_password:
@@ -14494,6 +14654,7 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
                 "mode": captcha_mode,
                 "site_key": captcha_site_key,
                 "secret_key": captcha_secret_key,
+                "min_score": captcha_min_score,
             }
         )
         auth["updated_at"] = now_ts()

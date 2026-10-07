@@ -1,6 +1,5 @@
 param(
-    [ValidateSet('Install', 'Rollback', 'Monitor')][string]$Action = 'Install',
-    [ValidateRange(1, 1440)][int]$Minutes = 10,
+    [ValidateSet('Install', 'Rollback')][string]$Action = 'Install',
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Vps,
     [switch]$PrepareOnly
 )
@@ -8,7 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $RemoteTarget = $Vps
-$UploadName = 'owrt-resource-' + [guid]::NewGuid().ToString('N')
+$UploadName = 'owrt-recaptcha-v3-' + [guid]::NewGuid().ToString('N')
 $Utf8 = [System.Text.UTF8Encoding]::new($false)
 $UploadFiles = @()
 
@@ -18,7 +17,8 @@ if ($Action -eq 'Install') {
 set -Eeuo pipefail
 stage=/tmp/__UPLOAD_NAME__
 target=/opt/owrt-remote/owrt-remote-hub.py
-backup=/opt/owrt-remote/owrt-remote-hub.py.bak-before-resource-fix-v110
+backup=/opt/owrt-remote/owrt-remote-hub.py.bak-before-recaptcha-v3-v110
+captcha_backup=/opt/owrt-remote/captcha-before-recaptcha-v3-v110.json
 candidate=$target.new-__UPLOAD_NAME__
 changed=0
 cleanup() {
@@ -47,16 +47,26 @@ source = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
 tree = ast.parse(source)
 assert 'v110' in source
 assert 'v108' not in source
-factory = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'connect')
-assert any(isinstance(item, ast.Name) and item.id == 'contextmanager' for item in factory.decorator_list)
-assert any(isinstance(item, ast.Try) and item.finalbody for item in ast.walk(factory))
+assert 'CAPTCHA_MODE_RECAPTCHA_V3' in source
+assert 'prepareLoginRecaptcha' in source
 PY
 # The Linux regression suite uses its own temporary DB and loopback ports.
 # It also exercises a real PTY and verifies child reaping.
-OWRT_RESOURCE_HUB_SOURCE="$stage/hub.py" "$python_bin" "$stage/tests.py" -v
+OWRT_RESOURCE_HUB_SOURCE="$stage/hub.py" "$python_bin" "$stage/resources.py" -v
+OWRT_RECAPTCHA_HUB_SOURCE="$stage/hub.py" "$python_bin" "$stage/recaptcha.py" -v
 
 if [ ! -e "$backup" ]; then cp -a "$target" "$backup"; fi
 test -s "$backup"
+if [ ! -e "$captcha_backup" ]; then
+    "$python_bin" - "$captcha_backup" <<'PY'
+import json, os, pathlib, sys
+auth = pathlib.Path('/var/lib/owrt-remote/hub-auth.json')
+state = json.loads(auth.read_text(encoding='utf-8')) if auth.exists() else {}
+with open(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w', encoding='utf-8') as output:
+    json.dump(state.get('captcha', {'mode': 'digits', 'site_key': '', 'secret_key': ''}), output)
+PY
+fi
+test -s "$captcha_backup"
 printf 'Backup: %s\n' "$backup"
 cp -a "$target" "$stage/previous.py"
 install -m 0755 "$stage/hub.py" "$candidate"
@@ -78,7 +88,7 @@ pid=$(systemctl show owrt-remote -p MainPID --value)
 test "$pid" -gt 0
 printf 'PID=%s FD=%s\n' "$pid" "$(find /proc/$pid/fd -maxdepth 1 -type l | wc -l)"
 systemctl --no-pager --full status owrt-remote | sed -n '1,16p'
-echo RESOURCE_FIX_V110_OK
+echo RECAPTCHA_V3_V110_OK
 '@
 } elseif ($Action -eq 'Rollback') {
     $RemoteScript = @'
@@ -86,9 +96,26 @@ echo RESOURCE_FIX_V110_OK
 set -Eeuo pipefail
 stage=/tmp/__UPLOAD_NAME__
 target=/opt/owrt-remote/owrt-remote-hub.py
-backup=/opt/owrt-remote/owrt-remote-hub.py.bak-before-resource-fix-v110
+backup=/opt/owrt-remote/owrt-remote-hub.py.bak-before-recaptcha-v3-v110
+captcha_backup=/opt/owrt-remote/captcha-before-recaptcha-v3-v110.json
 candidate=$target.rollback-__UPLOAD_NAME__
 changed=0
+restore_captcha() {
+    python3 - "$1" <<'PY'
+import json, os, pathlib, sys, tempfile
+auth = pathlib.Path('/var/lib/owrt-remote/hub-auth.json')
+state = json.loads(auth.read_text(encoding='utf-8'))
+state['captcha'] = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+fd, name = tempfile.mkstemp(prefix='.hub-auth-rollback-', dir=auth.parent)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        json.dump(state, output, ensure_ascii=False, indent=2)
+        output.write('\n')
+    os.replace(name, auth)
+finally:
+    pathlib.Path(name).unlink(missing_ok=True)
+PY
+}
 cleanup() {
     code=$?
     trap - EXIT
@@ -96,6 +123,7 @@ cleanup() {
         echo 'Rollback failed; restoring the file from this attempt.' >&2
         cp -a "$stage/current.py" "$candidate"
         mv -f "$candidate" "$target"
+        restore_captcha "$stage/current-captcha.json"
         systemctl restart owrt-remote || true
     fi
     rm -f "$candidate"
@@ -105,14 +133,24 @@ cleanup() {
 trap cleanup EXIT
 test -s "$target"
 test -s "$backup"
+test -s "$captcha_backup"
 python3 - "$backup" <<'PY'
 import ast, pathlib, sys
 ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
 PY
 cp -a "$target" "$stage/current.py"
+python3 - "$stage/current-captcha.json" <<'PY'
+import json, os, pathlib, sys
+auth = pathlib.Path('/var/lib/owrt-remote/hub-auth.json')
+state = json.loads(auth.read_text(encoding='utf-8'))
+with open(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w', encoding='utf-8') as output:
+    json.dump(state.get('captcha', {}), output)
+PY
 cp -a "$backup" "$candidate"
 changed=1
 mv -f "$candidate" "$target"
+systemctl stop owrt-remote
+restore_captcha "$captcha_backup"
 systemctl restart owrt-remote
 healthy=0
 for attempt in {1..10}; do
@@ -124,19 +162,11 @@ for attempt in {1..10}; do
 done
 test "$healthy" = 1
 printf '\n'
-echo RESOURCE_FIX_ROLLBACK_OK
-'@
-} else {
-    $RemoteScript = @'
-#!/bin/bash
-set -Eeuo pipefail
-stage=/tmp/__UPLOAD_NAME__
-trap 'rm -rf -- "$stage"' EXIT
-python3 "$stage/monitor.py" __MINUTES__
+echo RECAPTCHA_V3_ROLLBACK_OK
 '@
 }
 
-$RemoteScript = $RemoteScript.Replace('__UPLOAD_NAME__', $UploadName).Replace('__MINUTES__', [string]$Minutes)
+$RemoteScript = $RemoteScript.Replace('__UPLOAD_NAME__', $UploadName)
 try {
     $StageRoot = Join-Path ([System.IO.Path]::GetTempPath()) $UploadName
     [System.IO.Directory]::CreateDirectory($StageRoot) | Out-Null
@@ -145,15 +175,13 @@ try {
     if ($Action -eq 'Install') {
         $Payloads = @{
             'hub.py' = Join-Path $RepoRoot 'vps\owrt-remote-hub.py'
-            'tests.py' = Join-Path $RepoRoot 'tests\test_resource_lifecycle.py'
+            'resources.py' = Join-Path $RepoRoot 'tests\test_resource_lifecycle.py'
+            'recaptcha.py' = Join-Path $RepoRoot 'tests\test_recaptcha.py'
         }
         foreach ($Item in $Payloads.GetEnumerator()) {
             $FileText = [System.IO.File]::ReadAllText($Item.Value)
             [System.IO.File]::WriteAllText((Join-Path $StageRoot $Item.Key), $FileText.Replace("`r`n", "`n"), $Utf8)
         }
-    } elseif ($Action -eq 'Monitor') {
-        $MonitorText = [System.IO.File]::ReadAllText((Join-Path $RepoRoot 'tests\monitor_vps_resources.py'))
-        [System.IO.File]::WriteAllText((Join-Path $StageRoot 'monitor.py'), $MonitorText.Replace("`r`n", "`n"), $Utf8)
     }
     if ($PrepareOnly) {
         Write-Host "Prepared only: $StageRoot"
