@@ -1,17 +1,15 @@
-*.ipk
-*.tar.gz
-*.tar.gz.sha256
-.test-output/
-build_dir/
-bin/
-dl/
-staging_dir/
-tmp/
+# local runtime and secrets
+data/
+backups/
+.env
+.env.*
+!.env.example
+!.env.docker.example
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+*.token
 __pycache__/
 *.pyc
-
-# Docker edition private runtime and credentials
-/data/
-/.env
-/backups/
-*.bak
