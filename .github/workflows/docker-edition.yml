@@ -4,25 +4,51 @@ on:
     branches: [docker-edition]
   pull_request:
     paths:
-      - 'docker/**'
-      - 'compose.yaml'
-      - '.env.example'
-      - 'DOCKER-EDITION.md'
+      - "docker/**"
+      - "compose.yaml"
+      - ".env.example"
+      - "DOCKER-EDITION.md"
+      - "tests/test_docker_supervisor.py"
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Syntax check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python unit tests
         run: |
-          python3 -m py_compile docker/hub/systemctl docker/xray/supervisor.py vps/owrt-remote-hub.py
+          python -m py_compile docker/hub/docker_hub.py docker/xray/supervisor.py docker/scripts/verify_backup.py
+          python -m unittest discover -s tests -p test_docker_supervisor.py -v
           sh -n docker/scripts/backup.sh
           sh -n docker/scripts/restore.sh
-      - name: Validate Compose
-        run: docker compose --env-file .env.example config -q
+          sh -n docker/scripts/migrate-from-host.sh
+      - name: Compose validation
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
       - name: Build images
-        run: docker compose --env-file .env.example build
-      - name: Xray version check
-        run: docker run --rm --entrypoint /usr/local/bin/xray owrt-remote-xray:local version
+        run: docker compose build
+      - name: Container smoke test (isolated CI runner)
+        run: |
+          mkdir -p data/state data/xray data/control
+          printf 'ci-dummy-password-12345\n' | docker compose run --rm --no-deps -T hub set-password-stdin admin
+          docker compose up -d
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8088/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8088/health
+          docker compose exec -T hub xray-status
+          docker compose exec -T hub apply-xray
+          docker compose exec -T hub xray-status
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs --tail 100 || true
+      - name: Stop services
+        if: always()
+        run: docker compose down --remove-orphans || true
