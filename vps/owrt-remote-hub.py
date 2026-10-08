@@ -4668,6 +4668,16 @@ def parse_resize_payload(payload):
     return message.get("rows"), message.get("cols")
 
 
+def vps_resource_widgets_html(mobile=False):
+    kind = "mobile" if mobile else "desktop"
+    widgets = "".join(
+        f'<div class="vpsResource badge" data-vps-resource="{key}" title="{label}: ожидаем данные VPS">'
+        f'<span>{label}</span><strong data-vps-resource-value>—</strong></div>'
+        for key, label in (("cpu", "ЦП"), ("memory", "ОЗУ"), ("disk", "ДИСК"))
+    )
+    return f'<div class="vpsResources vpsResources-{kind}" role="group" aria-label="Ресурсы VPS">{widgets}</div>'
+
+
 def dashboard_html(routers, username, sessions=None, notifications=None, auth_bootstrap=None):
     routers_json = json.dumps(routers, ensure_ascii=False)
     sessions_json = json.dumps(sessions or [], ensure_ascii=False)
@@ -4730,6 +4740,22 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
 @media(max-width:680px){{.trafficPanel{{width:min(100%,332px);padding:9px 9px 8px;border-radius:10px}}.trafficControls{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:6px}}.trafficPanel .wolField{{gap:4px;font-size:11px}}.trafficPanel .wolField input{{min-height:32px;padding:0 9px;font-size:12.5px}}.trafficStatusField .wolMeta{{min-height:32px;font-size:11px;line-height:1.18}}.trafficPanel .btn{{min-height:32px;padding:6px 7px;font-size:11px}}.trafficSummaryChip{{min-height:20px;padding:0 7px;font-size:9px}}.trafficViewport{{max-height:min(42svh,350px)}}.trafficIdentity{{text-align:center!important}}.trafficName{{font-size:12px;text-align:center!important}}.trafficMetaLine{{font-size:10px;line-height:1.28;text-align:center!important}}.trafficTotalBadge{{display:grid;width:fit-content;min-width:130px;max-width:180px;justify-self:center!important;margin:0 auto;place-self:center;padding:6px 10px;text-align:center!important}}.trafficTotalBadge strong{{font-size:11px}}.trafficStat{{padding:6px 5px}}.trafficStat strong{{font-size:11px}}}}
 @media(max-width:420px){{.trafficPanel{{width:100%}}.trafficControls{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:5px}}.trafficStatusField,.trafficPasswordField{{grid-column:auto}}.trafficStatusField .wolMeta{{padding:6px 8px}}.trafficTotalBadge{{min-width:118px;max-width:168px}}}}
 @media(max-width:680px){{.routerCardGroup{{margin-top:10px;padding:5px 0;gap:6px}}.routerGroupPickerHead{{min-height:30px}}.routerGroupPickerToggle{{min-height:30px;padding:6px 14px;font-size:11px}}.routerGroupPickerOptions{{width:100%;box-sizing:border-box;grid-template-columns:1fr;gap:6px;padding:6px}}.routerGroupChoice{{min-height:32px;padding:7px 8px;font-size:11px}}}}#diagnosticBuild,.btn[data-diagnose]{{display:none!important}}
+.desktopHeaderTop{{grid-template-columns:var(--hdr-col-1) var(--hdr-col-2) var(--hdr-col-3) var(--hdr-col-4) var(--hdr-col-5) var(--hdr-col-6) var(--hdr-col-7) var(--hdr-col-8);width:100%}}
+.desktopHeaderTop>.appBanner{{grid-column:1/span 2;width:100%;min-width:0;max-width:none}}
+.desktopHeaderTop>.routerSearchDock{{grid-column:3/span 2;width:100%;min-width:0;max-width:none}}
+.desktopHeaderTop>#seasonDock{{grid-column:5;width:100%;min-width:0;max-width:none}}
+.vpsResources{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;min-width:0;width:100%}}
+.vpsResources-desktop{{grid-column:6/span 3}}
+.vpsResources-mobile{{display:none}}
+.vpsResource.badge{{min-width:0;width:100%;height:36px;min-height:36px;padding:8px 10px;font-size:12px;gap:6px;cursor:default}}
+.vpsResource span{{color:var(--muted);font-weight:800}}
+.vpsResource strong{{font-size:12px;font-weight:900;font-variant-numeric:tabular-nums;color:var(--cyan)}}
+.vpsResource[data-vps-resource="memory"] strong{{color:#86efac}}
+.vpsResource[data-vps-resource="disk"] strong{{color:#fde68a}}
+.vpsResource[data-stale="true"] strong{{color:var(--muted)}}
+@media(min-width:681px) and (max-width:980px){{.vpsResource.badge{{padding:8px 4px;font-size:11px;gap:4px}}.vpsResource strong{{font-size:11px}}}}
+@media(min-width:681px) and (max-width:800px){{.vpsResource.badge{{padding:8px 2px;gap:2px}}.vpsResource.badge,.vpsResource strong{{font-size:10px}}}}
+@media(max-width:680px){{.vpsResources-mobile{{display:grid;margin:8px 0 3px}}.vpsResource.badge{{padding:8px 6px;font-size:11px}}.vpsResource strong{{font-size:11px}}}}
 </style>
 </head>
 <body class="preload-mobile-panels">
@@ -4785,6 +4811,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
               </div>
             </section>
           </div>
+          {vps_resource_widgets_html()}
         </div>
         <div class="desktopHeaderBottom">
           <div class="links">
@@ -5136,6 +5163,7 @@ systemctl restart owrt-remote-xray</pre>
         </div>
       </section>
     </div>
+    {vps_resource_widgets_html(mobile=True)}
     <button class="mobilePanelToggle primary" id="hubMenuToggle" type="button" hidden>Открыть меню хаба</button>
     <div id="hubMenuPanelHost"></div>
     <div class="mobileOwnerTools" id="mobileOwnerTools" hidden>
@@ -11504,6 +11532,71 @@ syncRouterSearchToggleState();
   requestRouterRender();
 fillRouterForm(true);
 waitNotificationsLoop();
+function initVpsResourceWidgets() {{
+  const widgets = Array.from(document.querySelectorAll('[data-vps-resource]'));
+  if (!widgets.length) return;
+  let timer = null;
+  let request = null;
+  let stopped = false;
+  const percentText = (value) => typeof value === 'number' && Number.isFinite(value)
+    ? new Intl.NumberFormat('ru-RU', {{maximumFractionDigits: 1}}).format(value) + '%' : '—';
+  const bytesText = (value) => {{
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+    const units = ['Б', 'КиБ', 'МиБ', 'ГиБ', 'ТиБ'];
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {{ value /= 1024; unit++; }}
+    return new Intl.NumberFormat('ru-RU', {{maximumFractionDigits: 1}}).format(value) + ' ' + units[unit];
+  }};
+  const show = (data, failed = false) => widgets.forEach((widget) => {{
+    const key = widget.dataset.vpsResource;
+    const metric = data && data[key];
+    const label = widget.querySelector('span').textContent;
+    widget.querySelector('[data-vps-resource-value]').textContent = percentText(metric && metric.percent);
+    widget.dataset.stale = failed ? 'true' : 'false';
+    let detail = failed ? 'нет связи с VPS' : 'данные пока недоступны';
+    if (metric && typeof metric.percent === 'number') {{
+      detail = key === 'cpu' ? 'нагрузка ' + percentText(metric.percent) + ', vCPU: ' + metric.cores
+        : 'занято ' + bytesText(metric.used_bytes) + ' из ' + bytesText(metric.total_bytes);
+      if (key === 'disk') detail += ' (раздел /)';
+    }}
+    widget.title = label + ': ' + detail;
+    widget.setAttribute('aria-label', widget.title);
+  }});
+  const load = async () => {{
+    if (stopped || document.hidden || request) return;
+    const controller = new AbortController();
+    request = controller;
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    try {{
+      const response = await fetch('/api/vps/resources', {{cache: 'no-store', signal: controller.signal}});
+      if (response.status === 401 || response.status === 403) {{ stopped = true; clearInterval(timer); }}
+      if (!response.ok) throw new Error('VPS resources unavailable');
+      const data = await response.json();
+      if (!data.ok) throw new Error('Invalid VPS resources');
+      if (!document.hidden && !stopped) show(data);
+    }} catch (error) {{
+      if (!document.hidden) show(null, true);
+    }} finally {{
+      clearTimeout(timeout);
+      request = null;
+    }}
+  }};
+  const pause = () => {{
+    clearInterval(timer); timer = null;
+    if (request) request.abort();
+  }};
+  const resume = () => {{
+    pause();
+    if (stopped || document.hidden) return;
+    load();
+    timer = setInterval(load, 3000);
+  }};
+  document.addEventListener('visibilitychange', resume);
+  window.addEventListener('pagehide', pause);
+  window.addEventListener('pageshow', resume);
+  resume();
+}}
+initVpsResourceWidgets();
 setInterval(loadRouters, 5000);
 setInterval(() => loadNotifications(), 30000);
 window.addEventListener('beforeunload', () => {{
@@ -13963,6 +14056,82 @@ def login_html(error=""):
     return page
 
 
+class VpsResourceMonitor:
+    """Shared, nonblocking Linux samples; never spawn commands per browser poll."""
+
+    interval = 3.0
+
+    def __init__(self, proc_dir="/proc", disk_path="/"):
+        self.proc_dir = Path(proc_dir)
+        self.disk_path = disk_path
+        self.lock = threading.Lock()
+        self.last_sample = None
+        self.cached = None
+        self.cpu_previous = self.read_cpu()
+
+    def read_cpu(self):
+        try:
+            with (self.proc_dir / "stat").open(encoding="ascii") as source:
+                values = source.readline().split()
+            if not values or values[0] != "cpu" or len(values) < 5:
+                return None
+            ticks = [int(value) for value in values[1:9]]
+            # guest/guest_nice are already included in user/nice; do not sum twice.
+            return sum(ticks), ticks[3] + (ticks[4] if len(ticks) > 4 else 0)
+        except (OSError, ValueError):
+            return None
+
+    def cpu_usage(self):
+        current = self.read_cpu()
+        previous, self.cpu_previous = self.cpu_previous, current
+        percent = None
+        if current is not None and previous is not None:
+            total, idle = current[0] - previous[0], current[1] - previous[1]
+            if total > 0 and idle >= 0:
+                percent = round(max(0.0, min(100.0, 100 * (total - idle) / total)), 1)
+        return {"percent": percent, "cores": os.cpu_count() or 1}
+
+    def memory_usage(self):
+        try:
+            with (self.proc_dir / "meminfo").open(encoding="ascii") as source:
+                values = {key: int(value.split()[0]) * 1024 for key, value in
+                          (line.split(":", 1) for line in source if ":" in line)}
+            total = values["MemTotal"]
+            available = values.get("MemAvailable")
+            if available is None:
+                available = (values.get("MemFree", 0) + values.get("Buffers", 0) +
+                             values.get("Cached", 0) + values.get("SReclaimable", 0) -
+                             values.get("Shmem", 0))
+            if total <= 0:
+                return None
+            available = max(0, min(total, available))
+            used = total - available
+            return {"percent": round(used * 100 / total, 1), "used_bytes": used,
+                    "total_bytes": total, "available_bytes": available}
+        except (OSError, ValueError, KeyError, IndexError):
+            return None
+
+    def disk_usage(self):
+        try:
+            usage = shutil.disk_usage(self.disk_path)
+            if usage.total <= 0:
+                return None
+            return {"percent": round(usage.used * 100 / usage.total, 1),
+                    "used_bytes": usage.used, "total_bytes": usage.total,
+                    "free_bytes": usage.free, "path": self.disk_path}
+        except OSError:
+            return None
+
+    def snapshot(self):
+        with self.lock:
+            now = time.monotonic()
+            if self.cached is None or now - self.last_sample >= self.interval:
+                self.cached = {"cpu": self.cpu_usage(), "memory": self.memory_usage(),
+                               "disk": self.disk_usage(), "sampled_at": time.time()}
+                self.last_sample = now
+            return self.cached
+
+
 class App:
     def __init__(self, db_path, session, agent, public_url):
         self.db_path = Path(db_path)
@@ -13973,6 +14142,7 @@ class App:
         self.router_state_snapshot = {}
         self.router_monitor_stop = threading.Event()
         self.router_monitor_thread = None
+        self.vps_resources = VpsResourceMonitor()
 
     @contextmanager
     def conn(self):
@@ -16954,6 +17124,12 @@ exit 127
         path = self.parsed().path
         if path == "/health":
             self.send_json(200, {"ok": True})
+            return
+        if path == "/api/vps/resources":
+            if not self.admin_ok():
+                self.send_json(401, {"ok": False, "error": "not authorized"})
+                return
+            self.send_json(200, {"ok": True, **self.app.vps_resources.snapshot()})
             return
         if path == "/favicon.ico":
             self.send_local_asset(FAVICON_ICO_FILE, "image/x-icon")
