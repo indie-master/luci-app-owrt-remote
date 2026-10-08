@@ -104,6 +104,31 @@ def create_initial_config():
         config = hub.make_server_xray_config(rows)
     hub.atomic_write_text(XRAY_CONFIG, json.dumps(config, ensure_ascii=False, indent=2) + "\n", mode=0o600)
 
+class RedactingStdout:
+    """Avoid publishing the upstream Hub's agent token in Docker logs."""
+    def __init__(self, output):
+        self.output = output
+        self.pending = ""
+
+    def write(self, value):
+        self.pending += value
+        while "\n" in self.pending:
+            line, self.pending = self.pending.split("\n", 1)
+            if line.startswith("AGENT_TOKEN:"):
+                line = "AGENT_TOKEN: [REDACTED]"
+            self.output.write(line + "\n")
+        return len(value)
+
+    def flush(self):
+        if self.pending:
+            line = "AGENT_TOKEN: [REDACTED]" if self.pending.startswith("AGENT_TOKEN:") else self.pending
+            self.output.write(line)
+            self.pending = ""
+        self.output.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.output, name)
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "set-password-stdin":
@@ -121,6 +146,7 @@ def main():
         print(json.dumps(request("status"), ensure_ascii=False))
         return
     if cmd == "serve":
+        sys.stdout = RedactingStdout(sys.stdout)
         if not hub.AUTH_FILE.is_file():
             raise SystemExit("No credentials. Run: docker compose run --rm --no-deps -T hub set-password-stdin admin")
         create_initial_config()
