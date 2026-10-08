@@ -20,6 +20,7 @@ FAKE = """#!/usr/bin/env python3
 import json,sys,time
 file=sys.argv[sys.argv.index('-config')+1]
 data=json.load(open(file))
+if not file.endswith('.json'): sys.exit(3)
 if data.get('invalid'):
     sys.exit(1)
 if '-test' in sys.argv:
