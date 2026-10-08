@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: docker/hub/Dockerfile
-    image: owrt-remote-hub:local
+    image: owrt-remote-hub:docker-edition
     network_mode: host
     init: true
     restart: unless-stopped
@@ -12,28 +12,34 @@ services:
       OWRT_REMOTE_BIND: "127.0.0.1"
       OWRT_REMOTE_PORT: "${HUB_PORT:-8088}"
       OWRT_REMOTE_STATE_DIR: /var/lib/owrt-remote
+      OWRT_REMOTE_DB: /var/lib/owrt-remote/hub.db
       OWRT_REMOTE_XRAY_CONFIG: /etc/xray/owrt-remote.json
       OWRT_REMOTE_VLESS_PORT: "${XRAY_PORT:-18443}"
       OWRT_REMOTE_PUBLIC_URL: "${PUBLIC_URL:-}"
-      OWRT_REMOTE_XRAY_SERVICE: owrt-remote-xray
+      OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT: "0"
+      OWRT_CONTROL_SOCKET: /run/owrt-control/xray.sock
     volumes:
       - ./data/state:/var/lib/owrt-remote
       - ./data/xray:/etc/xray
       - ./data/control:/run/owrt-control
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=64m
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/health',timeout=4)"]
+      test: ["CMD", "python3", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('OWRT_REMOTE_PORT','8088')+'/health',timeout=4)"]
       interval: 30s
       timeout: 6s
       retries: 3
+      start_period: 15s
   xray:
     build:
       context: .
       dockerfile: docker/xray/Dockerfile
-    image: owrt-remote-xray:local
+    image: owrt-remote-xray:docker-edition
     network_mode: host
     init: true
     restart: unless-stopped
@@ -41,14 +47,18 @@ services:
       XRAY_CONFIG: /etc/xray/owrt-remote.json
       CONTROL_DIR: /run/owrt-control
     volumes:
-      - ./data/xray:/etc/xray:ro
+      - ./data/xray:/etc/xray
       - ./data/control:/run/owrt-control
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=32m
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os; os.kill(int(open('/run/owrt-control/xray.pid').read()),0)"]
+      test: ["CMD", "python3", "-c", "import json,socket; s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect('/run/owrt-control/xray.sock');s.sendall(b'{\"action\":\"status\"}\n');response=s.recv(2048);assert json.loads(response)['ok']"]
       interval: 30s
-      timeout: 5s
+      timeout: 6s
       retries: 3
+      start_period: 30s
