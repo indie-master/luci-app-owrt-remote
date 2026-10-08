@@ -52,7 +52,7 @@ class Manager:
 
     def install(self, data):
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=".xray-candidate-", dir=CONFIG.parent)
+        fd, name = tempfile.mkstemp(prefix=".xray-candidate-", suffix=".json", dir=CONFIG.parent)
         path = Path(name)
         try:
             with os.fdopen(fd, "w") as f:
