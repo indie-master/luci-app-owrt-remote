@@ -36,6 +36,8 @@ jobs:
       - name: Container smoke test (isolated CI runner)
         run: |
           mkdir -p data/state data/xray data/control
+          sudo chown -R 0:0 data/state data/xray data/control
+          sudo chmod 700 data/state data/xray data/control
           printf 'ci-dummy-password-12345\n' | docker compose run --rm --no-deps -T hub set-password-stdin admin
           docker compose up -d
           for i in $(seq 1 40); do
