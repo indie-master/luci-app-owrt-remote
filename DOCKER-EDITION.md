@@ -16,14 +16,15 @@ The web UI's VPS terminal runs **inside the Hub container** and cannot administe
 
 ## Install on a clean staging VPS
 
-Requirements: Linux amd64/arm64, Docker + Compose v2, unrestricted loopback, free public VLESS port and free local Hub port.
+Requirements: rootful Docker Engine on Linux amd64/arm64, Compose v2, unrestricted loopback, free public VLESS port and free local Hub port. Runtime directories are root-owned (0700) because capabilities are dropped in containers.
 
 ```sh
 git clone --branch docker-edition https://github.com/indie-master/luci-app-owrt-remote.git
 cd luci-app-owrt-remote
 cp .env.example .env
 mkdir -p data/state data/xray data/control
-chmod 700 data/state data/xray data/control
+sudo chown -R 0:0 data/state data/xray data/control
+sudo chmod 700 data/state data/xray data/control
 docker compose config --quiet
 docker compose build
 read -r -s -p 'New Hub password (12+ characters): ' HUB_PASS; echo
