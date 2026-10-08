@@ -87,13 +87,13 @@ def safe_payload(row, hub_url, vps_host_override="", public_url_override=""):
     return _original_payload(data, hub_url, vps_host_override, public_url_override)
 hub.build_openwrt_config_payload = safe_payload
 
-_original_client = hub.make_client_xray_config
+_original_client = hub.make_router_xray_config
 def safe_client(row, *args, **kwargs):
     data = dict(row)
     if data.get("vps_host"):
         data["vps_host"] = clean_host(data["vps_host"])
     return _original_client(data, *args, **kwargs)
-hub.make_client_xray_config = safe_client
+hub.make_router_xray_config = safe_client
 
 def create_initial_config():
     if XRAY_CONFIG.is_file():
