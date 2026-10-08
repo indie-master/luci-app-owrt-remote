@@ -1,44 +1,85 @@
-# Docker Compose edition (experimental)
+# Docker Compose Edition — VPS
 
-The upstream OpenWrt agent remains unchanged. This branch containerizes the **VPS side only**.
-No live host or secrets were used in development.
+Dedicated fork branch `docker-edition`. Only the VPS side is containerized; the OpenWrt agent is retained from upstream. **Do not run this alongside the existing systemd Hub/Xray on the same VPS ports.**
 
 ## Architecture
-- `hub`: upstream Python Hub, bind 127.0.0.1:8088, persistent SQLite and secrets under `data/state`.
-- `xray`: Xray 26.3.27 and small supervisor, reverse endpoints on host networking, reads `data/xray/owrt-remote.json`.
-- Control channel: Hub's restricted `systemctl restart owrt-remote-xray` adapter requests config verification/restart through a shared file; **no Docker socket**.
-- Existing host Nginx reverse proxy is retained. Do not launch alongside host Hub/Xray on the same ports.
 
-## Clean deployment (test VPS recommended)
+- `hub`: upstream Python app, bind `127.0.0.1:8088` by default, persistent SQLite and state. Refuses to serve without a configured administrator password.
+- `xray`: official Xray-core 26.3.27 binary with an isolated supervisor, public VLESS on `18443` by default.
+- Both use `network_mode: host` on Linux to preserve localhost LuCI/SSH forward ports for multiple routers; no container publishes `443`.
+- Synchronous UNIX socket control: validate candidate Xray config before changing files, activate, confirm child stays up, rollback previous config if the new one fails. No systemd, Docker socket or privileged container.
+- Config and state in ignored directories `data/xray`, `data/state`; private control socket in `data/control`.
+- Server generator takes `XRAY_PORT` from `.env` (not hardcoded 8443). VLESS target is normalized to a hostname/IP; public Hub URL remains a URL.
+- Existing Nginx and Remnawave remain external on the host. Do not run the upstream `install-vps.sh` in Docker.
+
+The web UI's VPS terminal runs **inside the Hub container** and cannot administer the host. Host maintenance, Nginx, UFW, certbot remain outside Docker. Heartbeat Online is not proof of a healthy reverse tunnel.
+
+## Install on a clean staging VPS
+
+Requirements: Linux amd64/arm64, Docker + Compose v2, unrestricted loopback, free public VLESS port and free local Hub port.
+
 ```sh
+git clone --branch docker-edition https://github.com/indie-master/luci-app-owrt-remote.git
+cd luci-app-owrt-remote
 cp .env.example .env
-mkdir -p data/{state,xray,control}
+mkdir -p data/state data/xray data/control
 chmod 700 data/state data/xray data/control
+docker compose config --quiet
 docker compose build
-# Initialize DB and admin credentials interactively; do not paste credentials into shell history
-docker compose run --rm hub python /opt/owrt-remote/owrt-remote-hub.py init
-docker compose run --rm hub python /opt/owrt-remote/owrt-remote-hub.py set-login --help
-# Set admin credentials using the supported CLI in an isolated session
-docker compose run --rm hub python /opt/owrt-remote/owrt-remote-hub.py render-xray --out /etc/xray/owrt-remote.json
+read -r -s -p 'New Hub password (12+ characters): ' HUB_PASS; echo
+printf '%s\n' "$HUB_PASS" | docker compose run --rm --no-deps -T hub set-password-stdin admin
+unset HUB_PASS
 docker compose up -d
 docker compose ps
+docker compose exec -T hub xray-status
 ```
-Avoid publishing 8088; bind the host's Nginx to 127.0.0.1:8088. A host network service runs with host port visibility; audit UFW/iptables.
 
-## Migration from legacy systemd service
-1. Develop and test off production. Verify image builds and Xray config syntax.
-2. Schedule maintenance; snapshot filesystem and collect `/var/lib/owrt-remote`, `/etc/xray/owrt-remote.json`, `/opt/owrt-remote` code/version, and service environment. Treat backups as secrets.
-3. For consistent SQLite, stop legacy Hub (or use SQLite backup API), then create the final snapshot. Keep the old systemd units installed but disabled for the cutover.
-4. Copy state files to `data/state/`, Xray config to `data/xray/owrt-remote.json`, restrict permissions, verify UUID/ports locally.
-5. Run `docker compose run --rm xray /usr/local/bin/xray run -test -config /etc/xray/owrt-remote.json` (entrypoint must be overridden: `--entrypoint /usr/local/bin/xray`).
-6. Stop legacy Hub/Xray; start containers; verify ports and `/health`, then test each router's LuCI and SSH.
-7. Roll back by `docker compose down`, restore the saved legacy state/config and start legacy systemd services. Never run both stacks on the same ports.
+An initial Hub does not start with the upstream admin/admin default: you must set a password first. Bind public HTTPS with your **existing host Nginx** to `http://127.0.0.1:8088`. Do not expose Hub HTTP directly. Set `PUBLIC_URL` to your own production URL before onboarding new clients; examples contain no secrets.
 
-## Notes / limitations
-- This edition is not yet integration-tested end-to-end on a real VPS.
-- Any upstream hardcoded systemctl actions beyond the isolated Xray restart are denied intentionally.
-- Hub's old VPS terminal may not manage host services inside Docker; host maintenance remains outside the container.
-- Nginx site changes / Let's Encrypt issuance remain managed by the host.
-- `OWRT_REMOTE_VLESS_PORT` defaults to 18443 in the compose file. Existing per-router VLESS UUIDs must be preserved at migration.
-- Repo's HTTP availability indicator is a heartbeat, not an authenticated check of the reverse path.
-- The `data/`, `.env` and backups are ignored and must never be pushed.
+## Operations
+
+```sh
+docker compose logs -f --tail=80 hub xray
+docker compose exec -T hub list-routers
+docker compose exec -T hub apply-xray
+docker compose exec -T hub xray-status
+```
+
+Hub UI changes trigger a synchronous, validated Xray reload automatically. If you change router records using CLI, explicitly run `apply-xray`. An invalid config is rejected without terminating the active Xray. No automatic reload on individual WAN reconnect (this avoids dropping other tunnels).
+
+## Consistent cold backup and restore
+
+**All backup archives contain UUIDs, tokens, auth data and other private information. Do not upload them into the repository.**
+
+```sh
+docker compose stop hub xray
+sh docker/scripts/backup.sh
+docker compose up -d
+```
+
+This creates a private archive in `backups/` containing the *entire* `state/` directory and the active `xray/` config. Unlike the original built-in Hub backup, this captures the complete Compose volumes. Cold snapshots require Hub and Xray to be stopped.
+
+Restore is allowed **only with stopped services and an empty data directory**:
+
+```sh
+docker compose stop hub xray
+# Move or archive old data/ securely and restore only into an empty destination.
+sh docker/scripts/restore.sh /secure/path/owrt-remote-YYYYMMDDTHHMMSSZ.tar.gz
+docker compose up -d
+```
+
+The restore helper rejects absolute/traversal paths, symlinks, duplicate file entries and oversized payloads; it does not overwrite an existing installation.
+
+## Production migration from systemd (do this later)
+
+1. Test the fork on an **independent staging VM**. Do not connect the same production router to two Xray servers simultaneously. Test UI, actual reverse LuCI and SSH, and rollback.
+2. Take a protected offline copy of original `/var/lib/owrt-remote`, `/etc/xray/owrt-remote.json` and the old app version. Preserve auth, tokens and UUIDs; no credentials go into Git.
+3. During a maintenance window, stop only `owrt-remote` and `owrt-remote-xray` systemd services. Leave Nginx/Remnawave untouched.
+4. With the new Docker project `data/state` and `data/xray` not yet created, run `sh docker/scripts/migrate-from-host.sh` (requires old units inactive). This imports the legacy state and Xray config without changing originals.
+5. Verify `XRAY_PORT` in `.env` equals the actual inbound port in the imported Xray JSON, and `HUB_PORT` equals host Nginx's upstream port. Keep original tunnel hostnames and client UUIDs.
+6. Start `docker compose up -d`. Check health endpoints plus actual LuCI and SSH for each router. The old systemd units remain installed but stopped.
+7. Rollback: `docker compose stop hub xray`, restore the previously saved host state/config, start only the original two systemd units. Never enable both stacks at once on overlapping ports.
+
+An original Hub-format archive (`manifest.json` + `state/`) can be imported separately using original `restore` CLI, but it is **not interchangeable** with the cold Compose `state/xray` archive.
+
+The current fork is not presented as production-proven until independently tested on a VPS. Code does not contact the user's Belt host, nor include client IDs, real domain names, tokens or server keys.
