@@ -45,9 +45,9 @@ jobs:
             sleep 2
           done
           curl -fsS http://127.0.0.1:8088/health
-          docker compose exec -T hub xray-status
-          docker compose exec -T hub apply-xray
-          docker compose exec -T hub xray-status
+          docker compose exec -T hub owrt-hub xray-status
+          docker compose exec -T hub owrt-hub apply-xray
+          docker compose exec -T hub owrt-hub xray-status
       - name: Dump container logs on failure
         if: failure()
         run: docker compose logs --tail 100 || true
