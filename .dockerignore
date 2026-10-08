@@ -1,6 +1,16 @@
-.git
-data
+# Never send runtime state/secrets to Docker build context.
+data/
+backups/
 .env
-*.tar.gz
-*.bak
-__pycache__
+.env.*
+!.env.example
+!.env.docker.example
+.git/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+*.token
