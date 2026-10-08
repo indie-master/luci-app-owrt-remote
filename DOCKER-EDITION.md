@@ -32,7 +32,7 @@ printf '%s\n' "$HUB_PASS" | docker compose run --rm --no-deps -T hub set-passwor
 unset HUB_PASS
 docker compose up -d
 docker compose ps
-docker compose exec -T hub xray-status
+docker compose exec -T hub owrt-hub xray-status
 ```
 
 An initial Hub does not start with the upstream admin/admin default: you must set a password first. Bind public HTTPS with your **existing host Nginx** to `http://127.0.0.1:8088`. Do not expose Hub HTTP directly. Set `PUBLIC_URL` to your own production URL before onboarding new clients; examples contain no secrets.
@@ -41,9 +41,9 @@ An initial Hub does not start with the upstream admin/admin default: you must se
 
 ```sh
 docker compose logs -f --tail=80 hub xray
-docker compose exec -T hub list-routers
-docker compose exec -T hub apply-xray
-docker compose exec -T hub xray-status
+docker compose exec -T hub owrt-hub list-routers
+docker compose exec -T hub owrt-hub apply-xray
+docker compose exec -T hub owrt-hub xray-status
 ```
 
 Hub UI changes trigger a synchronous, validated Xray reload automatically. If you change router records using CLI, explicitly run `apply-xray`. An invalid config is rejected without terminating the active Xray. No automatic reload on individual WAN reconnect (this avoids dropping other tunnels).
