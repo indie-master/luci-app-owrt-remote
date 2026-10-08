@@ -1,0 +1,28 @@
+name: Docker Edition checks
+on:
+  push:
+    branches: [docker-edition]
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'compose.yaml'
+      - '.env.example'
+      - 'DOCKER-EDITION.md'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          python3 -m py_compile docker/hub/systemctl docker/xray/supervisor.py vps/owrt-remote-hub.py
+          sh -n docker/scripts/backup.sh
+          sh -n docker/scripts/restore.sh
+      - name: Validate Compose
+        run: docker compose --env-file .env.example config -q
+      - name: Build images
+        run: docker compose --env-file .env.example build
+      - name: Xray version check
+        run: docker run --rm --entrypoint /usr/local/bin/xray owrt-remote-xray:local version
