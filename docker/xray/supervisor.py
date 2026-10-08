@@ -101,31 +101,30 @@ class Manager:
                 "pid": self.child.pid if self.child and self.child.poll() is None else None}
 
     def handle(self, conn):
-        with conn:
-            conn.settimeout(35)
-            body = bytearray()
-            while b"\n" not in body:
-                piece = conn.recv(8192)
-                if not piece:
-                    break
-                body.extend(piece)
-                if len(body) > MAX_BYTES:
-                    raise ValueError("Request exceeds size limit")
-            msg = json.loads(bytes(body).split(b"\n", 1)[0])
-            action = msg.get("action")
-            if action == "status":
-                result = self.status()
-            elif action == "apply":
-                config = msg.get("config")
-                if not isinstance(config, dict) or not isinstance(config.get("inbounds"), list):
-                    raise ValueError("Invalid config payload")
-                result = {"ok": True, **self.install(config)}
-            elif action == "restart":
-                self.restart()
-                result = {"ok": True}
-            else:
-                raise ValueError("Unsupported control action")
-            conn.sendall((json.dumps(result) + "\n").encode())
+        conn.settimeout(35)
+        body = bytearray()
+        while b"\n" not in body:
+            piece = conn.recv(8192)
+            if not piece:
+                break
+            body.extend(piece)
+            if len(body) > MAX_BYTES:
+                raise ValueError("Request exceeds size limit")
+        msg = json.loads(bytes(body).split(b"\n", 1)[0])
+        action = msg.get("action")
+        if action == "status":
+            result = self.status()
+        elif action == "apply":
+            config = msg.get("config")
+            if not isinstance(config, dict) or not isinstance(config.get("inbounds"), list):
+                raise ValueError("Invalid config payload")
+            result = {"ok": True, **self.install(config)}
+        elif action == "restart":
+            self.restart()
+            result = {"ok": True}
+        else:
+            raise ValueError("Unsupported control action")
+        conn.sendall((json.dumps(result) + "\n").encode())
 
     def serve(self):
         CONTROL.mkdir(parents=True, exist_ok=True)
@@ -160,6 +159,7 @@ class Manager:
                         conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode())
                     except OSError:
                         pass
+                finally:
                     conn.close()
         finally:
             self.stop_child()
