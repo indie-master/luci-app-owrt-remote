@@ -57,7 +57,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python3", "-c", "import json,socket; s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect('/run/owrt-control/xray.sock');s.sendall(b'{\"action\":\"status\"}\n');response=s.recv(2048);assert json.loads(response)['ok']"]
+      test: ["CMD", "python3", "-c", "import json,socket; s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect('/run/owrt-control/xray.sock');s.sendall(bytes.fromhex('7b22616374696f6e223a22737461747573227d0a'));response=s.recv(2048);assert json.loads(response)['ok']"]
       interval: 30s
       timeout: 6s
       retries: 3
