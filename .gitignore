@@ -9,3 +9,9 @@ staging_dir/
 tmp/
 __pycache__/
 *.pyc
+
+# Docker edition private runtime and credentials
+/data/
+/.env
+/backups/
+*.bak
