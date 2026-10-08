@@ -136,13 +136,17 @@ save_config() {
 	for field in router_id router_name role hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_port vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port public_url; do
 		uci_set "$field" "$(param "$field")"
 	done
+	if has_param vps_host_auto; then uci_set vps_host_mode auto; else uci_set vps_host_mode manual; fi
+	if has_param wan_direct; then uci_set wan_direct 1; else uci_set wan_direct 0; fi
+	uci_set wan_interface "$(param wan_interface)"
+	uci_set wan_dns "$(param wan_dns)"
 	uci commit owrtremote
 	set_result "Настройки сохранены" "Если менял Xray или VPS-поля, перезапусти сервис." "ok"
 }
 
 clear_config() {
 	local field
-	for field in role public_url hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_port vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port; do
+	for field in role public_url hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_host_mode wan_direct wan_interface wan_dns vps_port vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port; do
 		uci -q delete "owrtremote.main.$field"
 	done
 	uci commit owrtremote
@@ -279,6 +283,10 @@ EOF
 
 render_page() {
 	local key router_id router_name hub_url service_state service_tone xray_state xray_tone enabled_checked status_text
+	local vps_host_auto_checked wan_direct_checked
+	vps_host_auto_checked=''; wan_direct_checked=''
+	[ "$(uci_get vps_host_mode manual)" != auto ] || vps_host_auto_checked=checked
+	[ "$(uci_get wan_direct 0)" != 1 ] || wan_direct_checked=checked
 	key="$(param key)"
 	router_id="$(uci_get router_id main)"
 	router_name="$(uci_get router_name "$router_id")"
@@ -314,7 +322,7 @@ render_page() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="owrt-remote-ui-version" content="$OWRT_REMOTE_UI_VERSION">
-<title>OpenWrt Remote Hub v110</title>
+<title>OpenWrt Remote Hub v111</title>
 <style>
 :root{color-scheme:dark;--bg:#07040f;--panel:rgba(19,14,32,.88);--text:#f7f2ff;--muted:#b9adc9;--line:rgba(169,126,255,.24);--blue:#7c3aed;--green:#22c55e;--red:#fb7185;--amber:#f59e0b;--teal:#a855f7;--grid:rgba(168,85,247,.16)}
 *{box-sizing:border-box}body{position:relative;min-height:100vh;margin:0;overflow-x:hidden;background-color:var(--bg);background-image:radial-gradient(circle at 12% 8%,rgba(168,85,247,.46),transparent 31%),radial-gradient(circle at 82% 12%,rgba(79,70,229,.38),transparent 30%),radial-gradient(circle at 50% 105%,rgba(236,72,153,.26),transparent 35%),linear-gradient(145deg,#07040f,#120a24 48%,#05030a),repeating-linear-gradient(0deg,transparent 0 30px,var(--grid) 31px),repeating-linear-gradient(90deg,transparent 0 30px,var(--grid) 31px);background-size:130% 130%,140% 140%,135% 135%,100% 100%,31px 31px,31px 31px;background-attachment:fixed;color:var(--text);font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;animation:bgFlow 22s ease-in-out infinite alternate}
@@ -344,7 +352,7 @@ form{margin:0}.formgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr
     <div class="brand">
       <div class="brandPanel">
         <div class="titleRow">
-          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v110</span></span></h1>
+          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v111</span></span></h1>
         </div>
         <div class="links">
           <a class="uiPill" href="https://t.me/kzolotarev95" target="_blank" rel="noopener noreferrer">Telegram</a>
@@ -441,6 +449,14 @@ EOF
 	field xray_bin "Xray binary" text "Путь к Xray на роутере. Если ставил пакет xray-core, обычно оставь /usr/bin/xray."
 	field xray_config "Xray config" text "Куда агент сохранит клиентский Xray-конфиг. Обычно оставь /etc/xray/owrt-remote-client.json."
 	field vps_host "VPS host" text "IP или домен VPS, куда Xray роутера подключается reverse-туннелем. Бери IP/домен своего VPS."
+	cat <<EOF
+      <label class="check"><input type="checkbox" name="vps_host_auto" value="1" $vps_host_auto_checked> Автоматически обновлять VPS host</label>
+      <span class="hint">Выключено: заданный VPS host сохраняется, heartbeat не меняет его.</span>
+      <label class="check"><input type="checkbox" name="wan_direct" value="1" $wan_direct_checked> Соединение с Hub напрямую через WAN</label>
+      <span class="hint">Heartbeat и Xray обходят Podkop. DNS берётся с WAN, настройки LAN не меняются.</span>
+EOF
+	field wan_interface "WAN интерфейс" text "Логическое имя WAN из OpenWrt, обычно wan. Пустое поле означает wan."
+	field wan_dns "WAN DNS" text "Необязательно: IP DNS-сервера для Remote. Пустое поле — DNS от провайдера на WAN."
 	field vps_port "VPS Xray port" number "Порт Xray на VPS для reverse-туннеля. Должен совпадать с render-xray на VPS, обычно 8443."
 	field vless_uuid "VLESS UUID" text "Уникальный UUID роутера. Бери из карточки роутера на VPS или из команды print-openwrt-config."
 	field vless_encryption "VLESS encryption" text "Для этой схемы оставь none. Меняй только если сам меняешь Xray-конфиг на VPS."

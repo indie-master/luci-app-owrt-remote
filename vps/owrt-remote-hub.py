@@ -12,6 +12,7 @@ import hmac
 import hashlib
 import html
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -1364,6 +1365,70 @@ def row_int_value(row, key, default=0):
         return int(default)
 
 
+def router_reported_connection(router, *, legacy_mode="auto"):
+    row = dict(router or {})
+    status = row.get("status")
+    if not isinstance(status, dict):
+        try:
+            status = json.loads(row.get("status_json") or "{}")
+        except (ValueError, TypeError):
+            status = {}
+    if not isinstance(status, dict):
+        status = {}
+    # Legacy agents had automatic endpoint updates. Keep that server behavior
+    # until they report a policy; the patched agent itself defaults to manual.
+    mode = legacy_mode if status.get("vps_host_mode") is None else ("auto" if status.get("vps_host_mode") == "auto" else "manual")
+    host = str(status.get("vps_host") or row.get("vps_host") or "").strip()
+    return mode, host
+
+
+def validate_router_vps_host(value):
+    host = str(value or "").strip()
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", host):
+        raise ValueError("Некорректный IP-адрес VPS host")
+    if len(host) > 253 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", host):
+        raise ValueError("VPS host должен быть IP-адресом или доменом без URL и порта")
+    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-") for label in host.split(".")):
+        raise ValueError("Некорректный домен VPS host")
+    return host.lower()
+
+
+def make_router_vps_host_script(host, mode):
+    host = validate_router_vps_host(host)
+    if mode not in ("manual", "auto"):
+        raise ValueError("VPS host mode должен быть manual или auto")
+    return f'''set -eu
+owrt-remote status | grep -q '^vps_host_mode:' || {{ echo 'Сначала обнови агент на роутере' >&2; exit 1; }}
+old_host="$(uci -q get owrtremote.main.vps_host || true)"
+old_mode="$(uci -q get owrtremote.main.vps_host_mode || true)"
+applied=0
+cleanup() {{
+    code=$?
+    trap - EXIT
+    if [ "$applied" = 0 ]; then
+        uci set "owrtremote.main.vps_host=$old_host"
+        if [ -n "$old_mode" ]; then uci set "owrtremote.main.vps_host_mode=$old_mode"; else uci -q delete owrtremote.main.vps_host_mode || true; fi
+        uci commit owrtremote
+        owrt-remote render-client >/dev/null 2>&1 || true
+    fi
+    exit "$code"
+}}
+trap cleanup EXIT
+uci set 'owrtremote.main.vps_host={sh_quote(host)}'
+uci set 'owrtremote.main.vps_host_mode={mode}'
+uci commit owrtremote
+owrt-remote render-client >/dev/null
+applied=1
+logger -t owrt-remote "VPS host changed by Hub UI: old=$old_host new={host} mode={mode}" || true
+( sleep 2; /etc/init.d/owrt-remote restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+echo VPS_HOST_APPLIED
+'''
+
+
 def canonical_router_hub_update(router, app_public_url="", request_origin=""):
     router = router or {}
     router_public_url = public_url_origin(router.get("public_url", ""))
@@ -1378,11 +1443,15 @@ def canonical_router_hub_update(router, app_public_url="", request_origin=""):
             vps_host = urllib.parse.urlsplit(hub_url).hostname or ""
         except Exception:
             vps_host = ""
-    return {
+    update = {
         "hub_url": hub_url,
         "public_url": public_url,
-        "vps_host": vps_host,
     }
+    # Router is authoritative for a manually fixed tunnel address. Patched
+    # agents also protect it locally while the Hub is still on an old version.
+    if router_reported_connection(router)[0] == "auto":
+        update["vps_host"] = vps_host
+    return update
 
 
 def verify_password_login(username, password, otp=""):
@@ -3619,9 +3688,11 @@ def router_current_hub_bundle(router, app_public_url="", request_origin="", fall
     public_url = prefer_origin_with_explicit_port(router_public_url, app_origin)
     public_url = prefer_origin_with_explicit_port(public_url, request_origin)
     hub_url = public_url or request_origin or router_fallback_hub_url(row, fallback_host, 8088)
+    reported_mode, reported_host = router_reported_connection(row)
     config_vps_host = (
-        vps_host_name(public_url or hub_url)
+        (reported_host if reported_mode == "manual" else "")
         or str(row.get("vps_host") or "").strip()
+        or vps_host_name(public_url or hub_url)
         or vps_host_name(app_origin or request_origin)
         or vps_host_name(router_fallback_hub_url(row, fallback_host, 8088))
         or ""
@@ -4266,6 +4337,7 @@ def build_openwrt_config_payload(row, hub_url, vps_host_override="", public_url_
         "role": row_str_value(row, "role", "node"),
         "hub_url": str(hub_url or ""),
         "vps_host": effective_vps_host,
+        "vps_host_mode": router_reported_connection(row, legacy_mode="manual")[0],
         "vps_port": row_int_value(row, "vless_port", DEFAULT_VLESS_PORT),
         "vless_uuid": row_str_value(row, "vless_uuid"),
         "vless_encryption": row_str_value(row, "vless_encryption", "none"),
@@ -4288,8 +4360,9 @@ def build_openwrt_config_payload(row, hub_url, vps_host_override="", public_url_
 
 def build_openwrt_config_lines(payload, mode="manual"):
     lines = [
-        "uci -q delete owrtremote.main",
-        "uci set owrtremote.main=remote",
+        "owrt_saved_host=\"$(uci -q get owrtremote.main.vps_host 2>/dev/null || true)\"",
+        "owrt_saved_mode=\"$(uci -q get owrtremote.main.vps_host_mode 2>/dev/null || echo manual)\"",
+        "uci -q get owrtremote.main >/dev/null 2>&1 || uci set owrtremote.main=remote",
         "uci set owrtremote.main.enabled='1'",
         f"uci set owrtremote.main.router_id='{sh_quote(payload['id'])}'",
         f"uci set owrtremote.main.router_name='{sh_quote(payload['name'])}'",
@@ -4299,7 +4372,12 @@ def build_openwrt_config_lines(payload, mode="manual"):
         "uci set owrtremote.main.heartbeat_interval='30'",
         "uci set owrtremote.main.xray_bin='/usr/bin/xray'",
         "uci set owrtremote.main.xray_config='/etc/xray/owrt-remote-client.json'",
-        f"uci set owrtremote.main.vps_host='{sh_quote(payload['vps_host'])}'",
+        "if [ \"$owrt_saved_mode\" = auto ] || [ -z \"$owrt_saved_host\" ]; then",
+        f"  uci set owrtremote.main.vps_host='{sh_quote(payload['vps_host'])}'",
+        f"  uci set owrtremote.main.vps_host_mode='{sh_quote(payload.get('vps_host_mode', 'manual'))}'",
+        "else",
+        "  uci set owrtremote.main.vps_host_mode='manual'",
+        "fi",
         f"uci set owrtremote.main.vps_port='{payload['vps_port']}'",
         f"uci set owrtremote.main.vless_uuid='{sh_quote(payload['vless_uuid'])}'",
         f"uci set owrtremote.main.vless_encryption='{sh_quote(payload['vless_encryption'])}'",
@@ -4661,7 +4739,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div class="brand">
       <div class="desktopHeader">
         <div class="desktopHeaderTop">
-          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v110</span></span></h1>
+          <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v111</span></span></h1>
           <div class="routerSearchDock" id="routerSearchDock">
             <button class="routerSearchToggle" id="routerSearchToggle" type="button" aria-expanded="false" aria-controls="routerSearchPanel" data-active="false">
               <span>Поиск роутеров</span>
@@ -5013,7 +5091,7 @@ systemctl restart owrt-remote-xray</pre>
       </div>
     </div>
     <div class="mobileSearchDock" id="mobileRouterSearchDock">
-      <span class="mobileSearchVersion">v110</span>
+      <span class="mobileSearchVersion">v111</span>
       <button class="routerSearchToggle mobilePanelToggle primary" id="mobileRouterSearchToggle" type="button" aria-expanded="false" aria-controls="mobileRouterSearchPanel" data-active="false">
         <span>Поиск роутеров</span>
       </button>
@@ -5500,7 +5578,7 @@ function hasOpenWolPicker() {{
 
 function activeWolInteractiveField() {{
   const active = document.activeElement;
-  return active && typeof active.matches === 'function' && active.matches('[data-wol-password],[data-wol-select],[data-traffic-password],[data-router-notes-input]') ? active : null;
+  return active && typeof active.matches === 'function' && active.matches('[data-wol-password],[data-wol-select],[data-traffic-password],[data-router-notes-input],[data-vps-field]') ? active : null;
 }}
 
 function shouldDeferRouterRender() {{
@@ -7721,6 +7799,36 @@ function normalizeRouterName(value) {{
   return String(value || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
 }}
 
+const vpsHostDrafts = new Map();
+function getVpsHostDraft(router) {{
+  if (!vpsHostDrafts.has(router.id)) {{
+    const status = router.status || {{}};
+    vpsHostDrafts.set(router.id, {{open: false, host: status.vps_host || router.vps_host || '', auto: status.vps_host_mode === 'auto', password: '', dirty: false, saving: false, message: ''}});
+  }}
+  const state = vpsHostDrafts.get(router.id);
+  if (!state.dirty && !state.saving) {{
+    state.host = (router.status || {{}}).vps_host || router.vps_host || '';
+    state.auto = (router.status || {{}}).vps_host_mode === 'auto';
+  }}
+  return state;
+}}
+function renderVpsHostSettings(router) {{
+  if (!(router.permissions || {{}}).owner) return '';
+  const state = getVpsHostDraft(router);
+  const key = escapeAttr(router.id);
+  return `<div class="wolPanel" style="margin-top:10px">
+    <button class="btn" type="button" data-vps-toggle="${{key}}" aria-expanded="${{state.open ? 'true' : 'false'}}">${{state.open ? 'Скрыть VPS host' : 'Настроить VPS host'}}</button>
+    ${{state.open ? `<div style="display:grid;gap:10px;margin-top:10px;min-width:0">
+      <label style="display:grid;gap:5px;min-width:0">VPS host<input style="width:100%;min-width:0" data-vps-field="host" data-vps-router="${{key}}" value="${{escapeAttr(state.host)}}" placeholder="IP или домен VPS"></label>
+      <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" data-vps-field="auto" data-vps-router="${{key}}"${{state.auto ? ' checked' : ''}}> Автоматически обновлять VPS host</label>
+      <label style="display:grid;gap:5px;min-width:0">Пароль SSH роутера<input style="width:100%;min-width:0" type="password" autocomplete="off" data-vps-field="password" data-vps-router="${{key}}" value="${{escapeAttr(state.password)}}" placeholder="Пусто, если доступ по ключу"></label>
+      <span>Выключено: heartbeat сохраняет указанный адрес. Сохранение применяется на роутере через SSH.</span>
+      <button class="btn" type="button" data-vps-save="${{key}}"${{state.saving || !router.online ? ' disabled' : ''}}>${{state.saving ? 'Сохраняю...' : 'Сохранить VPS host'}}</button>
+      <span>${{escapeHtml(state.message)}}</span>
+    </div>` : ''}}
+  </div>`;
+}}
+
 function renderRouterNotesPanel(router) {{
   const permissions = router && router.permissions && typeof router.permissions === 'object' ? router.permissions : {{}};
   const canEdit = Boolean(permissions.notes_edit || permissions.manage);
@@ -8535,6 +8643,46 @@ routerForm.addEventListener('submit', async (ev) => {{
 }});
 
 
+
+cards.addEventListener('input', (ev) => {{
+  const field = ev.target.closest('[data-vps-field]');
+  if (!field) return;
+  const router = selectedRouter(field.dataset.vpsRouter);
+  if (!router) return;
+  const state = getVpsHostDraft(router);
+  state[field.dataset.vpsField] = field.type === 'checkbox' ? field.checked : field.value;
+  state.dirty = true;
+}});
+cards.addEventListener('click', async (ev) => {{
+  const toggle = ev.target.closest('[data-vps-toggle]');
+  if (toggle) {{
+    const router = selectedRouter(toggle.dataset.vpsToggle);
+    if (!router) return;
+    const state = getVpsHostDraft(router);
+    state.open = !state.open;
+    requestRouterRender();
+    return;
+  }}
+  const save = ev.target.closest('[data-vps-save]');
+  if (!save) return;
+  const key = save.dataset.vpsSave;
+  const router = selectedRouter(key);
+  if (!router) return;
+  const state = getVpsHostDraft(router);
+  if (state.saving) return;
+  state.saving = true;
+  state.message = '';
+  requestRouterRender();
+  try {{
+    const res = await fetch('/api/router/' + encodeURIComponent(key) + '/vps-host', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{vps_host: state.host, vps_host_mode: state.auto ? 'auto' : 'manual', ssh_password: state.password}})}});
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || 'Не удалось сохранить VPS host');
+    replaceRouterInList(data.router);
+    state.dirty = false;
+    state.message = 'Настройки сохранены на роутере.';
+  }} catch (error) {{ state.message = error.message; }}
+  finally {{ state.saving = false; state.password = ''; requestRouterRender(); }}
+}});
 
 cards.addEventListener('click', async (ev) => {{
   const pickerToggle = ev.target.closest('[data-router-group-picker-toggle]');
@@ -12405,7 +12553,7 @@ button:hover{{filter:brightness(1.06)}}
       <form class="login" method="post" action="/login">
     {error_html}
     <span class="brand">
-      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v110</span></span></h1>
+      <h1 class="appBanner"><span>OpenWrt Remote Hub <span class="appBannerVersion">v111</span></span></h1>
     </span>
     <label for="hubUsername">Логин</label>
     <input id="hubUsername" name="username" autocomplete="off" autofocus required>
@@ -12877,7 +13025,7 @@ body::after{{content:"";position:fixed;inset:0;pointer-events:none;background:li
                 <circle cx="65" cy="59" r="3" fill="#E5F2FF"/>
               </svg>
             </div>
-            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v110</span></h2>
+            <h2 class="brandTitle">OpenWrt Remote Hub <span class="brandVersion">v111</span></h2>
           </div>
         </div>
         <div class="brandBottom">
@@ -17422,6 +17570,36 @@ exit 127
                     if not router_group_exists(conn, group_id):
                         raise ValueError("Группа не найдена")
                     conn.execute("update routers set group_id = ?, updated_at = ? where id = ?", (group_id, now_ts(), router_id))
+                    conn.commit()
+                    router = row_to_router(get_router(conn, router_id))
+                self.send_json(200, {"ok": True, "router": router})
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if path.startswith("/api/router/") and path.endswith("/vps-host"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValueError("Некорректный путь")
+                router_id = urllib.parse.unquote(parts[2])
+                payload = self.read_payload()
+                host = validate_router_vps_host(payload.get("vps_host"))
+                mode = str(payload.get("vps_host_mode") or "manual")
+                script = make_router_vps_host_script(host, mode)
+                with self.app.conn() as conn:
+                    row = get_active_router(conn, router_id)
+                if not row:
+                    raise ValueError("Роутер не найден")
+                output = self.run_router_ssh_script(row, script, timeout=35, ssh_password=payload.get("ssh_password", ""))
+                if "VPS_HOST_APPLIED" not in output:
+                    raise ValueError("Роутер не подтвердил применение настройки")
+                with self.app.conn() as conn:
+                    fresh = get_active_router(conn, router_id)
+                    status = row_to_router(fresh).get("status", {})
+                    status.update({"vps_host": host, "vps_host_mode": mode})
+                    conn.execute("update routers set vps_host = ?, status_json = ?, updated_at = ? where id = ?", (host, json.dumps(status, ensure_ascii=False), now_ts(), router_id))
                     conn.commit()
                     router = row_to_router(get_router(conn, router_id))
                 self.send_json(200, {"ok": True, "router": router})

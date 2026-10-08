@@ -215,6 +215,7 @@ install_xray_runtime() {
 }
 
 install_file "usr/sbin/owrt-remote" 0755
+install_file "usr/lib/owrt-remote/wan.sh" 0644
 install_file "etc/init.d/owrt-remote" 0755
 install_file "etc/hotplug.d/iface/99-owrt-remote" 0755
 install_config

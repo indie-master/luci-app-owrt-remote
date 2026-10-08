@@ -8,6 +8,7 @@ XRAY_RELEASE_BASE_URL="${XRAY_RELEASE_BASE_URL:-https://github.com/XTLS/Xray-cor
 
 log() {
 	printf '%s\n' "$*" >&2
+	logger -t owrt-remote "$*" 2>/dev/null || true
 }
 
 die() {
@@ -26,6 +27,7 @@ usage() {
   owrt-remote run
   owrt-remote heartbeat
   owrt-remote heartbeat-loop
+  owrt-remote network-diagnostics
 
 Настройки лежат в /etc/config/owrtremote.
 EOF
@@ -100,6 +102,20 @@ uci_set_if_changed() {
 	uci -q set "$CONFIG.$SECTION.$key=$next" >/dev/null 2>&1 || return 1
 	return 0
 }
+
+# Existing installations also default to manual: only an explicit opt-in may
+# let a heartbeat replace the administrator's tunnel endpoint.
+vps_host_mode() {
+	case "$(uci_get vps_host_mode manual)" in
+		auto) printf auto ;;
+		*) printf manual ;;
+	esac
+}
+
+WAN_HELPER="${OWRT_REMOTE_WAN_HELPER:-/usr/lib/owrt-remote/wan.sh}"
+if [ -r "$WAN_HELPER" ]; then
+	. "$WAN_HELPER"
+fi
 
 host_model() {
 	if [ -r /tmp/sysinfo/model ]; then
@@ -507,6 +523,14 @@ render_client_config() {
 
 	router_id="$(safe_id "$(uci_get router_id main)")"
 	vps_host="$(uci_get vps_host '')"
+	local wan_sockopt
+	wan_sockopt=''
+	if truthy "$(uci_get wan_direct 0)"; then
+		command -v wan_prepare >/dev/null 2>&1 || die "WAN helper missing: $WAN_HELPER"
+		wan_prepare || die "не удалось подготовить прямое соединение через WAN"
+		vps_host="$(wan_resolve_host "$vps_host")" || die "VPS host не разрешается через WAN DNS"
+		wan_sockopt=", \"sockopt\": {\"mark\": $((PODKOP_BYPASS_MARK)), \"interface\": \"$(json_escape "$(wan_device)")\"}"
+	fi
 	vps_port="$(safe_num "$(uci_get vps_port 8443)" 8443)"
 	uuid="$(uci_get vless_uuid '')"
 	ssh_uuid="$(uci_get ssh_vless_uuid '')"
@@ -567,7 +591,7 @@ render_client_config() {
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none"$wan_sockopt
       }
     },
     {
@@ -585,7 +609,7 @@ render_client_config() {
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none"$wan_sockopt
       }
     }
   ],
@@ -678,6 +702,9 @@ heartbeat_json() {
   "ssh_host": $(json_string "$(uci_get ssh_host 127.0.0.1)"),
   "ssh_port": $(safe_num "$(uci_get ssh_port 22)" 22),
   "hub_url": $(json_string "$hub_url"),
+  "vps_host": $(json_string "$(uci_get vps_host '')"),
+  "vps_host_mode": $(json_string "$(vps_host_mode)"),
+  "wan_direct": $(json_string "$(uci_get wan_direct 0)"),
   "uptime": $(safe_num "$(uptime_seconds)" 0),
   "load": $(json_string "$(load_text)"),
   "memory": $(json_string "$(memory_text)"),
@@ -696,23 +723,27 @@ post_json() {
 	url="$1"
 	token="$2"
 	file="$3"
-
-	if command -v wget >/dev/null 2>&1; then
-		wget -q -O - \
-			--header="Authorization: Bearer $token" \
-			--header="Content-Type: application/json" \
-			--post-file="$file" "$url"
+	if truthy "$(uci_get wan_direct 0)"; then
+		wan_post_json "$url" "$token" "$file"
 		return
 	fi
+
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsS \
+		curl -fsS --connect-timeout 4 --max-time 10 --noproxy '*' \
 			-H "Authorization: Bearer $token" \
 			-H "Content-Type: application/json" \
 			--data-binary "@$file" "$url"
 		return
 	fi
+	if command -v wget >/dev/null 2>&1; then
+		http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= all_proxy= wget -q -T 10 -O - \
+			--header="Authorization: Bearer $token" \
+			--header="Content-Type: application/json" \
+			--post-file="$file" "$url"
+		return
+	fi
 	if command -v uclient-fetch >/dev/null 2>&1; then
-		uclient-fetch -q -O - \
+		http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= all_proxy= uclient-fetch -q -T 10 -O - \
 			--header="Authorization: Bearer $token" \
 			--header="Content-Type: application/json" \
 			--post-file="$file" "$url"
@@ -760,12 +791,14 @@ heartbeat_candidate_endpoints() {
 }
 
 heartbeat_apply_hub_update() {
-	local response_file fallback_base next_hub_url next_public_url next_vps_host changed
+	local response_file fallback_base next_hub_url next_public_url next_vps_host changed old_vps_host mode ignored_file ignored
 	response_file="$1"
 	fallback_base="$2"
 	next_hub_url="$(json_extract_object_string "$response_file" hub_update hub_url)"
 	next_public_url="$(json_extract_object_string "$response_file" hub_update public_url)"
 	next_vps_host="$(json_extract_object_string "$response_file" hub_update vps_host)"
+	old_vps_host="$(uci_get vps_host '')"
+	mode="$(vps_host_mode)"
 	[ -n "$next_hub_url" ] || next_hub_url="$fallback_base"
 	changed=0
 	if uci_set_if_changed hub_url "$next_hub_url"; then
@@ -774,12 +807,26 @@ heartbeat_apply_hub_update() {
 	if uci_set_if_changed public_url "$next_public_url"; then
 		changed=1
 	fi
-	if uci_set_if_changed vps_host "$next_vps_host"; then
-		changed=1
+	if [ "$mode" = auto ]; then
+		if uci_set_if_changed vps_host "$next_vps_host"; then
+			changed=1
+		fi
+	elif [ -n "$next_vps_host" ] && [ "$old_vps_host" != "$next_vps_host" ]; then
+		ignored_file="${TMPDIR:-/tmp}/owrt-remote-vps-host-ignored"
+		ignored="$old_vps_host|$next_vps_host"
+		if [ "$(cat "$ignored_file" 2>/dev/null)" != "$ignored" ]; then
+			log "heartbeat kept vps_host: current=$old_vps_host proposed=$next_vps_host reason=manual"
+			printf '%s' "$ignored" >"$ignored_file"
+		fi
 	fi
 	[ "$changed" = "1" ] || return 0
-	uci commit "$CONFIG" >/dev/null 2>&1 || true
+	uci commit "$CONFIG" >/dev/null 2>&1 || return 1
 	log "heartbeat updated hub settings: hub_url=$(uci_get hub_url '') public_url=$(uci_get public_url '') vps_host=$(uci_get vps_host '')"
+	if [ "$mode" = auto ] && [ -n "$next_vps_host" ] && [ "$old_vps_host" != "$next_vps_host" ]; then
+		log "heartbeat updated vps_host: old=$old_vps_host new=$next_vps_host reason=hub_update mode=auto"
+		# The running Xray keeps its old address until it is restarted.
+		( sleep 2; /etc/init.d/owrt-remote restart >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+	fi
 }
 
 send_heartbeat() {
@@ -789,6 +836,10 @@ send_heartbeat() {
 	token="$(uci_get hub_token '')"
 	[ -n "$hub_url" ] || die "hub_url пустой"
 	[ -n "$token" ] || die "hub_token пустой"
+	if truthy "$(uci_get wan_direct 0)"; then
+		command -v wan_prepare >/dev/null 2>&1 || die "WAN helper missing: $WAN_HELPER"
+		wan_prepare || return 1
+	fi
 
 	endpoint="${hub_url%/}/api/heartbeat"
 	tmp="${TMPDIR:-/tmp}/owrt-remote-heartbeat.$$"
@@ -799,14 +850,17 @@ send_heartbeat() {
 		used=1
 		if post_json "$endpoint" "$token" "$tmp" >"$response"; then
 			fallback_base="$(heartbeat_base_from_endpoint "$endpoint")"
-			heartbeat_apply_hub_update "$response" "$fallback_base"
+			if ! heartbeat_apply_hub_update "$response" "$fallback_base"; then
+				rm -f "$tmp" "$response"
+				return 1
+			fi
 			cat "$response"
 			rm -f "$tmp" "$response"
 			return 0
 		fi
 	done
 	rm -f "$tmp" "$response"
-	[ "$used" = "1" ] || die "hub_url/public_url/vps_host РїСѓСЃС‚С‹Рµ"
+	[ "$used" = "1" ] || die "hub_url/public_url/vps_host пустые"
 	return 1
 }
 
@@ -867,6 +921,8 @@ status() {
 	printf 'enabled: %s\n' "$(uci_get enabled 0)"
 	printf 'hub_url: %s\n' "$(uci_get hub_url '')"
 	printf 'vps_host: %s\n' "$(uci_get vps_host '')"
+	printf 'vps_host_mode: %s\n' "$(vps_host_mode)"
+	printf 'wan_direct: %s\n' "$(uci_get wan_direct 0)"
 	printf 'vps_port: %s\n' "$(uci_get vps_port 8443)"
 	printf 'xray_bin: %s\n' "$(xray_bin_path)"
 	printf 'xray_config: %s\n' "$(uci_get xray_config /etc/xray/owrt-remote-client.json)"
@@ -1123,6 +1179,18 @@ case "$cmd" in
 		;;
 	doctor)
 		doctor
+		;;
+	wan-prepare)
+		wan_prepare
+		;;
+	wan-preflight)
+		wan_preflight
+		;;
+	wan-cleanup)
+		wan_cleanup
+		;;
+	network-diagnostics)
+		wan_diagnostics
 		;;
 	install-xray-tmp)
 		install_xray_tmp

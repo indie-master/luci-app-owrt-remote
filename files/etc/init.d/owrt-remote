@@ -82,6 +82,7 @@ reload_service() {
 
 stop_service() {
 	stop_xray_processes
+	/usr/sbin/owrt-remote wan-cleanup >/dev/null 2>&1 || true
 }
 
 service_triggers() {

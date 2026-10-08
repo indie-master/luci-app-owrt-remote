@@ -19,6 +19,8 @@ if [ -x "$(target_path etc/init.d/owrt-remote)" ]; then
 fi
 
 rmf usr/sbin/owrt-remote
+rmf usr/lib/owrt-remote/wan.sh
+rmdir "$(target_path usr/lib/owrt-remote)" 2>/dev/null || true
 rmf etc/init.d/owrt-remote
 rmf www/cgi-bin/owrt-remote
 rmf usr/lib/lua/luci/controller/owrt_remote.lua
