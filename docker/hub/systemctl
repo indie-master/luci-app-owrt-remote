@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Restricted adapter for legacy Hub Xray restart operations.
+No systemd, docker socket or host privileged controls are exposed.
+"""
+import sys
+from pathlib import Path
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args == ["restart", "owrt-remote-xray"]:
+        directory = Path("/run/owrt-control")
+        directory.mkdir(parents=True, exist_ok=True)
+        req = directory / "restart.seq"
+        try:
+            previous = int(req.read_text().strip())
+        except (OSError, ValueError):
+            previous = 0
+        req.write_text(str(previous + 1))
+        print("Xray reload queued; validation and activation are asynchronous")
+        return 0
+    print("Container adapter refuses systemctl operation", file=sys.stderr)
+    return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())
