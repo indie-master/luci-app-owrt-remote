@@ -1,0 +1,6 @@
+.git
+data
+.env
+*.tar.gz
+*.bak
+__pycache__
