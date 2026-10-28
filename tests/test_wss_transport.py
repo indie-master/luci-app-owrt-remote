@@ -216,6 +216,22 @@ class WssHubTests(unittest.TestCase):
         self.assertTrue(result["unchanged"])
         call.assert_not_called()
 
+    def test_semantic_json_equal_without_reordering_rules_does_not_restart(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        live = Path(self.temp.name) / "current.json"
+        original = hub.make_server_xray_config(rows, listen_port=18443)
+        # Same config, deliberately different whitespace and map-key ordering.
+        live.write_text(json.dumps(original, sort_keys=True, separators=(",", ":")))
+        before = live.read_bytes()
+        with mock.patch.dict(os.environ, {"OWRT_REMOTE_XRAY_CONFIG": str(live)}), \
+             mock.patch.object(hub.subprocess, "run") as run:
+            result = hub.reload_vps_xray(self.db)
+        self.assertTrue(result["unchanged"])
+        run.assert_not_called()
+        self.assertEqual(live.read_bytes(), before)
+
     def test_failed_candidate_validation_does_not_overwrite_live_xray(self):
         self.add("old", "tcp", 18443)
         live = Path(self.temp.name) / "current.json"
