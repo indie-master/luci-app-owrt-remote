@@ -18,6 +18,12 @@ production deployment or changes to the Belt VPS or any OpenWrt router.
 - Never rename the GitHub repository before all installers, self-update URLs, CI
   references, release manifests and rollback links have been retargeted and tested.
 
+## Original functionality is mandatory
+
+**Router Orchestrator is an additive fork; original OpenWrt Remote v119 is not replaced.** All existing upstream and fork workflows, including registration/grouping, existing users and authentication methods, LuCI/SSH browser access, TCP reverse and WSS support, logs, heartbeat, router traffic/clients, WAN/DNS controls, Xray generation/validation, alerts, WOL and self/router updates must remain usable. Optional Docker, Telegram and third-party service adapters must not change their behavior as a side effect. Original capabilities not named here are also protected.
+
+See [UPSTREAM_FEATURE_PARITY.md](UPSTREAM_FEATURE_PARITY.md) for the mandatory capability inventory, evidence matrix and the operator's latest `main` read-only preflight result.
+
 ## One backend, multiple interfaces
 
 Both the UI and the opt-in Telegram bot must call the SAME authenticated Hub API
