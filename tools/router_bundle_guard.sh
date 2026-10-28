@@ -135,6 +135,7 @@ snapshot() {
     trap 'rm -rf "$STATE/backup"' EXIT HUP INT TERM
     mkdir "$STATE/backup/files"
     : > "$STATE/backup/present.txt"
+    : > "$STATE/backup/original.sha256"
     for rel in $FILES; do
         old="$(path "$rel")"
         if [ -e "$old" ]; then
@@ -142,8 +143,10 @@ snapshot() {
             mkdir -p "$STATE/backup/files/$(dirname "$rel")"
             cp -p "$old" "$STATE/backup/files/$rel" || abort "could not back up: $rel"
             printf '1 %s\n' "$rel" >> "$STATE/backup/present.txt"
+            printf '%s %s\n' "$(sha_file "$old")" "$rel" >> "$STATE/backup/original.sha256"
         else
             printf '0 %s\n' "$rel" >> "$STATE/backup/present.txt"
+            printf '%s %s\n' '-' "$rel" >> "$STATE/backup/original.sha256"
         fi
     done
     for rel in etc/config/owrtremote etc/xray/owrt-remote-client.json; do
