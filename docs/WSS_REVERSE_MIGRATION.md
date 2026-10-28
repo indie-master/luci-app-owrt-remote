@@ -1,0 +1,56 @@
+# OWRT Remote: WSS reverse + legacy TCP (experimental fork)
+
+This feature branch is based on upstream v119 (2026-10-27), **not** on the older fork `main` (2026-10-08). Do not install it over a production HUB without reviewing the upstream differences.
+
+## Transport contract
+
+| Router records | Server inbound | Client outbound | Security |
+|---|---|---|---|
+| Existing SQLite rows, after migration | `owrt-remote-vless` TCP, legacy listener preserved (Belt :18443) | TCP to existing port | Existing behaviour unchanged |
+| Newly registered rows | `owrt-remote-wss` on `127.0.0.1:18444` | VLESS WSS on public :443 | TLS verified, ALPN http/1.1, SNI from HUB URL, WS path `/owrt-ws/` |
+
+Both inbounds use the same reverse routing scheme but different client lists. They are **not** exposed via Remnawave; the deployed Nginx HTTPS virtual host terminates TLS and proxies `/owrt-ws/` to `127.0.0.1:18444`. This Nginx location must already exist. No change to Nginx stream, port 443, Remnawave, or existing TCP clients is required.
+
+Each modern WSS router has two restricted Freedom outbounds for LuCI/SSH. `finalRules` allow TCP to the configured ports, additionally pinning a literal IPv4 destination (for example `127.0.0.1/32`). Legacy client settings are deliberately unchanged. New OpenWrt agents support `vps_transport=tcp|ws` and `vps_sni`, with `tcp` as the default for older UCI configurations.
+
+## Source and upgrades
+
+The experimental fork self-update source defaults to `indie-master/luci-app-owrt-remote/feature/wss-reverse-v119`, not upstream. `RAW_REPO_BASE` can override it. This prevents a panel self-update from silently reverting WSS support. Pin a reviewed release branch or commit before production deployment. Docker support lives in a separate `docker-edition` branch and is not deployed here.
+
+## Development checks
+
+```sh
+python3 -m py_compile vps/owrt-remote-hub.py
+sh -n files/usr/sbin/owrt-remote
+python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+```
+
+See the WSS reverse compatibility GitHub Actions workflow for the CI results.
+
+## Safe migration of Belt (not an unattended installer)
+
+1. Keep the working `/etc/xray/owrt-remote.json`, `/opt/owrt-remote/owrt-remote-hub.py`, `/var/lib/owrt-remote/hub.db` and Nginx configuration untouched until deployment. Make permission-restricted backups and use `sqlite3.Connection.backup()` for a consistent DB snapshot.
+2. Run the new HUB generator **against a copy of the DB**, never the live DB. An existing DB acquires `vps_transport='tcp'` for every existing row. For the Belt staging copy **only**, update `Netis_N6_router5` to `vps_transport='ws'`, `vless_port=443` because this particular router has already been switched manually.
+3. Render to a private staging JSON file, not `/etc/xray/owrt-remote.json`. Verify the current TCP listener address/port stays the same, original UUID/reverse client mappings are unchanged, no existing `entry-*` or `ssh-*` tags disappear, and no local listening port collides. On Belt the expected state after staging is **8 TCP clients**, **2 WSS clients**, **10 routing rules**, with localhost `18444` for WSS.
+4. Validate the staged config with the **exact Xray binary running on Belt** (`/usr/local/bin/xray run -test -config /path/candidate.json`), test Nginx TLS verification / WebSocket Upgrade, and check that the OpenWrt agent is updated for WSS before moving any existing router.
+5. Install the new HUB source **only after separate dependency/version review**. The new HUB generator validates the candidate with Xray before replacing the live file, takes a private backup, and tries to roll back a failed service restart. It reads and preserves the port of an existing `owrt-remote-vless` inbound rather than silently changing the legacy port.
+6. Stage the DB transport migration separately: `set-router-transport --id Netis_N6_router5 --transport ws --sync-xray`. The command preserves both UUIDs and reverse tags; it changes only transport and outbound port, with DB rollback on sync failure. Run it **only when the updated HUB is installed and candidate validation has passed**.
+7. After the controlled Xray restart, verify :18443 and localhost :18444 listeners, WSS established sessions and actual LuCI/SSH over `127.0.0.1:18120` and `127.0.0.1:19120`. Verify every other router as well. Do not mistake successful `xray -test` or a listening TCP port for working reverse traffic.
+
+**Never use the legacy `render-xray --out /etc/xray/owrt-remote.json` command from the older HUB while this custom WSS inbound is active.** It will regenerate a TCP-only server configuration.
+
+## New routers after deployment
+
+1. Register through the HUB web form, selecting **WSS / TLS · 443** (default) or explicit legacy TCP.
+2. Registration stores distinct UUIDs and reverse tags and attempts a safe server Xray sync; the UI reports a sync error rather than claiming success.
+3. Update/install the **fork agent with WSS support** on the new router *before* applying the generated configuration. An old agent does not understand `vps_transport=ws`.
+4. Apply OpenWrt config from that router's HUB card; confirm both LuCI and SSH over the reverse tunnel.
+
+Existing router records default to `tcp` during DB migration and no existing router is automatically switched. Manual changes via the transport CLI require an explicit operator action.
+
+## Limitations
+
+- WSS in Xray 26.x is deprecated in favour of XHTTP. It is retained here because the exact Belt/Netis path has been verified operationally.
+- An Xray restart temporarily disconnects reverse connections. The upgrade cannot promise zero downtime.
+- The base branch has substantial upstream changes since the old installed HUB. A green CI run is **not** equivalent to production approval or a successful migration of the live database.
+- This branch is an experiment; do not merge or deploy without staging, backup, and a rollback window.
