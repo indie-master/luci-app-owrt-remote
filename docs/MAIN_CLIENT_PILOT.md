@@ -174,6 +174,59 @@ snapshot protection and absence of any apply action.
   logging, user auth) must still work. Never install this experimental bundle
   with an untested manual copy step.
 
+## Prototype transaction milestone (NOT YET cleared for the real router)
+
+New opt-in `tools/router_pilot_transaction.sh` adds the separately gated
+`apply`, `confirm`, `rollback`, a short-lived autonomous watchdog and
+an OpenWrt `S08` early-boot recovery hook. **The original installer remains
+unchanged.** `router_bundle_guard.sh` continues to reject `apply`.
+
+This new script:
+
+- Refuses all targets except the explicitly selected `main`, TCP/18443;
+  preserves the selected Xray binary and current TCP-none JSON and never
+  invokes service, network, firewall or Xray restarts.
+- Requires pre-downloaded/pinned tar and per-file manifest digests plus a
+  verified persistent snapshot of all ten original files and critical UCI/JSON
+  digests. Aborts when any original changed after its backup, or when a backup
+  was corrupted.
+- Checks available RAM and persistent overlay reserve, writes a persistent
+  `pending` marker *before* any live code-file change, and uses per-file
+  same-directory atomic replacement.
+- Starts the short-lived watchdog before mutation; if an operator does not
+  explicitly confirm via a unique nonce before the deadline, it restores
+  previous code files from the private snapshot. A router reboot while pending
+  invokes early-boot rollback before the usual reverse tunnel service starts.
+- Requires external operator checks from Belt (LuCI HTTP/SSH banner, Xray
+  fingerprint and actual reverse link) before nonce confirmation. The
+  tool does **not** independently assert that those external checks passed.
+  Never issue `confirm` until outside-in verification is recorded.
+- Keeps the recovery copy after confirmation for review. A confirmed update
+  still needs a separately protected normal reboot/service activation test;
+  the early-boot hook intentionally rolls back rather than testing new code
+  if a reboot occurs **before** confirmation.
+
+### Validation status and remaining safety gates
+
+CI tests synthetic filesystems under Ubuntu `sh` AND BusyBox `ash` with
+BusyBox applets, including success, timeout, unexpected reboot, incorrect
+nonce, duplicate apply, mismatched identity/port/transport, private config
+changes, damaged candidate and damaged recovery snapshots.
+
+**Do NOT execute `apply` on Cudy yet.** The prototype has not been tested
+on the actual Cudy/OpenWrt firmware with its built-in `tar`, rc.common,
+procd, overlay filesystem, reboot lifecycle or live reverse tunnel. It
+currently installs files without service activation; therefore a simple
+HTTP/SSH check only proves that the *old running connection* survived.
+A separate reversible functional activation/reboot acceptance gate is needed
+before calling the v119 client fully upgraded. Test an interrupted write,
+unavailable VPS, watchdog process termination and power loss in a disposable
+OpenWrt environment before real execution.
+
+No `install.sh` commands or router-side deployment commands are published
+here intentionally; only the developer canary fixture is covered by CI. Do
+not remove Belt's maintenance HOLD or update Xray-core.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
