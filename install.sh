@@ -80,6 +80,31 @@ install_config() {
 	chmod 0644 "$dst"
 }
 
+# Do not replace a manually WSS-patched agent if UCI still says TCP.
+# The new agent uses UCI as the source of truth after its next restart.
+transport_preflight() {
+	local config transport existing client_config
+	[ "${ROOT%/}" = "" ] || return 0
+	command -v uci >/dev/null 2>&1 || return 0
+	config="$(uci -q get owrtremote.main.xray_config 2>/dev/null || true)"
+	[ -n "$config" ] || config=/etc/xray/owrt-remote-client.json
+	[ -s "$config" ] || return 0
+	transport="$(uci -q get owrtremote.main.vps_transport 2>/dev/null || true)"
+	existing=""
+	if command -v jq >/dev/null 2>&1; then
+		existing="$(jq -r '[.outbounds[]? | select(.tag == "vps-interconn" or .tag == "vps-ssh-interconn") | .streamSettings.network] | unique | if length == 1 then .[0] else "unknown" end' "$config" 2>/dev/null || true)"
+	else
+		# Without a JSON parser, err on the side of keeping existing WS setups intact.
+		if grep -Eq '"network"[[:space:]]*:[[:space:]]*"ws"' "$config"; then existing=ws; fi
+	fi
+	if [ "$existing" = ws ] && [ "$transport" != ws ]; then
+		die "Роутер сейчас работает через WSS, но в UCI нет vps_transport=ws. Обновление отменено; перенеси текущие WSS/TLS настройки в UCI до обновления агента."
+	fi
+	if [ "$transport" = ws ] && [ "$existing" = tcp ]; then
+		die "UCI уже настроен на WSS, но действующий Xray ещё TCP. Обновление отменено до завершения миграции."
+	fi
+}
+
 make_key() {
 	local key_dir key_file key
 	key_dir="$(target_path etc/owrt-remote)"
@@ -220,6 +245,9 @@ install_xray_runtime() {
 	info "Preparing Xray and its persistent boot cache..."
 	"$remote_bin" prepare-xray || die "failed to prepare Xray"
 }
+
+# Abort before changing any installed component if transport state is unsafe.
+transport_preflight
 
 # Stop the old log writer before replacing its storage code. Its bounded legacy
 # archive is migrated by the new log service, without moving any other /tmp data.
