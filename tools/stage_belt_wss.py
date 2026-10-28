@@ -104,6 +104,22 @@ def check_expected(config):
     return mapping, ws_router
 
 
+def validate_alternate_core(binary, config_file, stage, label):
+    """Read-only syntax check using a separately installed Xray executable."""
+    require(binary.is_file() and os.access(binary, os.X_OK),
+            "Alternate Xray executable is missing or not executable")
+    result = subprocess.run(
+        [str(binary), "run", "-test", "-config", str(config_file)],
+        capture_output=True, text=True, timeout=30
+    )
+    report = stage / (label + "-xray-check.log")
+    report.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
+    report.chmod(0o600)
+    require(result.returncode == 0,
+            "Alternate Xray refused candidate; no changes made. Inspect private log " + str(report))
+    print("Alternate Xray syntax check:", label, "OK")
+
+
 def run_stage(args):
     live_path = Path(args.live).resolve()
     db_path = Path(args.db).resolve()
@@ -216,6 +232,11 @@ def run_stage(args):
     require(xray.returncode == 0, "Xray rejected candidate. See private " + str(log))
 
     print("Xray -test:", "OK")
+    if args.next_xray_bin:
+        alternate = Path(args.next_xray_bin).resolve()
+        require(alternate != binary,
+                "Alternate Xray must be a separate binary; no in-place core upgrades during staging")
+        validate_alternate_core(alternate, candidate, stage, "baseline-next-core")
     if args.simulate_fallback:
         # Rehearse the next legacy TCP -> WSS cutover on the DATABASE COPY only.
         # The existing legacy route must remain valid during this temporary state.
@@ -282,6 +303,11 @@ def run_stage(args):
         check_log.write_text(test.stdout + "\n" + test.stderr, encoding="utf-8")
         check_log.chmod(0o600)
         require(test.returncode == 0, "Xray rejected simultaneous TCP+WSS reverse clients. DO NOT DEPLOY.")
+        if args.next_xray_bin:
+            validate_alternate_core(
+                Path(args.next_xray_bin).resolve(), rehearsal_file,
+                stage, "fallback-next-core",
+            )
         print("===== OPTIONAL FALLBACK REHEARSAL =====")
         print("Existing TCP clients: 8, preserved unchanged")
         print("WSS clients: 4 (existing 2 + staged router 2)")
@@ -300,6 +326,8 @@ def main():
     parser.add_argument("--hub-source", default="vps/owrt-remote-hub.py")
     parser.add_argument("--xray-bin", default="/usr/local/bin/xray")
     parser.add_argument("--output-root", default="/root")
+    parser.add_argument("--next-xray-bin", default="",
+                        help="optional separate upgraded Xray binary for read-only syntax checks")
     parser.add_argument("--simulate-fallback", action="store_true",
                         help="also verify a temporary TCP+WSS dual-authorization candidate without changing live DB")
     args = parser.parse_args()
