@@ -83,6 +83,28 @@ class BeltOfflineStageTests(unittest.TestCase):
             self.assertEqual(db.execute(
                 "select vless_port from routers where id=?", ("wss-router",)).fetchone()[0], 443)
 
+    def test_route_order_difference_does_not_reject_safe_fallback(self):
+        live = json.loads(self.live.read_text(encoding="utf-8"))
+        # Every reverse selector is disjoint, and the live server may have
+        # been assembled in a different order than the DB renderer.
+        live["routing"]["rules"] = list(reversed(live["routing"]["rules"]))
+        self.live.write_text(json.dumps(live, ensure_ascii=False, indent=2) + "\\n")
+        live_hash = hashlib.sha256(self.live.read_bytes()).hexdigest()
+        result = self.stage("--simulate-fallback")
+        self.assertEqual(result.returncode, 0, result.stderr + "\\n" + result.stdout)
+        self.assertIn("Temporary fallback simulated: SNAPSHOT ONLY", result.stdout)
+        self.assertEqual(hashlib.sha256(self.live.read_bytes()).hexdigest(), live_hash)
+        self.assertEqual(hashlib.sha256(self.db.read_bytes()).hexdigest(), self.before_hash)
+
+    def test_overlapping_routes_fail_closed_in_fallback(self):
+        live = json.loads(self.live.read_text(encoding="utf-8"))
+        live["routing"]["rules"].append(dict(live["routing"]["rules"][0]))
+        self.live.write_text(json.dumps(live, indent=2) + "\\n")
+        result = self.stage("--simulate-fallback")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("routing", result.stderr.lower())
+        self.assertEqual(hashlib.sha256(self.db.read_bytes()).hexdigest(), self.before_hash)
+
     def test_simulated_dual_transport_fallback_keeps_live_unchanged(self):
         result = self.stage("--simulate-fallback")
         self.assertEqual(result.returncode, 0, result.stderr + "\n" + result.stdout)
