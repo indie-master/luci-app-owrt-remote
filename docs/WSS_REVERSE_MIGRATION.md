@@ -44,10 +44,13 @@ python3 "$SRC/tools/stage_belt_wss.py" \
   --db /var/lib/owrt-remote/hub.db \
   --live /etc/xray/owrt-remote.json \
   --xray-bin /usr/local/bin/xray \
-  --output-root /root
+  --output-root /root \
+  --simulate-fallback
 ```
 
-The script does not print real UUIDs, tokens or router credentials. All private output goes to `/root/owrt-wss-v119-*/` with mode 0700/0600. Only a completed **`SAFE STAGING PASSED`** and **`Semantic match ... YES`** can green-light the next *manual* deployment planning step. An error means **stop and investigate, do not force an install**. In particular, tests against generated synthetic data are not a substitute for this check with the real five-router database.
+The script does not print real UUIDs, tokens or router credentials. All private output goes to `/root/owrt-wss-v119-*/` with mode 0700/0600. The optional `--simulate-fallback` additionally tests the next planned TCP-to-WSS cutover for one synthetic selection of an existing router **inside the database snapshot only**. It keeps all 8 legacy TCP clients and expects 4 WSS clients (2 existing plus 2 for the migrating router), with identical UUIDs, preserved LuCI/SSH routing and a successful Xray `-test`. This is a syntax/reverse-contract rehearsal, not proof that two simultaneous live reverse sessions can coexist. No production services or files are changed.
+
+Only a completed **`SAFE STAGING PASSED`** and **`Semantic match ... YES`** can green-light the next *manual* deployment planning step. An error means **stop and investigate, do not force an install**. In particular, tests against generated synthetic data are not a substitute for this check with the real five-router database.
 
 For the already-migrated WSS router, the generated OpenWrt UCI export now preserves any previously selected `owrtremote.main.xray_bin` (e.g. the tested softfloat build) rather than blindly reverting to `/usr/bin/xray`.
 
