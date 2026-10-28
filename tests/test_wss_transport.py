@@ -97,6 +97,9 @@ class WssHubTests(unittest.TestCase):
         self.assertIn("vps_transport='ws'", new_lines)
         self.assertIn("vps_ws_path='/owrt-ws/'", new_lines)
         self.assertIn("vps_port='443'", new_lines)
+        self.assertIn('owrt_saved_xray_bin=', new_lines)
+        self.assertIn('if [ -z "$owrt_saved_xray_bin" ]; then', new_lines)
+        self.assertIn("uci set owrtremote.main.xray_bin='/usr/bin/xray'", new_lines)
         xray = hub.make_router_xray_config(new)
         outbounds = {o["tag"]: o for o in xray["outbounds"]}
         self.assertEqual(outbounds["vps-interconn"]["streamSettings"]["security"], "tls")
