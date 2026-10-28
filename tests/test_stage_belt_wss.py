@@ -22,7 +22,7 @@ sys.modules[spec.name] = hub
 with mock.patch.dict(os.environ, {"OWRT_REMOTE_STATE_DIR": state.name}):
     spec.loader.exec_module(hub)
 
-NAMES = ("main", "AX3000T-Shteinberg", "WR3000S_2", "PaxoBs", "Netis_N6_router5")
+NAMES = ("primary", "node-a", "node-b", "backup", "wss-router")
 
 
 class BeltOfflineStageTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class BeltOfflineStageTests(unittest.TestCase):
                     "name": rid,
                     "vps_transport": "tcp",
                     "vless_port": 18443,
-                    "vps_host": "sprt-wrt.cdnvc.xyz",
+                    "vps_host": "hub.example",
                     "entry_port": 18080 + index * 10,
                     "ssh_entry_port": 19080 + index * 10,
                     "vless_uuid": str(uuid.uuid4()),
@@ -51,7 +51,7 @@ class BeltOfflineStageTests(unittest.TestCase):
                 })
             rows = [dict(r) for r in hub.list_router_rows(db)]
             for r in rows:
-                if r["id"] == "Netis_N6_router5":
+                if r["id"] == "wss-router":
                     r["vps_transport"] = "ws"
                     r["vless_port"] = 443
         live_json = hub.make_server_xray_config(rows, listen_port=18443)
@@ -81,7 +81,7 @@ class BeltOfflineStageTests(unittest.TestCase):
         with sqlite3.connect(staged_db) as db:
             self.assertEqual(db.execute("select count(*) from routers where vps_transport='ws'").fetchone()[0], 1)
             self.assertEqual(db.execute(
-                "select vless_port from routers where id=?", ("Netis_N6_router5",)).fetchone()[0], 443)
+                "select vless_port from routers where id=?", ("wss-router",)).fetchone()[0], 443)
 
     def test_mismatched_live_client_refuses_stage(self):
         live = json.loads(self.live.read_text())
@@ -95,12 +95,12 @@ class BeltOfflineStageTests(unittest.TestCase):
 
     def test_missing_router_refuses_stage(self):
         with hub.connect(self.db) as db:
-            db.execute("update routers set deleted_at=10 where id='PaxoBs'")
+            db.execute("update routers set deleted_at=10 where id='backup'")
             db.commit()
         db_after = hashlib.sha256(self.db.read_bytes()).hexdigest()
         result = self.stage()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Active router ID set", result.stderr)
+        self.assertIn("Unexpected number of active DB routers", result.stderr)
         self.assertEqual(db_after, hashlib.sha256(self.db.read_bytes()).hexdigest())
 
 
