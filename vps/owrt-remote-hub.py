@@ -4587,30 +4587,82 @@ def make_router_xray_config(row):
     }
 
 
+_XRAY_RELOAD_LOCK = threading.RLock()
+
+
 def reload_vps_xray(db_path=DB_PATH):
+    """Validate a private candidate, retain a backup and roll back failed restarts."""
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
-    with connect(db_path) as conn:
-        init_db(conn)
-        rows = list_router_rows(conn)
-    config = make_server_xray_config(rows)
-    atomic_write_text(out, json.dumps(config, ensure_ascii=False, indent=2) + "\n", mode=0o600)
-    try:
-        os.chmod(out, 0o600)
-    except OSError:
-        pass
-    result = subprocess.run(
-        ["systemctl", "restart", service],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=20,
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"systemctl restart {service} failed: {detail}")
-    return {"config": str(out), "service": service, "routers": len(rows)}
+    binary = os.environ.get("OWRT_REMOTE_XRAY_BIN", "/usr/local/bin/xray")
+    with _XRAY_RELOAD_LOCK:
+        with connect(db_path) as conn:
+            init_db(conn)
+            rows = list_router_rows(conn)
+        config = make_server_xray_config(rows)
+        text = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        data = text.encode("utf-8")
+        if out.exists() and out.read_bytes() == data:
+            return {"config": str(out), "service": service, "routers": len(rows), "unchanged": True}
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fd, candidate_name = tempfile.mkstemp(prefix=".owrt-xray-", suffix=".json", dir=str(out.parent))
+        candidate = Path(candidate_name)
+        previous = out.read_bytes() if out.exists() else None
+        backup = None
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            check = subprocess.run(
+                [binary, "run", "-test", "-config", str(candidate)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                timeout=25, check=False,
+            )
+            if check.returncode:
+                raise RuntimeError("Xray candidate validation failed: " + (check.stderr or check.stdout)[-1500:])
+            if previous is not None:
+                archive = out.parent / "owrt-remote-backups"
+                archive.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(archive, 0o700)
+                backup = archive / ("owrt-remote-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".json")
+                atomic_write_text(backup, previous.decode("utf-8"), mode=0o600)
+            atomic_write_text(out, text, mode=0o600)
+
+            def restart_and_check():
+                result = subprocess.run(
+                    ["systemctl", "restart", service],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=25, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError("systemctl restart failed: " + (result.stderr or result.stdout)[-1000:])
+                # systemd can report 'active' before Xray has bound its sockets.
+                for attempt in range(15):
+                    status = subprocess.run(["systemctl", "is-active", "--quiet", service],
+                                            timeout=5, check=False)
+                    if status.returncode == 0:
+                        try:
+                            with socket.create_connection(("127.0.0.1", int(config["inbounds"][0]["port"])), timeout=1):
+                                with socket.create_connection(("127.0.0.1", 18444), timeout=1):
+                                    return
+                        except OSError:
+                            pass
+                    time.sleep(1)
+                raise RuntimeError("Xray did not open both reverse inbounds")
+
+            try:
+                restart_and_check()
+            except Exception as exc:
+                if previous is not None:
+                    atomic_write_text(out, previous.decode("utf-8"), mode=0o600)
+                    recovery = subprocess.run(["systemctl", "restart", service],
+                                              timeout=25, text=True, capture_output=True, check=False)
+                    if recovery.returncode:
+                        raise RuntimeError(f"Xray reload failed ({exc}); rollback restart also failed: {recovery.stderr}") from exc
+                raise RuntimeError(f"Xray reload failed; previous config restored: {exc}") from exc
+        finally:
+            candidate.unlink(missing_ok=True)
+    return {"config": str(out), "service": service, "routers": len(rows),
+            "backup": str(backup) if backup else "", "unchanged": False}
 
 
 def restart_vps_xray():
@@ -8949,7 +9001,10 @@ routerForm.addEventListener('submit', async (ev) => {{
     syncOwnerChrome();
     await loadRouters();
     fillRouterForm(true);
-    showRouterMsg('Роутер добавлен. Теперь открой OpenWrt config в его карточке и вставь команды на роутер.');
+    showRouterMsg(data.xray && data.xray.error
+      ? 'Роутер добавлен, но Xray не синхронизирован: ' + data.xray.error
+      : 'Роутер зарегистрирован в Xray. Открой OpenWrt config в карточке и вставь команды на роутер.',
+      Boolean(data.xray && data.xray.error));
   }} else {{
     showRouterMsg(await res.text(), true);
   }}
@@ -19539,7 +19594,15 @@ exit 127
                     router = row_to_router(row)
                 if current and not current.get("is_owner"):
                     grant_delegated_router_flag(load_auth(), current.get("username", ""), router_id, "G")
-                self.send_json(200, {"ok": True, "router": router, "auth": self.build_auth_meta()})
+                # Register new reverse UUIDs and entry/SSH inbounds immediately.
+                # An Xray failure never deletes a successfully registered router.
+                try:
+                    xray_sync = reload_vps_xray(self.app.db_path)
+                except Exception as exc:
+                    self.log_message("new router xray sync failed: %s", exc)
+                    xray_sync = {"error": str(exc)}
+                self.send_json(200, {"ok": True, "router": router,
+                                     "xray": xray_sync, "auth": self.build_auth_meta()})
             except Exception as exc:
                 self.send_text(400, str(exc))
             return
@@ -20246,6 +20309,25 @@ def cmd_add_router(args):
     print(json.dumps(router, ensure_ascii=False, indent=2))
 
 
+def cmd_set_router_transport(args):
+    """Explicit transport migration; never rotate UUIDs, reverse tags or entry ports."""
+    with connect(args.db) as conn:
+        init_db(conn)
+        row = get_router(conn, args.id)
+        if not row or router_deleted(row):
+            raise SystemExit("router not found")
+        new_port = 443 if args.transport == "ws" else DEFAULT_VLESS_PORT
+        conn.execute("update routers set vps_transport = ?, vless_port = ?, updated_at = ? where id = ?",
+                     (args.transport, new_port, now_ts(), row["id"]))
+        conn.commit()
+        row = get_router(conn, row["id"])
+    result = {"router_id": row["id"], "transport": args.transport,
+              "vless_port": new_port, "xray": "not reloaded"}
+    if args.sync_xray:
+        result["xray"] = reload_vps_xray(args.db)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def cmd_set_entry_port(args):
     router_id = clean_router_id(args.id)
     with connect(args.db) as conn:
@@ -20483,6 +20565,12 @@ def parser():
     add.add_argument("--ssh-host", default="127.0.0.1")
     add.add_argument("--ssh-port", type=int, default=22)
     add.set_defaults(func=cmd_add_router)
+
+    transport = sub.add_parser("set-router-transport", help="migrate a router between legacy TCP and WSS without changing UUIDs")
+    transport.add_argument("--id", required=True)
+    transport.add_argument("--transport", choices=("tcp", "ws"), required=True)
+    transport.add_argument("--sync-xray", action="store_true", help="validate and reload VPS Xray")
+    transport.set_defaults(func=cmd_set_router_transport)
 
     sep = sub.add_parser("set-entry-port", help="set router VPS entry port without changing UUID")
     sep.add_argument("--id", required=True)
