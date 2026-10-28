@@ -173,7 +173,16 @@ logs_response() {
 }
 
 save_config() {
-	local enabled field wan_interfaces
+	local enabled field wan_interfaces transport sni ws_path
+	transport="$(param vps_transport)"
+	case "$transport" in tcp|ws) ;; *) set_result "Настройки не сохранены" "Транспорт должен быть TCP или WSS" "bad"; return 1 ;; esac
+	sni="$(param vps_sni)"
+	ws_path="$(param vps_ws_path)"
+	case "$ws_path" in /*) ;; *) set_result "Настройки не сохранены" "WebSocket path должен начинаться с /" "bad"; return 1 ;; esac
+	if [ "$transport" = ws ]; then
+		[ -n "$sni" ] || { set_result "Настройки не сохранены" "Для WSS требуется домен TLS SNI" "bad"; return 1; }
+		case "$sni" in *://*|*/*|*[!a-zA-Z0-9._-]*) set_result "Настройки не сохранены" "Некорректный TLS SNI" "bad"; return 1 ;; esac
+	fi
 	wan_interfaces="$(param_values wan_interface | awk 'NF { if (NF != 1 || $0 !~ /^[a-zA-Z0-9_.:-]+$/) exit 1; if (!seen[$0]++) { printf "%s%s", sep, $0; sep=" " } }')" || {
 		set_result "Настройки не сохранены" "Некорректное имя WAN интерфейса." "bad"
 		return 1
@@ -192,7 +201,7 @@ save_config() {
 	fi
 	uci_set enabled "$enabled"
 
-	for field in router_id router_name role hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_port vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port public_url; do
+	for field in router_id router_name role hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_port vps_transport vps_sni vps_ws_path vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port public_url; do
 		uci_set "$field" "$(param "$field")"
 	done
 	if has_param vps_host_auto; then uci_set vps_host_mode auto; else uci_set vps_host_mode manual; fi
@@ -208,7 +217,7 @@ save_config() {
 
 clear_config() {
 	local field
-	for field in role public_url hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_host_mode wan_direct wan_interface wan_dns vps_port vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port; do
+	for field in role public_url hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_host_mode wan_direct wan_interface wan_dns vps_port vps_transport vps_sni vps_ws_path vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port; do
 		uci -q delete "owrtremote.main.$field"
 	done
 	uci commit owrtremote
@@ -466,8 +475,13 @@ EOF
 
 render_page() {
 	local key router_id router_name hub_url service_state service_tone xray_state xray_tone enabled_checked status_text
-	local vps_host_auto_checked wan_direct_checked
+	local vps_host_auto_checked wan_direct_checked transport_tcp_selected transport_ws_selected
 	vps_host_auto_checked=''; wan_direct_checked=''
+	transport_tcp_selected=''; transport_ws_selected=''
+	case "$(uci_get vps_transport tcp)" in
+		ws) transport_ws_selected=selected ;;
+		*) transport_tcp_selected=selected ;;
+	esac
 	[ "$(uci_get vps_host_mode manual)" != auto ] || vps_host_auto_checked=checked
 	[ "$(uci_get wan_direct 0)" != 1 ] || wan_direct_checked=checked
 	key="$(param key)"
@@ -659,7 +673,18 @@ EOF
 EOF
 	wan_interface_field
 	field wan_dns "WAN DNS" text "Необязательно: IP DNS-сервера для Remote. Пустое поле — DNS от провайдера на WAN."
-	field vps_port "VPS Xray port" number "Порт Xray на VPS для reverse-туннеля. Должен совпадать с render-xray на VPS, обычно 8443."
+	field vps_port "VPS Xray port" number "TCP: действующий порт HUB (на Belt 18443); WSS/TLS: внешний 443."
+	cat <<EOF
+      <label>Транспорт reverse-туннеля
+        <select name="vps_transport">
+          <option value="tcp" $transport_tcp_selected>Legacy VLESS TCP</option>
+          <option value="ws" $transport_ws_selected>VLESS WebSocket + TLS (WSS)</option>
+        </select>
+      </label>
+      <span class="hint">Сначала обнови агент на TCP. Перед переключением старого роутера включи временный TCP fallback в HUB через set-router-transport --stage. Только после этого меняй транспорт на WSS и проверяй доступ по LuCI/SSH. Не переключай вслепую удалённый роутер.</span>
+EOF
+	field vps_sni "TLS SNI / домен" text "Имя домена, чей сертификат проверяет WSS. Например hub.example.com; должно совпадать с сертификатом Nginx."
+	field vps_ws_path "WebSocket path" text "Путь, который проксирует Nginx, обычно /owrt-ws/."
 	field vless_uuid "VLESS UUID" text "Уникальный UUID роутера. Бери из карточки роутера на VPS или из команды print-openwrt-config."
 	field vless_encryption "VLESS encryption" text "Для этой схемы оставь none. Меняй только если сам меняешь Xray-конфиг на VPS."
 	field vless_flow "VLESS flow" text "Обычно оставь пустым. Нужно только для специальных режимов Xray."
