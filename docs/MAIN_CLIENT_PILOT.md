@@ -30,6 +30,13 @@ rollback are implemented and tested.
 Run on the *known router `main`* only, in a terminal with alternate
 local recovery access. Nothing below prints UUIDs or auth tokens.
 
+The versioned **read-only** guard is `tools/openwrt_pilot_preflight.sh`.
+Review it before executing. It deliberately fails if live UCI is not TCP/18443,
+if either reverse outbound is not TCP none, or if required utilities are absent.
+The script is a diagnostic ONLY: it does **not** install or create a rollback
+watchdog. CI covers shell syntax and rejection of WSS/unexpected ports.
+
+
 ```sh
 printf '%s\n' '===== ID ====='
 hostname
@@ -46,7 +53,7 @@ for s in owrt-remote rpcd uhttpd; do
   /etc/init.d/"$s" status 2>/dev/null || true
 done
 printf '%s\n' '===== VERSION ====='
-owrt-remote status 2>/dev/null | head -n 20 || true
+grep -m1 '^OWRT_REMOTE_UI_VERSION=' /www/cgi-bin/owrt-remote 2>/dev/null || true
 printf '%s\n' '===== STORAGE ====='
 df -h /overlay /tmp 2>/dev/null || true
 printf '%s\n' '===== Xray PROCESSES ====='
