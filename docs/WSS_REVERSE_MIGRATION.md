@@ -29,9 +29,9 @@ See the WSS reverse compatibility GitHub Actions workflow for the CI results.
 
 ## Read-only Belt staging (recommended next step)
 
-Use the pinned GitHub feature branch on a separate checkout. **Never install it over the live HUB or launch a maintenance/update command yet.** Running \`stage_belt_wss.py\` will read the live SQLite DB through read-only mode, create an online consistent backup in a private directory, and migrate **only the copy**. It will then generate a candidate from the new v119 Python source, compare it semantically with the currently working Xray configuration (8 TCP and 2 WSS clients), and run Xray \`-test\`. It neither writes to \`/etc/xray/owrt-remote.json\` nor restarts any systemd service.
+Use the pinned GitHub feature branch on a separate checkout. **Never install it over the live HUB or launch a maintenance/update command yet.** Running `stage_belt_wss.py` will read the live SQLite DB through read-only mode, create an online consistent backup in a private directory, and migrate **only the copy**. It will then generate a candidate from the new v119 Python source, compare it semantically with the currently working Xray configuration (8 TCP and 2 WSS clients), and run Xray `-test`. It neither writes to `/etc/xray/owrt-remote.json` nor restarts any systemd service.
 
-\`\`\`sh
+```sh
 set -eu
 umask 077
 SRC=/root/owrt-remote-v119-wss-check
@@ -45,11 +45,11 @@ python3 "$SRC/tools/stage_belt_wss.py" \
   --live /etc/xray/owrt-remote.json \
   --xray-bin /usr/local/bin/xray \
   --output-root /root
-\`\`\`
+```
 
-The script does not print real UUIDs, tokens or router credentials. All private output goes to \`/root/owrt-wss-v119-*/\` with mode 0700/0600. Only a completed **\`SAFE STAGING PASSED\`** and **\`Semantic match ... YES\`** can green-light the next *manual* deployment planning step. An error means **stop and investigate, do not force an install**. In particular, tests against generated synthetic data are not a substitute for this check with the real five-router database.
+The script does not print real UUIDs, tokens or router credentials. All private output goes to `/root/owrt-wss-v119-*/` with mode 0700/0600. Only a completed **`SAFE STAGING PASSED`** and **`Semantic match ... YES`** can green-light the next *manual* deployment planning step. An error means **stop and investigate, do not force an install**. In particular, tests against generated synthetic data are not a substitute for this check with the real five-router database.
 
-For Netis N6, the generated OpenWrt UCI export now preserves any previously selected \`owrtremote.main.xray_bin\` (e.g. the tested softfloat build) rather than blindly reverting to \`/usr/bin/xray\`.
+For Netis N6, the generated OpenWrt UCI export now preserves any previously selected `owrtremote.main.xray_bin` (e.g. the tested softfloat build) rather than blindly reverting to `/usr/bin/xray`.
 
 ## Safe migration of Belt (not an unattended installer)
 
