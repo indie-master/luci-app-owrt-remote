@@ -239,6 +239,24 @@ experimental transaction now use a secure 16-byte nonce from
 method works (never use timestamp/PID fallback). The transaction attempts
 random generation **before** adding its boot recovery hook.
 
+Second Cudy hardware probe (pinned `aa6803fbb0206493b46a0f4d9f288995a210e517`)
+stopped at `PROBE: FAIL - missing applet: nohup`, again **before any
+synthetic fixture was created**. This is a material runtime blocker for the
+transaction prototype, whose watchdog used `nohup`. The isolated probe now
+treats `nohup` as an **optional diagnostic**, reports availability of
+`nohup`, `start-stop-daemon`, `setsid`, `procd`, and `ubus` in one
+pass, and prints `WATCHDOG BLOCKED` if `nohup` is absent. It also
+collects the complete required-applet inventory before stopping, avoiding
+serial discovery of one missing utility at a time. The transaction separately
+rejects missing `nohup` before placing a recovery init script; all live
+transactions remain hard-blocked.
+
+Important: **do not silently replace `nohup` with a plain background
+`&`**. The local rollback watchdog must survive shell/session disconnection
+and be independently supervised; prefer evaluating OpenWrt `procd` with a
+separate recovery service under controlled test conditions. A present
+alternative applet does not establish durable supervision.
+
 The initial `od` failure does not establish that tar, BusyBox extraction,
 overlay capacity or the rest of the pilot passed; re-run the immutable
 CI-verified corrected probe on the router to check those separately.
