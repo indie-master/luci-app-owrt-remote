@@ -213,7 +213,7 @@ BusyBox applets, including success, timeout, unexpected reboot, incorrect
 nonce, duplicate apply, mismatched identity/port/transport, private config
 changes, damaged candidate and damaged recovery snapshots.
 
-**Do NOT execute `apply` on Cudy yet.** The prototype has not been tested
+**Do NOT execute `apply` on Cudy yet.** The prototype now **hard-rejects all live-mode calls** to `apply`, `confirm`, `rollback`, `watchdog` or `boot-recover` (only an explicitly isolated synthetic root runs). Live enablement requires a separately reviewed release. The prototype has not been tested
 on the actual Cudy/OpenWrt firmware with its built-in `tar`, rc.common,
 procd, overlay filesystem, reboot lifecycle or live reverse tunnel. It
 currently installs files without service activation; therefore a simple
