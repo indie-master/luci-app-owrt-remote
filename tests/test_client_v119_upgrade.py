@@ -71,6 +71,20 @@ class ClientV119UpgradeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 55, result.stderr)
         self.assertIn("BLOCKED", result.stdout)
 
+    def test_generic_vps_installer_refuses_existing_hub_before_modifying_anything(self):
+        with tempfile.TemporaryDirectory(prefix="existing-owrt-hub-") as d:
+            db = Path(d) / "hub.db"
+            db.write_text("existing-production-state")
+            result = subprocess.run(
+                ["sh", str(ROOT / "vps/install-vps.sh")],
+                env={**os.environ, "OWRT_REMOTE_STATE_DIR": d,
+                     "OWRT_REMOTE_ALLOW_REINSTALL": "0"},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Существующий HUB", result.stderr)
+            self.assertEqual(db.read_text(), "existing-production-state")
+
     def test_new_install_is_tcp_safe_until_hub_provisions_wss(self):
         with tempfile.TemporaryDirectory(prefix="owrt-v119-new-client-") as d:
             root = Path(d)
