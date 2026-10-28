@@ -19,3 +19,5 @@ jobs:
           sh -n files/usr/sbin/owrt-remote
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Check agent Xray config validation regressions
+        run: python3 -m unittest discover -s tests -p 'test_xray_validation.py' -v
