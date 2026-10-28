@@ -30,6 +30,8 @@ jobs:
       - name: Run strictly isolated hardware compatibility probe in CI
         run: |
           sh tools/openwrt_hardware_compat_probe.sh
+      - name: Check OpenWrt applet inventory when nohup is absent
+        run: python3 -m unittest discover -s tests -p 'test_openwrt_probe_inventory.py' -v
       - name: Test secure nonce encoding with od absent or unavailable
         run: python3 -m unittest discover -s tests -p 'test_secure_nonce_portability.py' -v
       - name: Test opt-in router apply, timeout rollback and boot recovery
