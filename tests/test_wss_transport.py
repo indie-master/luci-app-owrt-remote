@@ -114,6 +114,42 @@ class WssHubTests(unittest.TestCase):
             row = hub.get_router(conn, "old")
         self.assertEqual(row["vps_transport"], "tcp")
 
+    def test_reload_preserves_live_legacy_port_18443(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        live = Path(self.temp.name) / "current.json"
+        prior = hub.make_server_xray_config(rows, listen_port=18443)
+        live.write_text(json.dumps(prior) + "\n", encoding="utf-8")
+        self.add("new")
+        from contextlib import nullcontext
+        with mock.patch.dict(os.environ, {
+            "OWRT_REMOTE_XRAY_CONFIG": str(live),
+            "OWRT_REMOTE_XRAY_BIN": "/bin/xray-test",
+        }), mock.patch.object(hub.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+             mock.patch.object(hub.socket, "create_connection", return_value=nullcontext()):
+            result = hub.reload_vps_xray(self.db)
+        self.assertFalse(result["unchanged"])
+        config = json.loads(live.read_text(encoding="utf-8"))
+        inbounds = {inbound["tag"]: inbound for inbound in config["inbounds"]}
+        self.assertEqual(inbounds["owrt-remote-vless"]["port"], 18443)
+        self.assertEqual(inbounds["owrt-remote-wss"]["port"], 18444)
+        self.assertEqual(len(inbounds["owrt-remote-vless"]["settings"]["clients"]), 2)
+        self.assertEqual(len(inbounds["owrt-remote-wss"]["settings"]["clients"]), 2)
+
+    def test_reload_unchanged_skips_restart(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        live = Path(self.temp.name) / "current.json"
+        live.write_text(json.dumps(hub.make_server_xray_config(rows, listen_port=18443),
+                                   ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"OWRT_REMOTE_XRAY_CONFIG": str(live)}), \
+             mock.patch.object(hub.subprocess, "run") as call:
+            result = hub.reload_vps_xray(self.db)
+        self.assertTrue(result["unchanged"])
+        call.assert_not_called()
+
     def test_failed_candidate_validation_does_not_overwrite_live_xray(self):
         self.add("old", "tcp", 18443)
         live = Path(self.temp.name) / "current.json"
