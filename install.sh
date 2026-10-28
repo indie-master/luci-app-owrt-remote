@@ -208,6 +208,10 @@ install_packages() {
 ensure_wol_support() {
 	local need manager tool_pkg candidate
 	[ "${ROOT%/}" = "" ] || return 0
+	if [ "${OWRT_REMOTE_SKIP_WOL_PACKAGES:-0}" = 1 ]; then
+		info "Skipping optional Wake-on-LAN package changes (pilot upgrade)."
+		return 0
+	fi
 	manager="$(package_manager)"
 	[ "$manager" != "unknown" ] || {
 		warn "не найден пакетный менеджер для установки WOL-пакетов"
@@ -240,6 +244,10 @@ ensure_wol_support() {
 install_xray_runtime() {
 	local remote_bin
 	[ "${ROOT%/}" = "" ] || return 0
+	if [ "${OWRT_REMOTE_SKIP_XRAY_PREPARE:-0}" = 1 ]; then
+		info "Keeping existing Xray executable and boot cache unchanged (pilot upgrade)."
+		return 0
+	fi
 	remote_bin="$(target_path usr/sbin/owrt-remote)"
 	[ -x "$remote_bin" ] || die "missing $remote_bin after install"
 	info "Preparing Xray and its persistent boot cache..."
