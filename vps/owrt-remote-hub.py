@@ -4632,7 +4632,10 @@ def reload_vps_xray(db_path=DB_PATH):
         config = make_server_xray_config(rows, listen_host=legacy_listen, listen_port=legacy_port)
         text = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
         data = text.encode("utf-8")
-        if out.exists() and out.read_bytes() == data:
+        # Semantically identical JSON must not force a disconnect merely
+        # because the existing file uses different whitespace/key ordering.
+        # Keep all list ordering intact (Xray routing rules are ordered).
+        if out.exists() and json.loads(out.read_text(encoding="utf-8")) == config:
             return {"config": str(out), "service": service, "routers": len(rows), "unchanged": True}
         out.parent.mkdir(parents=True, exist_ok=True)
         fd, candidate_name = tempfile.mkstemp(prefix=".owrt-xray-", suffix=".json", dir=str(out.parent))
