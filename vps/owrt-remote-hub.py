@@ -3589,6 +3589,8 @@ def init_db(conn):
     ensure_column(conn, "routers", "ssh_host", "text not null default '127.0.0.1'")
     ensure_column(conn, "routers", "ssh_port", "integer not null default 22")
     ensure_column(conn, "routers", "notes", "text not null default ''")
+    # Existing router records are always legacy TCP; new records default to WSS.
+    ensure_column(conn, "routers", "vps_transport", "text not null default 'tcp'")
     conn.execute(
         """
         update routers
@@ -4083,6 +4085,19 @@ def upsert_router(conn, values):
             return int(current[key] or default)
         return default
 
+    # A missing value means preserve existing transport; use WSS for new records.
+    transport = str(values.get("vps_transport") or (current["vps_transport"] if current else "ws")).strip().lower()
+    if transport not in ("tcp", "ws"):
+        raise ValueError("vps_transport must be tcp or ws")
+    port_value = values.get("vless_port")
+    if port_value in (None, ""):
+        if current and transport == current["vps_transport"]:
+            port_value = current["vless_port"]
+        else:
+            port_value = 443 if transport == "ws" else DEFAULT_VLESS_PORT
+    port_value = int(port_value)
+    if not 1 <= port_value <= 65535:
+        raise ValueError("Invalid VLESS port")
     reverse_tag = keep_str("reverse_tag", "reverse-in")
     ssh_vless_uuid = values.get("ssh_vless_uuid") or (current["ssh_vless_uuid"] if current and current["ssh_vless_uuid"] else str(uuid.uuid4()))
     ssh_reverse_tag = values.get("ssh_reverse_tag") or (current["ssh_reverse_tag"] if current and current["ssh_reverse_tag"] else f"{reverse_tag}-ssh")
@@ -4104,7 +4119,8 @@ def upsert_router(conn, values):
         "group_id": clean_router_group_id(keep_str("group_id", "")),
         "entry_port": keep_int("entry_port", 0),
         "vps_host": keep_str("vps_host", ""),
-        "vless_port": keep_int("vless_port", DEFAULT_VLESS_PORT),
+        "vless_port": port_value,
+        "vps_transport": transport,
         "vless_uuid": keep_str("vless_uuid", str(uuid.uuid4())),
         "vless_encryption": keep_str("vless_encryption", "none"),
         "vless_decryption": keep_str("vless_decryption", "none"),
@@ -4137,6 +4153,7 @@ def upsert_router(conn, values):
                 entry_port = :entry_port,
                 vps_host = :vps_host,
                 vless_port = :vless_port,
+                vps_transport = :vps_transport,
                 vless_uuid = :vless_uuid,
                 vless_encryption = :vless_encryption,
                 vless_decryption = :vless_decryption,
@@ -4162,13 +4179,13 @@ def upsert_router(conn, values):
         conn.execute(
             """
             insert into routers (
-                id, name, role, group_id, entry_port, vps_host, vless_port, vless_uuid,
+                id, name, role, group_id, entry_port, vps_host, vless_port, vps_transport, vless_uuid,
                 vless_encryption, vless_decryption, vless_flow, reverse_tag,
                 public_url, admin_host, admin_port, ssh_entry_port, ssh_vless_uuid,
                 ssh_reverse_tag, ssh_host, ssh_port, notes,
                 created_at, updated_at, deleted_at
             ) values (
-                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vless_uuid,
+                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vps_transport, :vless_uuid,
                 :vless_encryption, :vless_decryption, :vless_flow, :reverse_tag,
                 :public_url, :admin_host, :admin_port, :ssh_entry_port, :ssh_vless_uuid,
                 :ssh_reverse_tag, :ssh_host, :ssh_port, :notes,
@@ -4206,6 +4223,7 @@ def heartbeat(conn, payload):
                 "id": router_id,
                 "name": payload.get("name") or router_id,
                 "role": payload.get("role") or "node",
+                "vps_transport": "tcp",  # Unknown heartbeat clients remain legacy.
                 "entry_port": payload.get("entry_port") or 0,
                 "vps_host": payload.get("vps_host") or "",
                 "admin_host": payload.get("admin_host") or "127.0.0.1",
@@ -4376,6 +4394,7 @@ def delete_router_note_entry(conn, router_id, note_id):
 
 def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLESS_PORT, decryption="none"):
     clients = []
+    ws_clients = []
     inbounds = [
         {
             "tag": "owrt-remote-vless",
@@ -4392,6 +4411,19 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
             },
         }
     ]
+    # Nginx terminates TLS on :443, then proxies /owrt-ws/ to localhost.
+    inbounds.append({
+        "tag": "owrt-remote-wss",
+        "listen": "127.0.0.1",
+        "port": 18444,
+        "protocol": "vless",
+        "settings": {"clients": ws_clients, "decryption": decryption},
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": "/owrt-ws/"},
+        },
+    })
     rules = []
 
     for row in rows:
@@ -4403,6 +4435,7 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
         reverse_out = f"reverse-{router_id}"
         ssh_reverse_out = f"{reverse_out}-ssh"
         portal_in = f"entry-{router_id}"
+        transport_clients = ws_clients if row_str_value(row, "vps_transport", "tcp") == "ws" else clients
         client = {
             "id": row["vless_uuid"],
             "email": f"{router_id}@owrt-remote",
@@ -4412,7 +4445,7 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
         }
         if row["vless_flow"]:
             client["flow"] = row["vless_flow"]
-        clients.append(client)
+        transport_clients.append(client)
         if ssh_entry_port > 0:
             ssh_client = {
                 "id": row["ssh_vless_uuid"],
@@ -4423,7 +4456,7 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
             }
             if row["vless_flow"]:
                 ssh_client["flow"] = row["vless_flow"]
-            clients.append(ssh_client)
+            transport_clients.append(ssh_client)
         inbounds.append(
             {
                 "tag": portal_in,
@@ -4479,6 +4512,18 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
 def make_router_xray_config(row):
     bridge_tag = row["reverse_tag"]
     ssh_bridge_tag = row["ssh_reverse_tag"] or f"{bridge_tag}-ssh"
+    transport = row_str_value(row, "vps_transport", "tcp")
+    sni = row_str_value(row, "vps_host", "")
+    stream = ({"network": "ws", "security": "tls",
+               "tlsSettings": {"serverName": sni, "allowInsecure": False, "alpn": ["http/1.1"]},
+               "wsSettings": {"path": "/owrt-ws/", "host": sni}}
+              if transport == "ws" else {"network": "tcp", "security": "none"})
+    admin_settings = {"redirect": f"{row['admin_host']}:{int(row['admin_port'])}"}
+    ssh_settings = {"redirect": f"{row['ssh_host'] or '127.0.0.1'}:{int(row['ssh_port'] or 22)}"}
+    if transport == "ws":
+        # WSS is intended for modern Xray; allow only the two redirect ports.
+        admin_settings["finalRules"] = [{"action": "allow", "network": "tcp", "port": str(int(row['admin_port']))}]
+        ssh_settings["finalRules"] = [{"action": "allow", "network": "tcp", "port": str(int(row['ssh_port'] or 22))}]
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [],
@@ -4487,14 +4532,14 @@ def make_router_xray_config(row):
                 "tag": "router-admin",
                 "protocol": "freedom",
                 "settings": {
-                    "redirect": f"{row['admin_host']}:{int(row['admin_port'])}",
+                    **admin_settings,
                 },
             },
             {
                 "tag": "router-ssh",
                 "protocol": "freedom",
                 "settings": {
-                    "redirect": f"{row['ssh_host'] or '127.0.0.1'}:{int(row['ssh_port'] or 22)}",
+                    **ssh_settings,
                 },
             },
             {
@@ -4508,7 +4553,7 @@ def make_router_xray_config(row):
                     "flow": row["vless_flow"],
                     "reverse": {"tag": bridge_tag},
                 },
-                "streamSettings": {"network": "tcp", "security": "none"},
+                "streamSettings": stream,
             },
             {
                 "tag": "vps-ssh-interconn",
@@ -4521,7 +4566,7 @@ def make_router_xray_config(row):
                     "flow": row["vless_flow"],
                     "reverse": {"tag": ssh_bridge_tag},
                 },
-                "streamSettings": {"network": "tcp", "security": "none"},
+                "streamSettings": stream,
             },
         ],
         "routing": {
@@ -4644,6 +4689,9 @@ def build_openwrt_config_payload(row, hub_url, vps_host_override="", public_url_
         "vps_host": effective_vps_host,
         "vps_host_mode": router_reported_connection(row, legacy_mode="manual")[0],
         "vps_port": row_int_value(row, "vless_port", DEFAULT_VLESS_PORT),
+        "vps_transport": row_str_value(row, "vps_transport", "tcp"),
+        "vps_sni": vps_host_name(hub_url) or effective_vps_host,
+        "vps_ws_path": "/owrt-ws/",
         "vless_uuid": row_str_value(row, "vless_uuid"),
         "vless_encryption": row_str_value(row, "vless_encryption", "none"),
         "vless_flow": row_str_value(row, "vless_flow", ""),
@@ -4684,6 +4732,9 @@ def build_openwrt_config_lines(payload, mode="manual"):
         "  uci set owrtremote.main.vps_host_mode='manual'",
         "fi",
         f"uci set owrtremote.main.vps_port='{payload['vps_port']}'",
+        f"uci set owrtremote.main.vps_transport='{sh_quote(payload['vps_transport'])}'",
+        f"uci set owrtremote.main.vps_sni='{sh_quote(payload['vps_sni'])}'",
+        f"uci set owrtremote.main.vps_ws_path='{sh_quote(payload['vps_ws_path'])}'",
         f"uci set owrtremote.main.vless_uuid='{sh_quote(payload['vless_uuid'])}'",
         f"uci set owrtremote.main.vless_encryption='{sh_quote(payload['vless_encryption'])}'",
         f"uci set owrtremote.main.vless_flow='{sh_quote(payload['vless_flow'])}'",
@@ -5547,6 +5598,10 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <select name="group_id" id="routerGroupInput"><option value="">Без группы</option></select>
     <input name="entry_port" placeholder="18080" inputmode="numeric" required>
     <input name="vps_host" placeholder="VPS IP/domain" required>
+    <select name="vps_transport" aria-label="Транспорт Xray">
+      <option value="ws" selected>WSS / TLS · 443 (новые роутеры)</option>
+      <option value="tcp">TCP · 18443 (legacy)</option>
+    </select>
     <button class="primary">Добавить</button>
   </form>
   <div id="routerMsg" class="formMsg" hidden></div>
@@ -19445,6 +19500,10 @@ exit 127
                 payload = self.read_payload()
                 router_id = clean_router_id(payload.get("id"))
                 payload["group_id"] = clean_router_group_id(payload.get("group_id"))
+                payload["vps_transport"] = str(payload.get("vps_transport") or "ws").strip().lower()
+                if payload["vps_transport"] not in ("ws", "tcp"):
+                    raise ValueError("Недопустимый транспорт Xray")
+                payload["vless_port"] = 443 if payload["vps_transport"] == "ws" else DEFAULT_VLESS_PORT
                 entry_port = int(payload.get("entry_port") or 0)
                 ssh_entry_port = int(payload.get("ssh_entry_port") or (entry_port + 1000))
                 if entry_port <= 0:
@@ -20167,6 +20226,7 @@ def cmd_add_router(args):
                 "entry_port": args.entry_port,
                 "vps_host": args.vps_host,
                 "vless_port": args.vless_port,
+                "vps_transport": args.vps_transport,
                 "vless_uuid": args.vless_uuid,
                 "vless_encryption": args.vless_encryption,
                 "vless_decryption": args.vless_decryption,
@@ -20407,7 +20467,8 @@ def parser():
     add.add_argument("--role", default="node")
     add.add_argument("--entry-port", type=int, required=True)
     add.add_argument("--vps-host", required=True)
-    add.add_argument("--vless-port", type=int, default=DEFAULT_VLESS_PORT)
+    add.add_argument("--vless-port", type=int, default=None)
+    add.add_argument("--vps-transport", choices=("tcp", "ws"), default=None)
     add.add_argument("--vless-uuid", default="")
     add.add_argument("--vless-encryption", default="none")
     add.add_argument("--vless-decryption", default="none")
