@@ -26,6 +26,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_client_v119_upgrade.py' -v
       - name: Test isolated Belt database migration
         run: python3 -m unittest discover -s tests -p 'test_stage_belt_wss.py' -v
+      - name: Test guarded Belt Hub-only upgrade and rollback preflight
+        run: python3 -m unittest discover -s tests -p 'test_belt_hub_upgrade.py' -v
       - name: Check agent Xray config validation regressions
         run: |
           mkdir -p /tmp/owrt-test-shell
