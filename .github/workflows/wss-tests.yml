@@ -1,0 +1,21 @@
+name: WSS reverse compatibility
+on:
+  push:
+    branches:
+      - feature/wss-reverse-v119
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  wss-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Python and BusyBox/POSIX shell syntax
+        run: |
+          python3 -m py_compile vps/owrt-remote-hub.py
+          sh -n files/usr/sbin/owrt-remote
+      - name: Run WSS backwards-compatibility tests
+        run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
