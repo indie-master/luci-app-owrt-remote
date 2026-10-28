@@ -325,9 +325,10 @@ def apply(args):
     print("Backup directory:", backup_dir, flush=True)
     changed = False
     try:
-        # Quiesce Hub writers before making the production DB snapshot.
-        call(["systemctl", "stop", HUB_SERVICE])
+        # If systemctl returns an error after the process has already exited,
+        # we still must recover the Hub. Mark this before issuing stop.
         changed = True
+        call(["systemctl", "stop", HUB_SERVICE])
         require(not is_active(HUB_SERVICE), "Hub did not stop")
         verify_xray_untouched(args, info)
         backup_files(args, info, backup_dir / "files")
