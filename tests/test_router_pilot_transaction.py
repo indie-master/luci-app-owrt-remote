@@ -153,6 +153,25 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.assertFalse((self.state/'pending').exists())
         self.restore_assertions()
 
+    def test_changed_original_client_blocks_apply(self):
+        self.prepared()
+        path=self.router/'usr/sbin/owrt-remote'
+        path.write_text('CONCURRENT-EDIT')
+        r=self.run_cmd(TRANSACTION,'apply',self.digest)
+        self.assertNotEqual(r.returncode,0)
+        self.assertFalse((self.state/'pending').exists())
+        self.assertIn('changed after snapshot',r.stderr)
+
+    def test_corrupted_recovery_file_blocks_apply(self):
+        self.prepared()
+        recovery=self.state/'backup/files/usr/sbin/owrt-remote'
+        recovery.write_text('CORRUPTED-BACKUP')
+        r=self.run_cmd(TRANSACTION,'apply',self.digest)
+        self.assertNotEqual(r.returncode,0)
+        self.assertFalse((self.state/'pending').exists())
+        self.assertIn('backup corrupted',r.stderr)
+        self.restore_assertions()
+
     def test_wrong_router_and_transport_block_mutation(self):
         self.prepared()
         for name,val in [('RO_TEST_ROUTER_ID','PaxoBs'),('RO_TEST_TRANSPORT','ws'),
