@@ -67,6 +67,34 @@ being queried. Verify the old transport remains `tcp`, port 18443 and the
 running Xray version/path/JSON match expectations. Never paste full UCI,
 Xray JSON or `web.key` to public logs.
 
+## Step 1 result: operator-tested baseline (2026-10-28)
+
+Read-only preflight on `main` / Cudy WBR3000UAX v1 (OpenWrt 24.10.5): **PASS**.
+`router_id=main`, two `TCP none` reverse outbounds, port `18443`, Xray
+26.3.27/arm64, `owrt-remote`, `rpcd` and `uhttpd` running.
+Overlay free 57.2 MiB; /tmp free 181.0 MiB (tmpfs, not persistent storage).
+Installed router UI: `2026-07-02-mobile-terminal-batch-v25`.
+
+Live memory `/proc/meminfo`:
+- Total: 497416 KiB (485.8 MiB);
+- Free: 241848 KiB (236.2 MiB);
+- Available: 272600 KiB (266.2 MiB, **use this for memory checks**);
+- Page cache: 133888 KiB (130.8 MiB);
+- Shared: 63348 KiB (61.9 MiB); swap 0.
+- Existing Xray 26.3.27 resident `VmRSS`: 30976 KiB (30.3 MiB), `VmHWM` 31844 KiB (31.1 MiB), 9 threads. Its virtual `VmSize` is **not** RSS.
+- No OOM events were found in visible `dmesg`. `/proc/pressure/memory`
+  and requested `/proc/vmstat` OOM counters returned no text; this does
+  **not** prove zero historic OOMs or memory pressure.
+
+The older BusyBox `free -m` display printed values corresponding to KiB;
+`/proc/meminfo` above is the authoritative source for units.
+
+**Gate:** memory and staging storage look sufficient for a **single** low-impact
+client pilot on this ~512 MB device. This does not authorize installing until
+the bundle-level rollback + local watchdog is implemented/tested. Separate
+real-hardware tests are required for 128/256 MB routers. Do not touch Belt's
+maintenance HOLD or the selected Xray executable.
+
 ## Step 2: guarded upgrade tooling, to be implemented and tested first
 
 The dedicated pilot entry point must:
