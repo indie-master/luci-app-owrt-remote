@@ -4607,10 +4607,22 @@ def make_router_xray_config(row):
 
 
 _XRAY_RELOAD_LOCK = threading.RLock()
+_XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"
+
+
+def assert_xray_mutation_allowed():
+    """Fail closed during a guarded Hub upgrade without touching Xray service."""
+    if _XRAY_MAINTENANCE_HOLD.exists():
+        raise RuntimeError(
+            "Xray restart/reload is locked during a guarded Hub upgrade; "
+            "verify all reverse tunnels before removing the maintenance hold."
+        )
+
 
 
 def reload_vps_xray(db_path=DB_PATH):
     """Validate a private candidate, retain a backup and roll back failed restarts."""
+    assert_xray_mutation_allowed()
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
     binary = os.environ.get("OWRT_REMOTE_XRAY_BIN", "/usr/local/bin/xray")
@@ -4699,6 +4711,7 @@ def reload_vps_xray(db_path=DB_PATH):
 
 
 def restart_vps_xray():
+    assert_xray_mutation_allowed()
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
     result = subprocess.run(
         ["systemctl", "restart", service],
