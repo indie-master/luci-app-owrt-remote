@@ -1,0 +1,300 @@
+# Client v119 — first pilot on router `main` (NOT PaxoBs)
+
+**Status: plan / read-only preflight. DO NOT run the installer yet.**
+The operator selected the router labelled `main`, because local recovery is
+possible in the evening. The repo branch name `main` is unrelated to that
+router name. Keep `PaxoBs` untouched.
+
+## Why the existing installer is not yet a safe remote one-click update
+
+`install.sh` preserves the existing UCI file and the pilot environment
+switches skip Xray preparation and optional WOL package installation, but
+currently:
+
+- It replaces agent, init, hotplug, LuCI and CGI files **one at a time**;
+  a later failure leaves a mixed-version installation.
+- It stops/restarts its logging service and restarts `rpcd`, then reloads
+  or restarts `uhttpd` if needed. This is not a no-op for remote management.
+- It does not implement automatic recovery of the previous entire bundle
+  after loss of end-to-end LuCI/SSH over the reverse tunnel.
+- It has no built-in local watchdog verifying an out-of-band acceptance
+  acknowledgement from Belt. Xray is not intentionally restarted by this
+  pilot, but that alone does not prove that the reverse connection survives.
+
+Therefore **do not click "Update all routers", change UCI transport, run the
+bare installer, or remove Belt's HOLD** until the guarded pilot tooling and
+rollback are implemented and tested.
+
+## Step 1: safe read-only inventory
+
+Run on the *known router `main`* only, in a terminal with alternate
+local recovery access. Nothing below prints UUIDs or auth tokens.
+
+The versioned **read-only** guard is `tools/openwrt_pilot_preflight.sh`.
+Review it before executing. It deliberately fails if live UCI is not TCP/18443,
+if either reverse outbound is not TCP none, or if required utilities are absent.
+The script is a diagnostic ONLY: it does **not** install or create a rollback
+watchdog. CI covers shell syntax and rejection of WSS/unexpected ports.
+
+
+```sh
+printf '%s\n' '===== ID ====='
+hostname
+ubus call system board 2>/dev/null | jsonfilter -e '@.model' -e '@.release.description' || true
+
+printf '%s\n' '===== TRANSPORT ====='
+uci -q get owrtremote.main.vps_transport || echo tcp
+uci -q get owrtremote.main.vps_port || true
+uci -q get owrtremote.main.xray_config || true
+uci -q get owrtremote.main.xray_bin || true
+
+printf '%s\n' '===== SERVICE STATUS ====='
+for s in owrt-remote rpcd uhttpd; do
+  /etc/init.d/"$s" status 2>/dev/null || true
+done
+printf '%s\n' '===== VERSION ====='
+grep -m1 '^OWRT_REMOTE_UI_VERSION=' /www/cgi-bin/owrt-remote 2>/dev/null || true
+printf '%s\n' '===== STORAGE ====='
+df -h /overlay /tmp 2>/dev/null || true
+printf '%s\n' '===== Xray PROCESSES ====='
+pidof xray 2>/dev/null || true
+printf '%s\n' '===== CONFIG HASH ====='
+sha256sum /etc/config/owrtremote 2>/dev/null || true
+```
+
+Check in the Hub that the selected `main` row really maps to the router
+being queried. Verify the old transport remains `tcp`, port 18443 and the
+running Xray version/path/JSON match expectations. Never paste full UCI,
+Xray JSON or `web.key` to public logs.
+
+## Step 1 result: operator-tested baseline (2026-10-28)
+
+Read-only preflight on `main` / Cudy WBR3000UAX v1 (OpenWrt 24.10.5): **PASS**.
+`router_id=main`, two `TCP none` reverse outbounds, port `18443`, Xray
+26.3.27/arm64, `owrt-remote`, `rpcd` and `uhttpd` running.
+Overlay free 57.2 MiB; /tmp free 181.0 MiB (tmpfs, not persistent storage).
+Installed router UI: `2026-07-02-mobile-terminal-batch-v25`.
+
+Live memory `/proc/meminfo`:
+- Total: 497416 KiB (485.8 MiB);
+- Free: 241848 KiB (236.2 MiB);
+- Available: 272600 KiB (266.2 MiB, **use this for memory checks**);
+- Page cache: 133888 KiB (130.8 MiB);
+- Shared: 63348 KiB (61.9 MiB); swap 0.
+- Existing Xray 26.3.27 resident `VmRSS`: 30976 KiB (30.3 MiB), `VmHWM` 31844 KiB (31.1 MiB), 9 threads. Its virtual `VmSize` is **not** RSS.
+- No OOM events were found in visible `dmesg`. `/proc/pressure/memory`
+  and requested `/proc/vmstat` OOM counters returned no text; this does
+  **not** prove zero historic OOMs or memory pressure.
+
+The older BusyBox `free -m` display printed values corresponding to KiB;
+`/proc/meminfo` above is the authoritative source for units.
+
+**Gate:** memory and staging storage look sufficient for a **single** low-impact
+client pilot on this ~512 MB device. This does not authorize installing until
+the bundle-level rollback + local watchdog is implemented/tested. Separate
+real-hardware tests are required for 128/256 MB routers. Do not touch Belt's
+maintenance HOLD or the selected Xray executable.
+
+## Step 2: guarded upgrade tooling, to be implemented and tested first
+
+The dedicated pilot entry point must:
+
+1. Verify the router identity with a pre-shared expected agent/router ID,
+   accepted `tcp` transport and port, writable overlay/free space,
+   no concurrent install, and the presence of local recovery access.
+2. Download **all** version-pinned files and manifest, verify SHA-256 and
+   syntax, and check storage limits before changing any live file.
+3. Create a private, persistent, complete snapshot of all files the installer
+   may replace, their modes, `/etc/config/owrtremote`, the selected Xray
+   binary/config identity, and the running service state. Preserve unknown
+   user customizations.
+4. Arm a router-local watchdog with a deadline BEFORE any installation.
+   The watchdog must survive a dropped management tunnel and roll back
+   affected files/services on missing explicit, authenticated acceptance.
+   Never use "the router can ping the VPS" as the only acceptance condition.
+5. Apply staged files as a coherent versioned bundle, keep Xray-core and its
+   boot cache unchanged, preserve `TCP none` and all UUID/route/port fields,
+   and avoid gratuitous restart of the reverse tunnel.
+6. From Belt, test HTTP 200 for LuCI **and** a valid SSH banner through the
+   existing reverse port pair. Verify stable Xray config/process identity.
+   Only then send explicit acceptance to cancel the watchdog.
+7. On any failure or lost confirmation, automatically restore the previous
+   bundle locally and reestablish old services. Log a redacted failure
+   report. Keep an independently available local emergency access route.
+
+The watchdog timeout needs real-world measurements and explicit approval
+before implementation; it must not be chosen blindly.
+
+## Guarded bundle milestone (development branch only)
+
+Two **new, separate** tools now exist. This does NOT mean the live upgrade is
+ready or that the original installer has been replaced:
+
+- `tools/build_router_bundle.py`: creates a deterministic, UNCOMPRESSED tar
+  containing exactly the ten files the original `install.sh` updates (excluding
+  the UCI config, selected Xray binary, optional packages and service actions).
+  Outputs SHA-256; no router commands.
+- `tools/router_bundle_guard.sh`: accepts a **pre-downloaded local bundle and
+  a separately reviewed exact SHA-256**. The `stage` command rejects mismatched
+  hashes, unexpected archive members, links and invalid per-file checksums.
+  It limits archives to 6 MiB and requires 24 MiB free on persistent overlay.
+  The `snapshot` command prepares a private persistent copy of the old ten
+  files plus UCI and default client JSON. Existing backups are never
+  overwritten. Only the `main` router on TCP none/18443 is supported.
+- Importantly, this version **does not implement `apply`, `confirm`,
+  `watchdog` or `rollback` yet**. Those commands are intentionally rejected.
+  It neither updates nor restarts any service, nor installs a boot recovery
+  mechanism. Do not interpret `STAGED` or `SNAPSHOT READY` as safe to run
+  the original `install.sh`.
+
+### Developer-only offline checks
+
+On a disposable source checkout (not Belt or the router):
+
+```sh
+python3 tools/build_router_bundle.py --out /tmp/ro-candidate.tar
+python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+```
+
+CI runs the builder and eight isolated synthetic-root tests, checking digest
+mismatches, archive path/link injection, wrong router/transport/port, repeat
+snapshot protection and absence of any apply action.
+
+### Outstanding safeguards before pilot
+
+- Complete the router-local automatic rollback/watchdog with a persistent
+  boot-safe recovery mechanism and authenticated outside-in LuCI + SSH
+  acknowledgment from Belt; test power loss and remote connection drop.
+- Make the 10-file installation transaction recoverable on interrupted writes;
+  preserve exact UCI/client JSON, Xray binary, reverse tags and auth state.
+- Add explicit rollback validation, concurrency locks, space and RAM budgets,
+  release manifest provenance, per-platform BusyBox `tar -xOf` validation
+  and actual hardware exercise before permitting `apply`.
+- All previous original service behavior (including WOL, updates, WAN,
+  logging, user auth) must still work. Never install this experimental bundle
+  with an untested manual copy step.
+
+## Prototype transaction milestone (NOT YET cleared for the real router)
+
+New opt-in `tools/router_pilot_transaction.sh` adds the separately gated
+`apply`, `confirm`, `rollback`, a short-lived autonomous watchdog and
+an OpenWrt `S08` early-boot recovery hook. **The original installer remains
+unchanged.** `router_bundle_guard.sh` continues to reject `apply`.
+
+This new script:
+
+- Refuses all targets except the explicitly selected `main`, TCP/18443;
+  preserves the selected Xray binary and current TCP-none JSON and never
+  invokes service, network, firewall or Xray restarts.
+- Requires pre-downloaded/pinned tar and per-file manifest digests plus a
+  verified persistent snapshot of all ten original files and critical UCI/JSON
+  digests. Aborts when any original changed after its backup, or when a backup
+  was corrupted.
+- Checks available RAM and persistent overlay reserve, writes a persistent
+  `pending` marker *before* any live code-file change, and uses per-file
+  same-directory atomic replacement.
+- Starts the short-lived watchdog before mutation; if an operator does not
+  explicitly confirm via a unique nonce before the deadline, it restores
+  previous code files from the private snapshot. A router reboot while pending
+  invokes early-boot rollback before the usual reverse tunnel service starts.
+- Requires external operator checks from Belt (LuCI HTTP/SSH banner, Xray
+  fingerprint and actual reverse link) before nonce confirmation. The
+  tool does **not** independently assert that those external checks passed.
+  Never issue `confirm` until outside-in verification is recorded.
+- Keeps the recovery copy after confirmation for review. A confirmed update
+  still needs a separately protected normal reboot/service activation test;
+  the early-boot hook intentionally rolls back rather than testing new code
+  if a reboot occurs **before** confirmation.
+
+### Validation status and remaining safety gates
+
+CI tests synthetic filesystems under Ubuntu `sh` AND BusyBox `ash` with
+BusyBox applets, including success, timeout, unexpected reboot, incorrect
+nonce, duplicate apply, mismatched identity/port/transport, private config
+changes, damaged candidate and damaged recovery snapshots.
+
+**Do NOT execute `apply` on Cudy yet.** The prototype now **hard-rejects all live-mode calls** to `apply`, `confirm`, `rollback`, `watchdog` or `boot-recover` (only an explicitly isolated synthetic root runs). Live enablement requires a separately reviewed release. The prototype has not been tested
+on the actual Cudy/OpenWrt firmware with its built-in `tar`, rc.common,
+procd, overlay filesystem, reboot lifecycle or live reverse tunnel. It
+currently installs files without service activation; therefore a simple
+HTTP/SSH check only proves that the *old running connection* survived.
+A separate reversible functional activation/reboot acceptance gate is needed
+before calling the v119 client fully upgraded. Test an interrupted write,
+unavailable VPS, watchdog process termination and power loss in a disposable
+OpenWrt environment before real execution.
+
+No `install.sh` commands or router-side deployment commands are published
+here intentionally; only the developer canary fixture is covered by CI. Do
+not remove Belt's maintenance HOLD or update Xray-core.
+
+## Next hardware gate: isolated OpenWrt applet probe (safe, no update)
+
+First real Cudy WBR3000UAX / OpenWrt 24.10.5 run (operator):
+`PROBE: FAIL - missing applet: od`. The probe stopped before creating any
+temporary fixture or touching live paths. **No package installation is
+required.** `od` was an unnecessary hard dependency. The probe and
+experimental transaction now use a secure 16-byte nonce from
+`/dev/urandom` encoded by BusyBox `hexdump`, or `od` if present, or
+`openssl rand -hex 16` if available. They fail closed if no secure encoding
+method works (never use timestamp/PID fallback). The transaction attempts
+random generation **before** adding its boot recovery hook.
+
+Second Cudy hardware probe (pinned `aa6803fbb0206493b46a0f4d9f288995a210e517`)
+stopped at `PROBE: FAIL - missing applet: nohup`, again **before any
+synthetic fixture was created**. This is a material runtime blocker for the
+transaction prototype, whose watchdog used `nohup`. The isolated probe now
+treats `nohup` as an **optional diagnostic**, reports availability of
+`nohup`, `start-stop-daemon`, `setsid`, `procd`, and `ubus` in one
+pass, and prints `WATCHDOG BLOCKED` if `nohup` is absent. It also
+collects the complete required-applet inventory before stopping, avoiding
+serial discovery of one missing utility at a time. The transaction separately
+rejects missing `nohup` before placing a recovery init script; all live
+transactions remain hard-blocked.
+
+Important: **do not silently replace `nohup` with a plain background
+`&`**. The local rollback watchdog must survive shell/session disconnection
+and be independently supervised; prefer evaluating OpenWrt `procd` with a
+separate recovery service under controlled test conditions. A present
+alternative applet does not establish durable supervision.
+
+The initial `od` failure does not establish that tar, BusyBox extraction,
+overlay capacity or the rest of the pilot passed; re-run the immutable
+CI-verified corrected probe on the router to check those separately.
+
+
+
+`tools/openwrt_hardware_compat_probe.sh` provides a **separate,
+non-mutating-to-production** check of the exact router's BusyBox tools,
+tar streaming (`tar -xOf`), checksum, copy/rename, random nonce,
+overlay `df -Pk`, and `MemAvailable` parsing.
+
+The script creates one private `mktemp -d /tmp/ro-hardware-probe.XXXXXX`
+directory, uses only synthetic text fixtures inside it, and deletes only
+that temporary directory. It does **not** run the transaction updater,
+read credentials, edit /etc/config, restart Xray, stop procd, change
+routing/DNS or invoke an init script.
+
+After the CI check has passed, obtain the script at a **pinned Git commit
+SHA**. Review before use. On the chosen `main` OpenWrt shell:
+
+```sh
+wget -O /tmp/ro-hardware-probe.sh 'https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/<VERIFIED_COMMIT_SHA>/tools/openwrt_hardware_compat_probe.sh'
+sh -n /tmp/ro-hardware-probe.sh && sh /tmp/ro-hardware-probe.sh
+```
+
+The placeholder SHA must be replaced with the latest known CI-passed
+commit: do NOT run the literal placeholder. This gate is *not* a full
+client update test and **cannot** establish that reboot, persistent
+rollback or reverse access will work after installing the new agent.
+The original on-router client must stay running and unchanged.
+
+## Step 3: after the guarded pilot
+
+- If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
+- Defer its WSS migration to a separate controlled window using server-side
+  temporary dual authorization and a router-local fallback.
+- Keep other routers unchanged until a stable rollout channel, compatibility
+  matrix and rollback tests exist.
+- Continue to keep Belt's Xray 26.3.27 and maintenance hold unchanged.
+
+Live updates are NOT performed by this document or any GitHub commit.

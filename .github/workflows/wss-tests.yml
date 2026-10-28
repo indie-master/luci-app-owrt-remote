@@ -18,10 +18,46 @@ jobs:
           python3 -m py_compile vps/owrt-remote-hub.py
           sh -n files/usr/sbin/owrt-remote
           sh -n install.sh
+          sh -n tools/openwrt_pilot_preflight.sh
+          sh -n tools/router_bundle_guard.sh
+          sh -n tools/router_pilot_transaction.sh
+          sh -n tools/openwrt_hardware_compat_probe.sh
+          python3 -m py_compile tools/build_router_bundle.py
           sh -n vps/install-vps.sh
           sh -n files/www/cgi-bin/owrt-remote
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Run strictly isolated hardware compatibility probe in CI
+        run: |
+          sh tools/openwrt_hardware_compat_probe.sh
+      - name: Check OpenWrt applet inventory when nohup is absent
+        run: python3 -m unittest discover -s tests -p 'test_openwrt_probe_inventory.py' -v
+      - name: Test secure nonce encoding with od absent or unavailable
+        run: python3 -m unittest discover -s tests -p 'test_secure_nonce_portability.py' -v
+      - name: Test opt-in router apply, timeout rollback and boot recovery
+        run: python3 -m unittest discover -s tests -p 'test_router_pilot_transaction.py' -v
+      - name: Test safe router candidate bundle and persistent snapshot
+        run: |
+          python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+          python3 tools/build_router_bundle.py --out "$RUNNER_TEMP/router-candidate.tar"
+          test -s "$RUNNER_TEMP/router-candidate.tar"
+      - name: Exercise OpenWrt pilot transactions with BusyBox ash and applets
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox-static
+          BB="$(command -v busybox)"
+          mkdir -p "$RUNNER_TEMP/ro-busybox"
+          for app in sh tar awk grep sed sort sha256sum cp mv rm mkdir rmdir chmod ln df wc head tr od nohup sleep cat date dirname; do
+            ln -s "$BB" "$RUNNER_TEMP/ro-busybox/$app"
+          done
+          RO_TEST_SHELL="$BB sh" PATH="$RUNNER_TEMP/ro-busybox:$PATH" \
+            python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+          RO_TEST_SHELL="$BB sh" PATH="$RUNNER_TEMP/ro-busybox:$PATH" \
+            python3 -m unittest discover -s tests -p 'test_router_pilot_transaction.py' -v
+      - name: Test original v119 features and protocol surfaces are retained
+        run: python3 -m unittest discover -s tests -p 'test_original_feature_contract.py' -v
+      - name: Test main router read-only pilot safety guards
+        run: python3 -m unittest discover -s tests -p 'test_main_pilot_preflight.py' -v
       - name: Test original v119 client upgrade without TCP config changes
         run: python3 -m unittest discover -s tests -p 'test_client_v119_upgrade.py' -v
       - name: Test isolated Belt database migration
