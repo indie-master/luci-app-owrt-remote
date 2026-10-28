@@ -121,6 +121,16 @@ then separate phased cutover with tested restoration of old services.
 - Never roll out to multiple routers or upgrade active Xray from a UI cosmetic
   update. Per-device and fleet rollout canaries must have a tested abort path.
 
+## Memory and storage budget: 128/256 MiB OpenWrt targets
+
+- **Default mode is minimal.** The router installs no Python/Node runtime, no database, no local Telegram bot and no new permanent agent HTTP server. Reuse BusyBox ash, ubus, uci, procd/uhttpd and the existing reverse tunnel. Collect expensive metrics on demand with rate limits rather than continuously streaming data.
+- Do not conflate **agent overhead** with the memory required by Xray/sing-box/Podkop/Forkop/Tachyon. These existing runtimes can consume tens of MiB, depending on platform and config. Nothing can promise "no OOM" without measurements on each representative model.
+- **Engineering target, not current measurement:** additional idle resident footprint for new router-side helper processes <=2 MiB beyond the previously installed reverse client, with no permanently running new worker when idle; target applies only when measurements confirm the platform supports it. Prefer no additional always-on process at all.
+- Use BusyBox-friendly streaming or bounded buffers; avoid loading large logs and config files into memory, fanout/subprocess storms, high-frequency full connection scans, and resource-heavy plugin discovery.
+- All optional actions check free overlay storage and `MemAvailable` before running. Use a configurable minimum RAM reserve (start testing with >=20 MiB reserve on 128 MiB routers; adjust only from hardware data). Refuse noncritical work rather than triggering OOM. Never automatically kill unrelated services to satisfy this budget.
+- CPU, RAM, and overlay acceptance is based on **measured** idle/loaded baselines, `/proc/meminfo`, service RSS/high-water mark, kernel OOM counters and session stability on real 128/256 MiB routers. Run disconnect/restore tests plus a 24-hour soak with the actual user's usual proxy and Wi-Fi load.
+- Compatibility testing includes 128/256 MiB routers with existing Xray and, where installed, Podkop/Forkop/Tachyon. Do not silently install those routing engines as dependencies of Router Orchestrator. Keep router packages small and avoid adding copies of already installed binaries.
+
 ## Acceptance gates before any production rollout
 
 1. CI syntax/security tests, API-contract tests, migration tests and signed
