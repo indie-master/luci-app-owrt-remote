@@ -21,11 +21,15 @@ jobs:
           sh -n tools/openwrt_pilot_preflight.sh
           sh -n tools/router_bundle_guard.sh
           sh -n tools/router_pilot_transaction.sh
+          sh -n tools/openwrt_hardware_compat_probe.sh
           python3 -m py_compile tools/build_router_bundle.py
           sh -n vps/install-vps.sh
           sh -n files/www/cgi-bin/owrt-remote
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Run strictly isolated hardware compatibility probe in CI
+        run: |
+          sh tools/openwrt_hardware_compat_probe.sh
       - name: Test opt-in router apply, timeout rollback and boot recovery
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_transaction.py' -v
       - name: Test safe router candidate bundle and persistent snapshot
