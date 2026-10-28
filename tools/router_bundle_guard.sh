@@ -91,8 +91,13 @@ stage() {
     src="$1"; expected="$2"
     hex64 "$expected" || abort 'expected SHA-256 required'
     [ -f "$src" ] && [ ! -L "$src" ] || abort 'bundle missing or symlink'
+    [ "$(wc -c < "$src")" -le 6291456 ] || abort 'candidate too large for constrained OpenWrt routers'
     [ "$(sha_file "$src")" = "$expected" ] || abort 'bundle SHA-256 mismatch'
     preflight_live
+    # Staging requires an overlay reserve; never unpack on tmpfs just because /tmp is large.
+    available_kb="$(df -Pk /etc | awk 'END {print $4}')"
+    case "$available_kb" in ''|*[!0-9]*) abort 'cannot measure persistent overlay free space' ;; esac
+    [ "$available_kb" -ge 24576 ] || abort 'less than 24 MiB of persistent overlay free space'
     [ ! -e "$STATE/pending" ] || abort 'unfinished update; do not overwrite snapshot'
     [ ! -e "$STATE/backup" ] || abort 'previous backup exists; no overwriting old recovery material'
     [ ! -e "$STATE/stage" ] || abort 'previous stage exists; explicit cleanup required'
@@ -104,7 +109,13 @@ stage() {
     [ "$(sha_file "$STATE/stage/candidate.tar")" = "$expected" ] || abort 'copy checksum mismatch'
     check_tar_names "$STATE/stage/candidate.tar" "$STATE/stage/names"
     mkdir "$STATE/stage/unpacked"
-    tar -xf "$STATE/stage/candidate.tar" -C "$STATE/stage/unpacked" || abort 'bundle unpack failed'
+    # Stream ONLY named entries into new files. Never extract tar links or paths directly.
+    tar -xOf "$STATE/stage/candidate.tar" manifest.txt > "$STATE/stage/unpacked/manifest.txt" || abort 'manifest stream failed'
+    for rel in $FILES; do
+        dst="$STATE/stage/unpacked/payload/$rel"
+        mkdir -p "$(dirname "$dst")"
+        tar -xOf "$STATE/stage/candidate.tar" "payload/$rel" > "$dst" || abort "payload stream failed: $rel"
+    done
     check_payload "$STATE/stage/unpacked"
     printf '%s\n' "$expected" > "$STATE/stage/archive.sha256"
     trap - EXIT HUP INT TERM
