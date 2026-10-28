@@ -44,7 +44,7 @@ class GuardedBundleTests(unittest.TestCase):
                     'RO_TEST_PORT':'18443'}
 
     def guard(self, *args, env=None):
-        return subprocess.run(['sh', str(GUARD), *map(str,args)],
+        return subprocess.run([*os.environ.get("RO_TEST_SHELL", "sh").split(), str(GUARD), *map(str,args)],
                               env=self.env if env is None else env,
                               text=True, capture_output=True, timeout=20)
 
