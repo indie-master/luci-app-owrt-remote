@@ -8152,7 +8152,7 @@ function render(list) {{
       renderModelMetric(model, modelGetsLegendBadge(model)),
       metric('Система', release),
       metric('Xray', statusRu(xray)),
-      metric('Транспорт', r.vps_transport === 'ws' ? 'WSS/TLS · 443' : 'TCP · ' + (r.vless_port || 18443)),
+      metric('Транспорт', r.vps_transport === 'ws' ? (Number(r.vps_allow_legacy || 0) ? 'WSS/TLS · 443 + TCP (временный fallback)' : 'WSS/TLS · 443') : 'TCP · ' + (r.vless_port || 18443)),
       metric('SSH', statusRu(ssh)),
       metric('В сети уже', uptime),
       metric('Был на связи', ago(r.last_seen_iso)),
