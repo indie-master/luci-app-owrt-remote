@@ -4788,6 +4788,7 @@ def build_openwrt_config_lines(payload, mode="manual"):
     lines = [
         "owrt_saved_host=\"$(uci -q get owrtremote.main.vps_host 2>/dev/null || true)\"",
         "owrt_saved_mode=\"$(uci -q get owrtremote.main.vps_host_mode 2>/dev/null || echo manual)\"",
+        "owrt_saved_xray_bin=\"$(uci -q get owrtremote.main.xray_bin 2>/dev/null || true)\"",
         "uci -q get owrtremote.main >/dev/null 2>&1 || uci set owrtremote.main=remote",
         "uci set owrtremote.main.enabled='1'",
         f"uci set owrtremote.main.router_id='{sh_quote(payload['id'])}'",
@@ -4796,7 +4797,9 @@ def build_openwrt_config_lines(payload, mode="manual"):
         f"uci set owrtremote.main.hub_url='{sh_quote(payload['hub_url'])}'",
         f"uci set owrtremote.main.hub_token='{sh_quote(agent_token())}'",
         "uci set owrtremote.main.heartbeat_interval='30'",
-        "uci set owrtremote.main.xray_bin='/usr/bin/xray'",
+        "if [ -z \"$owrt_saved_xray_bin\" ]; then",
+        "  uci set owrtremote.main.xray_bin='/usr/bin/xray'",
+        "fi",
         "uci set owrtremote.main.xray_config='/etc/xray/owrt-remote-client.json'",
         "if [ \"$owrt_saved_mode\" = auto ] || [ -z \"$owrt_saved_host\" ]; then",
         f"  uci set owrtremote.main.vps_host='{sh_quote(payload['vps_host'])}'",
