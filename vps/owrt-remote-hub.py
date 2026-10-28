@@ -8140,6 +8140,7 @@ function render(list) {{
       renderModelMetric(model, modelGetsLegendBadge(model)),
       metric('Система', release),
       metric('Xray', statusRu(xray)),
+      metric('Транспорт', r.vps_transport === 'ws' ? 'WSS/TLS · 443' : 'TCP · ' + (r.vless_port || 18443)),
       metric('SSH', statusRu(ssh)),
       metric('В сети уже', uptime),
       metric('Был на связи', ago(r.last_seen_iso)),
@@ -20331,22 +20332,34 @@ def cmd_add_router(args):
 
 
 def cmd_set_router_transport(args):
-    """Explicit transport migration; never rotate UUIDs, reverse tags or entry ports."""
+    """Explicit migration, preserving UUIDs, reverse tags and LuCI/SSH ports."""
     with connect(args.db) as conn:
         init_db(conn)
         row = get_router(conn, args.id)
         if not row or router_deleted(row):
             raise SystemExit("router not found")
+        old_transport = row_str_value(row, "vps_transport", "tcp")
+        old_port = int(row["vless_port"])
         new_port = 443 if args.transport == "ws" else DEFAULT_VLESS_PORT
         conn.execute("update routers set vps_transport = ?, vless_port = ?, updated_at = ? where id = ?",
                      (args.transport, new_port, now_ts(), row["id"]))
         conn.commit()
-        row = get_router(conn, row["id"])
-    result = {"router_id": row["id"], "transport": args.transport,
+        router_id = row["id"]
+    result = {"router_id": router_id, "transport": args.transport,
               "vless_port": new_port, "xray": "not reloaded"}
     if args.sync_xray:
-        result["xray"] = reload_vps_xray(args.db)
+        try:
+            result["xray"] = reload_vps_xray(args.db)
+        except Exception:
+            # A failed candidate must not leave DB and live Xray disagreeing.
+            with connect(args.db) as conn:
+                init_db(conn)
+                conn.execute("update routers set vps_transport = ?, vless_port = ?, updated_at = ? where id = ?",
+                             (old_transport, old_port, now_ts(), router_id))
+                conn.commit()
+            raise
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
 
 
 def cmd_set_entry_port(args):
