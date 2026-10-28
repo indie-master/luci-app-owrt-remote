@@ -105,6 +105,32 @@ class GuardedUpgradeTests(unittest.TestCase):
         ])
         self.assertTrue((self.db.parent / ".xray-maintenance-hold").exists())
 
+    def test_stop_command_error_still_attempts_recovery(self):
+        source = self.root / "candidate.py"
+        installed = self.root / "installed.py"
+        source.write_text("print('new')\n")
+        installed.write_text("print('old')\n")
+        info = {"source": source, "installed": installed, "db": self.db}
+        args = type("Args", (), {"backup_root": self.root})()
+        commands = []
+
+        def fake_call(command, **kwargs):
+            commands.append(command)
+            if command == ["systemctl", "stop", "owrt-remote"]:
+                raise up.UpgradeError("systemctl stop returned failure after shutting down")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(up, "inspect", return_value=info), \
+             mock.patch.object(up, "perform_staging"), \
+             mock.patch.object(up, "call", side_effect=fake_call):
+            with self.assertRaises(up.UpgradeError):
+                up.apply(args)
+        self.assertEqual(commands, [
+            ["systemctl", "stop", "owrt-remote"],
+            ["systemctl", "start", "owrt-remote"],
+        ])
+        self.assertEqual(installed.read_text(), "print('old')\n")
+
     def test_rollback_restores_code_database_and_clears_own_hold(self):
         old_hub = self.root / "old-hub.py"
         old_hub.write_text("print('old')\n")
