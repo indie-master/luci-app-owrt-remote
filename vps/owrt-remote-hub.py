@@ -111,7 +111,7 @@ ACME_WEBROOT = STATE_DIR / "acme-webroot"
 # Heartbeats normally arrive every 30 seconds. A short WAN/Xray rebind can
 # take longer than the old 75-second window while the reverse tunnel remains usable.
 ONLINE_AFTER_SECONDS = max(75, int(os.environ.get("OWRT_REMOTE_ONLINE_AFTER", "180")))
-DEFAULT_VLESS_PORT = int(os.environ.get("OWRT_REMOTE_VLESS_PORT", "8443"))
+DEFAULT_VLESS_PORT = int(os.environ.get("OWRT_REMOTE_VLESS_PORT", "18443"))
 REQUEST_QUEUE_SIZE = int(os.environ.get("OWRT_REMOTE_REQUEST_QUEUE_SIZE", "128"))
 ROUTER_PROXY_LIMIT = max(1, int(os.environ.get("OWRT_REMOTE_ROUTER_PROXY_LIMIT", "4")))
 PROXY_TIMEOUT = float(os.environ.get("OWRT_REMOTE_PROXY_TIMEOUT", "25"))
@@ -4524,8 +4524,16 @@ def make_router_xray_config(row):
     ssh_settings = {"redirect": f"{row['ssh_host'] or '127.0.0.1'}:{int(row['ssh_port'] or 22)}"}
     if transport == "ws":
         # WSS is intended for modern Xray; allow only the two redirect ports.
-        admin_settings["finalRules"] = [{"action": "allow", "network": "tcp", "port": str(int(row['admin_port']))}]
-        ssh_settings["finalRules"] = [{"action": "allow", "network": "tcp", "port": str(int(row['ssh_port'] or 22))}]
+        def local_allow(host, port):
+            rule = {"action": "allow", "network": "tcp", "port": str(int(port))}
+            try:
+                address = ipaddress.ip_address(host)
+                rule["ip"] = [str(address) + ("/32" if address.version == 4 else "/128")]
+            except ValueError:
+                pass  # The outbound redirect still fixes the destination.
+            return [rule]
+        admin_settings["finalRules"] = local_allow(row["admin_host"], row["admin_port"])
+        ssh_settings["finalRules"] = local_allow(row["ssh_host"] or "127.0.0.1", row["ssh_port"] or 22)
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [],
@@ -4598,10 +4606,21 @@ def reload_vps_xray(db_path=DB_PATH):
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
     binary = os.environ.get("OWRT_REMOTE_XRAY_BIN", "/usr/local/bin/xray")
     with _XRAY_RELOAD_LOCK:
+        # Never move an already-running legacy listener when regenerating Xray.
+        legacy_port = DEFAULT_VLESS_PORT
+        legacy_listen = "0.0.0.0"
+        if out.exists():
+            existing = json.loads(out.read_text(encoding="utf-8"))
+            legacy_inbound = next((item for item in existing.get("inbounds", [])
+                                   if item.get("tag") == "owrt-remote-vless"), None)
+            if legacy_inbound is None:
+                raise RuntimeError("Existing legacy inbound not found; refusing to overwrite Xray config")
+            legacy_port = int(legacy_inbound["port"])
+            legacy_listen = legacy_inbound.get("listen", "0.0.0.0")
         with connect(db_path) as conn:
             init_db(conn)
             rows = list_router_rows(conn)
-        config = make_server_xray_config(rows)
+        config = make_server_xray_config(rows, listen_host=legacy_listen, listen_port=legacy_port)
         text = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
         data = text.encode("utf-8")
         if out.exists() and out.read_bytes() == data:
