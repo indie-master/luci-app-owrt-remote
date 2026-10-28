@@ -42,6 +42,31 @@ def inbound_index(config):
     return index
 
 
+def routing_contract(routing):
+    """Require exact, non-overlapping tag-to-outbound assignments.
+
+    Different order is safe only if each field rule selects one unique inbound
+    and no rule can shadow another.
+    """
+    rest = {key: value for key, value in routing.items() if key != "rules"}
+    indexed = {}
+    for rule in routing.get("rules", []):
+        require(
+            isinstance(rule, dict)
+            and rule.get("type") == "field"
+            and isinstance(rule.get("inboundTag"), list)
+            and len(rule["inboundTag"]) == 1
+            and isinstance(rule["inboundTag"][0], str)
+            and isinstance(rule.get("outboundTag"), str),
+            "Unknown/overlapping routing selector; cannot safely disregard rule order",
+        )
+        inbound = rule["inboundTag"][0]
+        require(inbound not in indexed,
+                "Duplicate reverse routing inbound; ordering may affect semantics")
+        indexed[inbound] = rule
+    return rest, indexed
+
+
 def normalized(config):
     """Order-insensitive comparison, without printing UUIDs or other credentials."""
     data = copy.deepcopy(config)
@@ -51,6 +76,8 @@ def normalized(config):
             clients.sort(key=lambda c: c["reverse"]["tag"])
     data["inbounds"].sort(key=lambda x: x["tag"])
     data["outbounds"].sort(key=lambda x: x["tag"])
+    # This normalization is only valid for disjoint selectors.
+    routing_contract(data["routing"])
     data["routing"]["rules"].sort(key=lambda x: json.dumps(x, sort_keys=True))
     return data
 
@@ -224,8 +251,9 @@ def run_stage(args):
         rehearsed_in = inbound_index(rehearsal)
         require(set(expected_original_in) == set(rehearsed_in),
                 "Fallback rehearsal changed inbound tags")
-        require(rehearsal["routing"] == original["routing"],
-                "Fallback rehearsal changed routing")
+        require(routing_contract(rehearsal["routing"]) ==
+                routing_contract(original["routing"]),
+                "Fallback rehearsal changed routing assignments or matching conditions")
         for tag in expected_original_in:
             if tag not in (LEGACY, WSS):
                 require(rehearsed_in[tag] == expected_original_in[tag],
