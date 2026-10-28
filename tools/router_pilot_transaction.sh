@@ -14,6 +14,9 @@ case "${RO_TEST_ROOT:-/}" in
   *) fail 'invalid root' ;;
 esac
 [ "${RO_TEST_MODE:-0}" != 1 ] || [ -n "$ROOT" ] || fail 'test mode cannot target real root'
+# PRODUCTION DISABLED: only synthetic-root tests are permitted in this branch.
+# The live enablement is a separately reviewed release after hardware validation.
+[ "${RO_TEST_MODE:-0}" = 1 ] || fail 'live transactions disabled: use isolated synthetic-root compatibility tests only'
 STATE="$ROOT/etc/router-orchestrator/upgrade"
 HOOK="$ROOT/etc/init.d/ro-pilot-recovery"
 BOOT="$ROOT/etc/rc.d/S08ro-pilot-recovery"
