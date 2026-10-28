@@ -123,6 +123,20 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.restore_assertions()
         self.assertFalse((self.state/'pending').exists())
 
+    def test_no_live_transaction_is_permitted_in_development_branch(self):
+        # This is a *fail-closed check*, not a production invocation.
+        # The script must reject any live call before reading/writing /etc.
+        env={**os.environ}
+        for key in tuple(env):
+            if key.startswith("RO_TEST_"):
+                env.pop(key, None)
+        for command in ('apply','confirm','rollback','watchdog','boot-recover'):
+            with self.subTest(command=command):
+                p=subprocess.run(['sh',str(TRANSACTION),command],
+                                 capture_output=True,text=True,env=env,timeout=5)
+                self.assertNotEqual(p.returncode,0)
+                self.assertIn('live transactions disabled',p.stderr)
+
     def test_missing_snapshot_rejects_apply(self):
         r=self.run_cmd(GUARD,'stage',self.bundle,self.digest)
         self.assertEqual(r.returncode,0,r.stdout+r.stderr)
