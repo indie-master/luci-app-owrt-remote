@@ -20,4 +20,7 @@ jobs:
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
       - name: Check agent Xray config validation regressions
-        run: python3 -m unittest discover -s tests -p 'test_xray_validation.py' -v
+        run: |
+          mkdir -p /tmp/owrt-test-shell
+          ln -s "$(command -v bash)" /tmp/owrt-test-shell/sh
+          PATH="/tmp/owrt-test-shell:$PATH" python3 -m unittest discover -s tests -p 'test_xray_validation.py' -v
