@@ -580,6 +580,22 @@ validate_xray_config() {
 	fi
 }
 
+# Xray 26.5+ changed Freedom's default policy for reverse connections.
+# Older binaries keep the proven legacy config, while 26.5+ must receive
+# explicit scoped finalRules for LuCI and SSH on BOTH TCP and WSS.
+xray_reverse_finalrules_required() {
+	local binary first version major minor
+	binary="$(xray_bin_path)"
+	[ -x "$binary" ] || return 1
+	first="$("$binary" version 2>/dev/null | sed -n '1p')" || return 1
+	version="$(printf '%s\n' "$first" | sed -n 's/^Xray \([0-9][0-9]*\)\.\([0-9][0-9]*\)\..*/\1 \2/p')"
+	[ -n "$version" ] || return 1
+	set -- $version
+	major="$1"
+	minor="$2"
+	[ "$major" -gt 26 ] || { [ "$major" -eq 26 ] && [ "$minor" -ge 5 ]; }
+}
+
 render_client_config() (
 	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir vps_transport vps_sni vps_ws_path stream_fields admin_rules ssh_rules
 	temp_dir=""
@@ -644,9 +660,12 @@ render_client_config() (
 		case "$vps_sni" in *://*|*/*|*[!a-zA-Z0-9._-]*) die "Некорректный vps_sni" ;; esac
 		case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
 		stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
+	fi
+	if [ "$vps_transport" = ws ] || xray_reverse_finalrules_required; then
+		# Modern Xray blocks reverse-originated Freedom requests by default.
+		# Scope access to the exact LuCI/SSH redirect ports, on both transports.
 		admin_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"port\":\"$admin_port\"}]"
 		ssh_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"port\":\"$ssh_port\"}]"
-		# Pin literal IPv4 destinations; for named hosts, redirect and port still apply.
 		case "$admin_host" in *[!0-9.]*|'') ;; *) admin_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"ip\":[\"$admin_host/32\"],\"port\":\"$admin_port\"}]" ;; esac
 		case "$ssh_host" in *[!0-9.]*|'') ;; *) ssh_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"ip\":[\"$ssh_host/32\"],\"port\":\"$ssh_port\"}]" ;; esac
 	fi
