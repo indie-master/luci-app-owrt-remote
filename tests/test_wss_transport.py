@@ -247,7 +247,7 @@ class WssHubTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("sh"), "POSIX shell required")
 class WssAgentTests(unittest.TestCase):
-    def render(self, transport):
+    def render(self, transport, core_version=None):
         agent = AGENT.read_text(encoding="utf-8")
         prefix = agent.split('cmd="${1:-help}"', 1)[0]
         script = prefix + r'''
@@ -264,14 +264,21 @@ uci_get() {
         reverse_tag) printf reverse-in ;;
         ssh_reverse_tag) printf reverse-in-ssh ;;
         wan_direct) printf 0 ;;
+        xray_bin) printf %s "$TEST_XRAY_BIN" ;;
         *) printf '%s' "$2" ;;
     esac
 }
 render_client_config --stdout
 '''
         with tempfile.TemporaryDirectory() as tmp:
+            fake_xray = Path(tmp) / "test-xray"
+            if core_version:
+                fake_xray.write_text("#!/bin/sh\necho 'Xray " + core_version + " test'\n")
+                fake_xray.chmod(0o700)
             result = subprocess.run(["sh", "-c", script], capture_output=True,
-                                    text=True, env={**os.environ, "TMPDIR": tmp}, timeout=20)
+                                    text=True,
+                                    env={**os.environ, "TMPDIR": tmp,
+                                         "TEST_XRAY_BIN": str(fake_xray)}, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr[-1200:])
         return json.loads(result.stdout)
 
@@ -291,6 +298,23 @@ render_client_config --stdout
             self.assertEqual(rule["action"], "allow")
             self.assertEqual(rule["ip"], ["127.0.0.1/32"])
             self.assertEqual(rule["port"], port)
+
+    def test_modern_core_preserves_tcp_none_and_scopes_reverse_freedom(self):
+        config = self.render("tcp", core_version="26.10.21")
+        for tag in ("vps-interconn", "vps-ssh-interconn"):
+            stream = next(o for o in config["outbounds"] if o["tag"] == tag)["streamSettings"]
+            self.assertEqual(stream, {"network": "tcp", "security": "none"})
+        for tag, port in (("router-admin", "80"), ("router-ssh", "22")):
+            settings = next(o for o in config["outbounds"] if o["tag"] == tag)["settings"]
+            self.assertEqual(settings["finalRules"],
+                             [{"action": "allow", "network": "tcp",
+                               "ip": ["127.0.0.1/32"], "port": port}])
+
+    def test_old_core_does_not_gain_unsupported_freedom_rules(self):
+        config = self.render("tcp", core_version="26.3.27")
+        for tag in ("router-admin", "router-ssh"):
+            settings = next(o for o in config["outbounds"] if o["tag"] == tag)["settings"]
+            self.assertNotIn("finalRules", settings)
 
     def test_legacy_config_does_not_gain_wss_or_final_rules(self):
         config = self.render("tcp")
