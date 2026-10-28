@@ -71,7 +71,7 @@ except Exception:
 
 
 APP_NAME = "OpenWrt Remote Hub"
-RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main").rstrip("/")
+RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119").rstrip("/")
 APP_DIR = Path(__file__).resolve().parent
 
 
@@ -4513,7 +4513,9 @@ def make_router_xray_config(row):
     bridge_tag = row["reverse_tag"]
     ssh_bridge_tag = row["ssh_reverse_tag"] or f"{bridge_tag}-ssh"
     transport = row_str_value(row, "vps_transport", "tcp")
-    sni = row_str_value(row, "vps_host", "")
+    sni = (vps_host_name(os.environ.get("OWRT_REMOTE_PUBLIC_URL", ""))
+           or vps_host_name(row_str_value(row, "public_url", ""))
+           or row_str_value(row, "vps_host", ""))
     stream = ({"network": "ws", "security": "tls",
                "tlsSettings": {"serverName": sni, "allowInsecure": False, "alpn": ["http/1.1"]},
                "wsSettings": {"path": "/owrt-ws/", "host": sni}}
