@@ -36,6 +36,25 @@ sha() { sha256sum "$1" | awk '{print $1}'; }
 hex64() { case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -eq 64 ]; }
 present() { [ -f "$1" ] && [ ! -L "$1" ]; }
 
+secure_nonce() {
+  # Exactly 16 unpredictable bytes, hexadecimal-encoded. Never use timestamps,
+  # shell PIDs or weak PRNG values for confirmation tokens.
+  [ -r /dev/urandom ] || return 1
+  nonce_hex=''
+  if command -v dd >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1; then
+    nonce_hex="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '16/1 "%02x"' 2>/dev/null)" || nonce_hex=''
+  fi
+  if [ "${#nonce_hex}" -ne 32 ] && command -v od >/dev/null 2>&1; then
+    nonce_hex="$(od -An -tx1 -N 16 /dev/urandom 2>/dev/null | tr -d ' \n')" || nonce_hex=''
+  fi
+  if [ "${#nonce_hex}" -ne 32 ] && command -v openssl >/dev/null 2>&1; then
+    nonce_hex="$(openssl rand -hex 16 2>/dev/null)" || nonce_hex=''
+  fi
+  case "$nonce_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#nonce_hex}" -eq 32 ] || return 1
+  printf '%s\n' "$nonce_hex"
+}
+
 # Single-operation directory lock. Boot recovery clears orphaned locks from
 # a prior boot; watchdog can reclaim a lock only when the owner is gone.
 unlock() { rm -f "$STATE/lock/pid"; rmdir "$STATE/lock" 2>/dev/null || true; }
@@ -228,12 +247,10 @@ apply() {
   lock
   # Check preexisting state after obtaining the exclusive lock.
   [ ! -e "$STATE/pending" ] && [ ! -e "$STATE/armed" ] || fail 'update already started'
+  # Validate crypto availability before adding any recovery hooks or files.
+  # Missing od alone must not block devices with BusyBox hexdump.
+  nonce="$(secure_nonce)" || fail 'no supported secure nonce generator (hexdump, od or openssl)'
   install_boot_recovery
-  # A fresh nonce is required for human post-verification confirmation.
-  command -v od >/dev/null 2>&1 || fail 'od required for secure nonce'
-  nonce="$(od -An -tx1 -N 16 /dev/urandom | tr -d ' \n')"
-  case "$nonce" in *[!0-9a-f]*|'') fail 'cannot generate nonce' ;; esac
-  [ "${#nonce}" -eq 32 ] || fail 'invalid nonce'
   printf '%s\n' "$nonce" > "$STATE/confirm-nonce"
   duration="${RO_PILOT_TIMEOUT:-300}"
   case "$duration" in ''|*[!0-9]*) fail 'invalid timeout' ;; esac
