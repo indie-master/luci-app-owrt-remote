@@ -51,7 +51,7 @@ class RouterPilotTransactionTests(unittest.TestCase):
                   "RO_PILOT_TIMEOUT":"12"}
 
     def run_cmd(self,tool,*args,timeout=25,env=None):
-        return subprocess.run(["sh",str(tool),*map(str,args)],
+        return subprocess.run([*os.environ.get("RO_TEST_SHELL", "sh").split(),str(tool),*map(str,args)],
                               capture_output=True,text=True,timeout=timeout,
                               env=env or self.env)
 
