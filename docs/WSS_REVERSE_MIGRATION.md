@@ -54,6 +54,60 @@ Only a completed **`SAFE STAGING PASSED`** and **`Semantic match ... YES`** can 
 
 For the already-migrated WSS router, the generated OpenWrt UCI export now preserves any previously selected `owrtremote.main.xray_bin` (e.g. the tested softfloat build) rather than blindly reverting to `/usr/bin/xray`.
 
+## Pin the server Xray when upgrading Hub v119
+
+**Important: OpenWrt Remote v119 is the Python/agent version, not the Xray-core version.**
+Updating the Hub Python file does not automatically replace the running Xray
+executable. On an existing production server, **do not run** the generic
+`vps/install-vps.sh` as an in-place updater: it installs dependencies,
+potentially writes service units and resets authentication settings.
+
+Use the staged Hub-code deployment only. Leave the current
+`owrt-remote-xray.service`, its `ExecStart` executable and the running
+Xray-core unchanged until a completely separate core-compatibility pilot.
+Keep the legacy TCP inbound on the same host/port with
+`network=tcp`, `security=none`, `decryption=none` and unchanged UUIDs.
+
+For optional compatibility tests against the verified upstream **Xray-core
+26.10.21** executable, obtain it in a **separate private directory**, check
+the official SHA-256 and pass the extracted binary to the staging script.
+This MUST NOT replace `/usr/local/bin/xray`:
+
+```bash
+set -euo pipefail
+umask 077
+DIR=/root/owrt-next-xray-26.10.21
+mkdir -m 700 -p "$DIR"
+curl -fLsS --max-time 180 --retry 2 \
+  https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip \
+  -o "$DIR/official.zip"
+echo "0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978  $DIR/official.zip" | sha256sum -c -
+unzip -p "$DIR/official.zip" xray > "$DIR/xray"
+chmod 700 "$DIR/xray"
+"$DIR/xray" version | head -1
+python3 /root/owrt-v119-wss-fallback-check/tools/stage_belt_wss.py \
+  --hub-source /root/owrt-v119-wss-fallback-check/vps/owrt-remote-hub.py \
+  --db /var/lib/owrt-remote/hub.db \
+  --live /etc/xray/owrt-remote.json \
+  --xray-bin /usr/local/bin/xray \
+  --next-xray-bin "$DIR/xray" \
+  --output-root /root --simulate-fallback
+```
+
+The CLI checks both Xray versions against the same private candidate files,
+including the dual TCP+WSS fallback. It does **not** start a replacement
+listener, prove a successful reverse session, restart anything, or change
+the active daemon. Even if both syntax checks pass, the next-core cutover
+requires an independent real LuCI/SSH data-path pilot, preservation of the
+old binary, and a rollback window.
+
+Modern Xray's Freedom default security differs from 26.3.27: the
+OpenWrt client generator now adds narrowly scoped `finalRules` for reverse
+LuCI/SSH traffic on *both TCP and WSS* if it detects Xray 26.5+.
+Older Xray-core versions on legacy TCP keep their original Freedom config.
+If a custom core returns an unrecognized version, do not upgrade it without
+explicit compatibility validation.
+
 ## Safe migration of Belt (not an unattended installer)
 
 1. Keep the working `/etc/xray/owrt-remote.json`, `/opt/owrt-remote/owrt-remote-hub.py`, `/var/lib/owrt-remote/hub.db` and Nginx configuration untouched until deployment. Make permission-restricted backups and use `sqlite3.Connection.backup()` for a consistent DB snapshot.
