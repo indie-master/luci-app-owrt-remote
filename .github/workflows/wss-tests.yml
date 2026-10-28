@@ -19,10 +19,17 @@ jobs:
           sh -n files/usr/sbin/owrt-remote
           sh -n install.sh
           sh -n tools/openwrt_pilot_preflight.sh
+          sh -n tools/router_bundle_guard.sh
+          python3 -m py_compile tools/build_router_bundle.py
           sh -n vps/install-vps.sh
           sh -n files/www/cgi-bin/owrt-remote
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Test safe router candidate bundle and persistent snapshot
+        run: |
+          python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+          python3 tools/build_router_bundle.py --out "$RUNNER_TEMP/router-candidate.tar"
+          test -s "$RUNNER_TEMP/router-candidate.tar"
       - name: Test original v119 features and protocol surfaces are retained
         run: python3 -m unittest discover -s tests -p 'test_original_feature_contract.py' -v
       - name: Test main router read-only pilot safety guards
