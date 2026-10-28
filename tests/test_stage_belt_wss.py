@@ -88,10 +88,10 @@ class BeltOfflineStageTests(unittest.TestCase):
         # Every reverse selector is disjoint, and the live server may have
         # been assembled in a different order than the DB renderer.
         live["routing"]["rules"] = list(reversed(live["routing"]["rules"]))
-        self.live.write_text(json.dumps(live, ensure_ascii=False, indent=2) + "\\n")
+        self.live.write_text(json.dumps(live, ensure_ascii=False, indent=2) + "\n")
         live_hash = hashlib.sha256(self.live.read_bytes()).hexdigest()
         result = self.stage("--simulate-fallback")
-        self.assertEqual(result.returncode, 0, result.stderr + "\\n" + result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr + "\n" + result.stdout)
         self.assertIn("Temporary fallback simulated: SNAPSHOT ONLY", result.stdout)
         self.assertEqual(hashlib.sha256(self.live.read_bytes()).hexdigest(), live_hash)
         self.assertEqual(hashlib.sha256(self.db.read_bytes()).hexdigest(), self.before_hash)
@@ -99,7 +99,7 @@ class BeltOfflineStageTests(unittest.TestCase):
     def test_overlapping_routes_fail_closed_in_fallback(self):
         live = json.loads(self.live.read_text(encoding="utf-8"))
         live["routing"]["rules"].append(dict(live["routing"]["rules"][0]))
-        self.live.write_text(json.dumps(live, indent=2) + "\\n")
+        self.live.write_text(json.dumps(live, indent=2) + "\n")
         result = self.stage("--simulate-fallback")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("routing", result.stderr.lower())
