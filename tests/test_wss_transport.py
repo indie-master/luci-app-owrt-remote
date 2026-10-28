@@ -82,6 +82,69 @@ class WssHubTests(unittest.TestCase):
             self.assertIn(tag, by_tag)
         self.assertEqual(len(config["routing"]["rules"]), 4)
 
+    def test_staged_wss_migration_keeps_legacy_uuids_until_finalize(self):
+        self.add("old", "tcp", 18443)
+        self.add("new")
+        from argparse import Namespace
+
+        def update(stage=False, finalize=False, direct=False, transport="ws"):
+            args = Namespace(db=self.db, id="old", transport=transport,
+                             stage=stage, finalize=finalize, direct=direct,
+                             sync_xray=True)
+            with mock.patch.object(hub, "reload_vps_xray", return_value={"validated": True}):
+                hub.cmd_set_router_transport(args)
+
+        update(stage=True)
+        with hub.connect(self.db) as conn:
+            migrated = dict(hub.get_router(conn, "old"))
+            staged_config = hub.make_server_xray_config(hub.list_router_rows(conn), listen_port=18443)
+        self.assertEqual(migrated["vps_transport"], "ws")
+        self.assertEqual(migrated["vps_allow_legacy"], 1)
+        self.assertEqual(migrated["vless_port"], 443)
+        inbounds = {x["tag"]: x for x in staged_config["inbounds"]}
+        self.assertEqual(len(inbounds["owrt-remote-vless"]["settings"]["clients"]), 2)
+        self.assertEqual(len(inbounds["owrt-remote-wss"]["settings"]["clients"]), 4)
+        old_tcp = next(x for x in inbounds["owrt-remote-vless"]["settings"]["clients"]
+                       if x["reverse"]["tag"] == "reverse-old")
+        old_ws = next(x for x in inbounds["owrt-remote-wss"]["settings"]["clients"]
+                      if x["reverse"]["tag"] == "reverse-old")
+        self.assertEqual(old_tcp, old_ws)
+        update(finalize=True)
+        with hub.connect(self.db) as conn:
+            final = hub.get_router(conn, "old")
+            final_config = hub.make_server_xray_config(hub.list_router_rows(conn), listen_port=18443)
+        self.assertEqual(final["vps_allow_legacy"], 0)
+        inbounds = {x["tag"]: x for x in final_config["inbounds"]}
+        self.assertEqual(len(inbounds["owrt-remote-vless"]["settings"]["clients"]), 0)
+        self.assertEqual(len(inbounds["owrt-remote-wss"]["settings"]["clients"]), 4)
+        self.assertEqual(final["vless_uuid"], ADMIN_UUID)
+        self.assertEqual(final["ssh_vless_uuid"], SSH_UUID)
+
+    def test_abrupt_tcp_to_wss_change_is_refused(self):
+        self.add("old", "tcp", 18443)
+        from argparse import Namespace
+        args = Namespace(db=self.db, id="old", transport="ws",
+                         stage=False, finalize=False, direct=False, sync_xray=True)
+        with self.assertRaises(SystemExit):
+            hub.cmd_set_router_transport(args)
+        with hub.connect(self.db) as conn:
+            row = hub.get_router(conn, "old")
+        self.assertEqual(row["vps_transport"], "tcp")
+        self.assertEqual(row["vps_allow_legacy"], 0)
+
+    def test_failed_staging_sync_restores_legacy_port_and_transport(self):
+        self.add("old", "tcp", 18443)
+        from argparse import Namespace
+        args = Namespace(db=self.db, id="old", transport="ws",
+                         stage=True, finalize=False, direct=False, sync_xray=True)
+        with mock.patch.object(hub, "reload_vps_xray", side_effect=RuntimeError("validation error")):
+            with self.assertRaises(RuntimeError):
+                hub.cmd_set_router_transport(args)
+        with hub.connect(self.db) as conn:
+            row = hub.get_router(conn, "old")
+        self.assertEqual((row["vps_transport"], row["vless_port"], row["vps_allow_legacy"]),
+                         ("tcp", 18443, 0))
+
     def test_config_export_pins_wss_tls_and_preserves_legacy(self):
         old = self.add("old", "tcp", 18443)
         new = self.add("new")
