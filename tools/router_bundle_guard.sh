@@ -95,7 +95,7 @@ stage() {
     [ "$(sha_file "$src")" = "$expected" ] || abort 'bundle SHA-256 mismatch'
     preflight_live
     # Staging requires an overlay reserve; never unpack on tmpfs just because /tmp is large.
-    available_kb="$(df -Pk /etc | awk 'END {print $4}')"
+    available_kb="$(df -Pk "$(path etc)" | awk 'END {print $4}')"
     case "$available_kb" in ''|*[!0-9]*) abort 'cannot measure persistent overlay free space' ;; esac
     [ "$available_kb" -ge 24576 ] || abort 'less than 24 MiB of persistent overlay free space'
     [ ! -e "$STATE/pending" ] || abort 'unfinished update; do not overwrite snapshot'
