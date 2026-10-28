@@ -196,6 +196,43 @@ class GuardedUpgradeTests(unittest.TestCase):
                     module.restart_vps_xray()
                 subprocess_mock.assert_not_called()
 
+    def test_wan_reconnect_does_not_restart_xray_by_default(self):
+        import os
+        from unittest import mock as m
+        with tempfile.TemporaryDirectory(prefix="wss-no-wan-restart-") as state:
+            name = "wan_reconnect_test_" + str(id(self))
+            spec = importlib.util.spec_from_file_location(name, HUB)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            with m.patch.dict(os.environ, {
+                "OWRT_REMOTE_STATE_DIR": state
+            }):
+                os.environ.pop("OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT", None)
+                spec.loader.exec_module(module)
+                with m.patch.object(module, "restart_vps_xray") as restart:
+                    result = module.maybe_restart_vps_xray_after_wan_reconnect("synthetic")
+                    self.assertEqual(result, {"skipped": "disabled"})
+                    restart.assert_not_called()
+
+    def test_wan_reconnect_explicit_opt_in_still_guarded_by_maintenance_hold(self):
+        import os
+        from unittest import mock as m
+        with tempfile.TemporaryDirectory(prefix="wss-wan-hold-") as state:
+            name = "wan_reconnect_hold_" + str(id(self))
+            spec = importlib.util.spec_from_file_location(name, HUB)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            with m.patch.dict(os.environ, {
+                "OWRT_REMOTE_STATE_DIR": state,
+                "OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT": "1",
+            }):
+                spec.loader.exec_module(module)
+                (Path(state) / ".xray-maintenance-hold").write_text("hold")
+                with m.patch.object(module, "active_ssh_http_sessions", return_value=0), \
+                     m.patch.object(module, "restart_vps_xray", wraps=module.restart_vps_xray):
+                    with self.assertRaisesRegex(RuntimeError, "locked"):
+                        module.maybe_restart_vps_xray_after_wan_reconnect("synthetic")
+
     def test_all_xray_restarts_are_guarded_during_maintenance(self):
         source = HUB.read_text(encoding="utf-8")
         self.assertIn('_XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"', source)
