@@ -139,7 +139,7 @@ class GuardedUpgradeTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "", "")
         args = type("Args", (), {"xray_bin": xray_bin})()
         with mock.patch.object(up, "call", side_effect=call), \
-             mock.patch.object(up, "is_active", side_effect=lambda s: s == up.XRAY_SERVICE), \
+             mock.patch.object(up, "is_active", side_effect=lambda s: s == up.XRAY_SERVICE or (s == up.HUB_SERVICE and ["systemctl", "start", "owrt-remote"] in commands)), \
              mock.patch.object(up, "health", return_value=True):
             up.restore_from_backup(args, backup_dir)
         self.assertEqual(installed.read_bytes(), old_hub.read_bytes())
