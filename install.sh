@@ -4,7 +4,8 @@ set -eu
 
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 
-RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main}"
+# The v119 client is maintained in our WSS branch. An explicit RAW_URL overrides it.
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119}"
 ROOT="${ROOT:-/}"
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 
@@ -39,19 +40,25 @@ fetch() {
 }
 
 install_file() {
-	local rel mode src dst bust
+	# Stage each file beside its destination so a download failure cannot
+	# corrupt a running OpenWrt installation. Existing UCI stays untouched.
+	local rel mode src dst bust tmp
 	rel="$1"
 	mode="$2"
 	src="$SCRIPT_DIR/files/$rel"
 	dst="$(target_path "$rel")"
 	mkdir -p "$(dirname "$dst")"
+	tmp="${dst}.new.$$"
+	rm -f "$tmp"
 	if [ -f "$src" ]; then
-		cp "$src" "$dst"
+		cp "$src" "$tmp" || { rm -f "$tmp"; die "failed to stage $rel"; }
 	else
 		bust="$(date +%s 2>/dev/null || echo $$)"
-		fetch "$RAW_URL/files/$rel?v=$bust" "$dst"
+		fetch "$RAW_URL/files/$rel?v=$bust" "$tmp" || { rm -f "$tmp"; die "failed to download $rel, existing file preserved"; }
 	fi
-	chmod "$mode" "$dst"
+	[ -s "$tmp" ] || { rm -f "$tmp"; die "empty download for $rel, existing file preserved"; }
+	chmod "$mode" "$tmp" || { rm -f "$tmp"; die "chmod failed for $rel"; }
+	mv -f "$tmp" "$dst" || { rm -f "$tmp"; die "cannot install $rel"; }
 }
 
 install_config() {
