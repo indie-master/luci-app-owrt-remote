@@ -18,6 +18,7 @@ jobs:
           python3 -m py_compile vps/owrt-remote-hub.py
           sh -n files/usr/sbin/owrt-remote
           sh -n install.sh
+          sh -n tools/openwrt_pilot_preflight.sh
           sh -n vps/install-vps.sh
           sh -n files/www/cgi-bin/owrt-remote
       - name: Run WSS backwards-compatibility tests
