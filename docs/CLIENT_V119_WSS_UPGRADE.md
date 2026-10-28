@@ -52,7 +52,18 @@ client without changing the transport:
 
     wget -O /tmp/owrt-v119-installer.sh \
       'https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119/install.sh'
-    sh /tmp/owrt-v119-installer.sh
+    # First pilot: do not install/change the Xray core or optional WOL packages.
+    OWRT_REMOTE_SKIP_XRAY_PREPARE=1 OWRT_REMOTE_SKIP_WOL_PACKAGES=1 \
+      sh /tmp/owrt-v119-installer.sh
+
+For this first pilot, both environment switches leave the currently installed
+Xray executable/cache and optional WOL packages unchanged. They do not disable
+updating the agent, init scripts or GUI; uhttpd/rpcd may reload. Back up
+the router's settings and management scripts before running the installer.
+The current HUB maintenance hold must stay active while the deployed HUB
+still defaults to restarting Xray on WAN-reconnect. The source branch now
+defaults this behavior to disabled, but the already-installed HUB must be
+updated separately before that change takes effect.
 
 Verify the installed agent, settings, Xray binary version, outbound
 streamSettings and LuCI/SSH access from Belt. The router must still use TCP.
