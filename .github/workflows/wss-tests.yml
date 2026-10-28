@@ -23,6 +23,8 @@ jobs:
           sh -n files/www/cgi-bin/owrt-remote
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Test main router read-only pilot safety guards
+        run: python3 -m unittest discover -s tests -p 'test_main_pilot_preflight.py' -v
       - name: Test original v119 client upgrade without TCP config changes
         run: python3 -m unittest discover -s tests -p 'test_client_v119_upgrade.py' -v
       - name: Test isolated Belt database migration
