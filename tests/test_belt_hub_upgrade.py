@@ -105,6 +105,71 @@ class GuardedUpgradeTests(unittest.TestCase):
         ])
         self.assertTrue((self.db.parent / ".xray-maintenance-hold").exists())
 
+    def test_rollback_restores_code_database_and_clears_own_hold(self):
+        old_hub = self.root / "old-hub.py"
+        old_hub.write_text("print('old')\n")
+        installed = self.root / "installed.py"
+        installed.write_text("print('new')\n")
+        xray_bin = self.root / "xray"
+        xray_bin.write_text("core 26.3.27")
+        xray_config = self.root / "xray.json"
+        xray_config.write_text('{"network":"tcp","security":"none"}')
+        backup_dir = self.root / "backup"
+        backup_dir.mkdir()
+        before_db = backup_dir / "db-before.sqlite"
+        up.sqlite_backup(self.db, before_db)
+        (backup_dir / "hub-before.py").write_bytes(old_hub.read_bytes())
+        hold = self.root / ".xray-maintenance-hold"
+        hold.write_text("maintenance")
+        metadata = {
+            "installed": str(installed),
+            "db": str(self.db),
+            "xray_config": str(xray_config),
+            "xray_json_sha": up.sha256(xray_config),
+            "xray_sha": up.sha256(xray_bin),
+            "hub_before_sha": up.sha256(old_hub),
+            "maintenance_hold_created": True,
+            "maintenance_hold": str(hold),
+        }
+        (backup_dir / "manifest.json").write_text(json.dumps(metadata))
+        up.migrate_db(self.db, "already-wss")
+        commands = []
+        def call(cmd, **kwargs):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        args = type("Args", (), {"xray_bin": xray_bin})()
+        with mock.patch.object(up, "call", side_effect=call), \
+             mock.patch.object(up, "is_active", side_effect=lambda s: s == up.XRAY_SERVICE), \
+             mock.patch.object(up, "health", return_value=True):
+            up.restore_from_backup(args, backup_dir)
+        self.assertEqual(installed.read_bytes(), old_hub.read_bytes())
+        self.assertFalse(hold.exists())
+        with sqlite3.connect(self.db) as conn:
+            self.assertNotIn("vps_transport",
+                             {x[1] for x in conn.execute("pragma table_info(routers)")})
+        self.assertEqual(commands, [
+            ["systemctl", "stop", "owrt-remote"],
+            ["systemctl", "start", "owrt-remote"],
+        ])
+
+    def test_live_hub_refuses_both_xray_operations_when_hold_exists(self):
+        import os
+        from unittest import mock as m
+        with tempfile.TemporaryDirectory(prefix="wss-hold-test-") as path:
+            name = "guarded_hub_test_" + str(id(self))
+            spec = importlib.util.spec_from_file_location(name, HUB)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            with m.patch.dict(os.environ, {"OWRT_REMOTE_STATE_DIR": path}):
+                spec.loader.exec_module(module)
+            (Path(path) / ".xray-maintenance-hold").write_text("hold")
+            with m.patch.object(module.subprocess, "run") as subprocess_mock:
+                with self.assertRaises(RuntimeError):
+                    module.reload_vps_xray()
+                with self.assertRaises(RuntimeError):
+                    module.restart_vps_xray()
+                subprocess_mock.assert_not_called()
+
     def test_all_xray_restarts_are_guarded_during_maintenance(self):
         source = HUB.read_text(encoding="utf-8")
         self.assertIn('_XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"', source)
