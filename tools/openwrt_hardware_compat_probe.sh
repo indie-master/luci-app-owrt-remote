@@ -12,10 +12,40 @@ pass() { printf 'PROBE: PASS - %s\n' "$*"; }
 printf '%s\n' '===== ISOLATED OPENWRT COMPATIBILITY PROBE ====='
 printf '%s\n' 'No production files, services, UCI or tunnels are changed.'
 
-for app in mktemp mkdir rm cat cp mv chmod cmp tar sha256sum awk grep df tr nohup sleep sh wc; do
-  command -v "$app" >/dev/null 2>&1 || fail "missing applet: $app"
+# Inventory every required applet BEFORE running the first fixture, so one
+# missing applet doesn't force another diagnostic round trip.
+missing=''
+for app in mktemp mkdir rm cat cp mv chmod cmp tar sha256sum awk grep df tr sleep sh wc dirname sort; do
+  if ! command -v "$app" >/dev/null 2>&1; then
+    printf 'PROBE: MISSING REQUIRED - %s\n' "$app"
+    missing="$missing $app"
+  fi
 done
-pass 'required command applets are present'
+
+printf '%s\n' '===== OPTIONAL CRYPTO APPLETS ====='
+for app in dd hexdump od openssl; do
+  if command -v "$app" >/dev/null 2>&1; then
+    printf 'PROBE: PRESENT - %s\n' "$app"
+  else
+    printf 'PROBE: ABSENT - %s\n' "$app"
+  fi
+done
+
+printf '%s\n' '===== WATCHDOG LAUNCH OPTIONS (INVENTORY ONLY) ====='
+for app in nohup start-stop-daemon setsid procd ubus; do
+  if command -v "$app" >/dev/null 2>&1; then
+    printf 'PROBE: PRESENT - %s\n' "$app"
+  else
+    printf 'PROBE: ABSENT - %s\n' "$app"
+  fi
+done
+if command -v nohup >/dev/null 2>&1; then
+  printf '%s\n' 'PROBE: WATCHDOG - legacy nohup command present (NOT a durability test)'
+else
+  printf '%s\n' 'PROBE: WATCHDOG BLOCKED - legacy installer requires nohup; alternate launcher must be tested'
+fi
+[ -z "$missing" ] || fail "missing required applets:$missing"
+pass 'required filesystem applets are present'
 
 secure_nonce() {
   # Exactly 16 unpredictable bytes, hexadecimal-encoded. Never use timestamps,
