@@ -14,14 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-EXPECTED_ROUTERS = {
-    "main",
-    "AX3000T-Shteinberg",
-    "WR3000S_2",
-    "PaxoBs",
-    "Netis_N6_router5",
-}
-NETIS = "Netis_N6_router5"
+EXPECTED_ROUTER_COUNT = 5
 LEGACY = "owrt-remote-vless"
 WSS = "owrt-remote-wss"
 
@@ -75,13 +68,13 @@ def check_expected(config):
     ws_clients = client_index(ws)
     require(len(tcp_clients) == 8, f"Expected 8 legacy clients, got {len(tcp_clients)}")
     require(len(ws_clients) == 2, f"Expected 2 WSS clients, got {len(ws_clients)}")
-    require(set(ws_clients) == {f"reverse-{NETIS}", f"reverse-{NETIS}-ssh"},
-            "WSS client set differs from the live Netis configuration")
+    base_tags = [tag for tag in ws_clients if tag.startswith("reverse-") and not tag.endswith("-ssh")]
+    require(len(base_tags) == 1, "Expected exactly one WSS reverse router")
+    ws_router = base_tags[0][len("reverse-"):]
+    require(set(ws_clients) == {f"reverse-{ws_router}", f"reverse-{ws_router}-ssh"},
+            "The two active WSS client reverse tags do not match")
     require(len(config["routing"]["rules"]) == 10, "Expected 10 reverse routing rules")
-    for rid in EXPECTED_ROUTERS:
-        require(f"entry-{rid}" in mapping and f"ssh-{rid}" in mapping,
-                f"Missing entry / SSH inbound for {rid}")
-    return mapping
+    return mapping, ws_router
 
 
 def run_stage(args):
@@ -100,7 +93,7 @@ def run_stage(args):
     print("Staging directory:", stage, flush=True)
 
     original = json.loads(live_path.read_text(encoding="utf-8"))
-    check_expected(original)
+    _, active_ws_router = check_expected(original)
     orig_file = stage / "live-snapshot.json"
     orig_file.write_text(json.dumps(original, ensure_ascii=False, indent=2) + "\n")
     orig_file.chmod(0o600)
@@ -118,21 +111,26 @@ def run_stage(args):
             "select id, vless_port from routers where coalesce(deleted_at, 0)=0"
         ).fetchall()
         found = {rid for rid, _ in rows}
-        require(found == EXPECTED_ROUTERS, f"Active router ID set is different: {sorted(found)}")
+        require(len(found) == EXPECTED_ROUTER_COUNT, "Unexpected number of active DB routers")
+        require(active_ws_router in found, "The active WSS router is absent from the DB")
+        current_inbounds = inbound_index(original)
+        for rid in found:
+            require(f"entry-{rid}" in current_inbounds and f"ssh-{rid}" in current_inbounds,
+                    "An active router is missing entry or SSH in the live config")
         require(all(port == 18443 for _, port in rows),
                 "Original DB endpoint ports differ from the verified Belt baseline")
 
         # Migrate *only the snapshot*. All existing records remain tcp.
         if "vps_transport" not in names:
             conn.execute("alter table routers add column vps_transport text not null default 'tcp'")
-        conn.execute("update routers set vps_transport='ws', vless_port=443 where id=?", (NETIS,))
+        conn.execute("update routers set vps_transport='ws', vless_port=443 where id=?", (active_ws_router,))
         conn.commit()
         migrated = conn.execute(
             "select id, vps_transport, vless_port from routers where coalesce(deleted_at,0)=0"
         ).fetchall()
         require(sum(t == "ws" for _, t, _ in migrated) == 1,
                 "The snapshot should contain exactly one WSS router")
-        require(all((t == "ws" and p == 443) if rid == NETIS else
+        require(all((t == "ws" and p == 443) if rid == active_ws_router else
                     (t == "tcp" and p == 18443) for rid, t, p in migrated),
                 "Unexpected transport/port migration in snapshot")
 
@@ -154,16 +152,17 @@ def run_stage(args):
     require(candidate.is_file(), "HUB did not create candidate.json")
     candidate.chmod(0o600)
     new = json.loads(candidate.read_text(encoding="utf-8"))
-    check_expected(new)
+    _, generated_ws_router = check_expected(new)
+    require(generated_ws_router == active_ws_router, "Generated WSS router differs from live WSS router")
 
     # No real UUID/SSH access/routers are allowed to change. Other than
     # ordering of maps/lists, the new generator should reproduce working state.
     identical = normalized(new) == normalized(original)
     live_in, new_in = inbound_index(original), inbound_index(new)
     print("===== REVERSE CONTRACT =====")
-    print("Registered routers:", len(EXPECTED_ROUTERS))
+    print("Registered routers:", EXPECTED_ROUTER_COUNT)
     print("Legacy TCP clients: 8, port 18443")
-    print("Netis WSS clients: 2, local port 18444, public port 443")
+    print("WSS clients: 2, local port 18444, public port 443")
     print("LuCI / SSH routing rules: 10")
     print("Transport DB migration performed: SNAPSHOT ONLY")
     print("Semantic match with currently working Xray JSON:", "YES" if identical else "NO")
