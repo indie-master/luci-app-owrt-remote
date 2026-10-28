@@ -3591,6 +3591,8 @@ def init_db(conn):
     ensure_column(conn, "routers", "notes", "text not null default ''")
     # Existing router records are always legacy TCP; new records default to WSS.
     ensure_column(conn, "routers", "vps_transport", "text not null default 'tcp'")
+    # Temporary TCP fallback for planned WSS migration; disabled for all existing rows.
+    ensure_column(conn, "routers", "vps_allow_legacy", "integer not null default 0")
     conn.execute(
         """
         update routers
@@ -4121,6 +4123,7 @@ def upsert_router(conn, values):
         "vps_host": keep_str("vps_host", ""),
         "vless_port": port_value,
         "vps_transport": transport,
+        "vps_allow_legacy": int(current["vps_allow_legacy"] or 0) if current else 0,
         "vless_uuid": keep_str("vless_uuid", str(uuid.uuid4())),
         "vless_encryption": keep_str("vless_encryption", "none"),
         "vless_decryption": keep_str("vless_decryption", "none"),
@@ -4154,6 +4157,7 @@ def upsert_router(conn, values):
                 vps_host = :vps_host,
                 vless_port = :vless_port,
                 vps_transport = :vps_transport,
+                vps_allow_legacy = :vps_allow_legacy,
                 vless_uuid = :vless_uuid,
                 vless_encryption = :vless_encryption,
                 vless_decryption = :vless_decryption,
@@ -4179,13 +4183,13 @@ def upsert_router(conn, values):
         conn.execute(
             """
             insert into routers (
-                id, name, role, group_id, entry_port, vps_host, vless_port, vps_transport, vless_uuid,
+                id, name, role, group_id, entry_port, vps_host, vless_port, vps_transport, vps_allow_legacy, vless_uuid,
                 vless_encryption, vless_decryption, vless_flow, reverse_tag,
                 public_url, admin_host, admin_port, ssh_entry_port, ssh_vless_uuid,
                 ssh_reverse_tag, ssh_host, ssh_port, notes,
                 created_at, updated_at, deleted_at
             ) values (
-                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vps_transport, :vless_uuid,
+                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vps_transport, :vps_allow_legacy, :vless_uuid,
                 :vless_encryption, :vless_decryption, :vless_flow, :reverse_tag,
                 :public_url, :admin_host, :admin_port, :ssh_entry_port, :ssh_vless_uuid,
                 :ssh_reverse_tag, :ssh_host, :ssh_port, :notes,
@@ -4446,6 +4450,9 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
         if row["vless_flow"]:
             client["flow"] = row["vless_flow"]
         transport_clients.append(client)
+        if transport_clients is ws_clients and row_int_value(row, "vps_allow_legacy", 0):
+            # During migration, leave the old TCP authentication available.
+            clients.append(client)
         if ssh_entry_port > 0:
             ssh_client = {
                 "id": row["ssh_vless_uuid"],
@@ -4457,6 +4464,8 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
             if row["vless_flow"]:
                 ssh_client["flow"] = row["vless_flow"]
             transport_clients.append(ssh_client)
+            if transport_clients is ws_clients and row_int_value(row, "vps_allow_legacy", 0):
+                clients.append(ssh_client)
         inbounds.append(
             {
                 "tag": portal_in,
@@ -20335,7 +20344,11 @@ def cmd_add_router(args):
 
 
 def cmd_set_router_transport(args):
-    """Explicit migration, preserving UUIDs, reverse tags and LuCI/SSH ports."""
+    """Staged TCP -> WSS migration, preserving UUIDs and reverse endpoints."""
+    if not args.sync_xray:
+        raise SystemExit("Transport migration requires --sync-xray; database-only changes are unsafe.")
+    if sum(bool(v) for v in (args.stage, args.finalize, args.direct)) > 1:
+        raise SystemExit("--stage, --finalize and --direct are mutually exclusive")
     with connect(args.db) as conn:
         init_db(conn)
         row = get_router(conn, args.id)
@@ -20343,25 +20356,52 @@ def cmd_set_router_transport(args):
             raise SystemExit("router not found")
         old_transport = row_str_value(row, "vps_transport", "tcp")
         old_port = int(row["vless_port"])
+        old_allow = int(row["vps_allow_legacy"] or 0)
         new_port = 443 if args.transport == "ws" else DEFAULT_VLESS_PORT
-        conn.execute("update routers set vps_transport = ?, vless_port = ?, updated_at = ? where id = ?",
-                     (args.transport, new_port, now_ts(), row["id"]))
-        conn.commit()
+        if args.stage:
+            if args.transport != "ws" or old_transport != "tcp":
+                raise SystemExit("--stage requires an existing TCP router and --transport ws")
+            allow_legacy = 1
+        elif args.finalize:
+            if args.transport != "ws" or old_transport != "ws" or old_allow != 1:
+                raise SystemExit("--finalize requires a staged WSS router")
+            allow_legacy = 0
+        elif args.direct:
+            if args.transport != "ws" or old_transport != "tcp":
+                raise SystemExit("--direct is only for a router already connected via WSS, with the DB still marked TCP")
+            allow_legacy = 0
+        elif args.transport == "ws" and old_transport == "tcp":
+            raise SystemExit("Refusing abrupt TCP -> WSS migration. Use --stage, then --finalize after live verification.")
+        else:
+            # Return to TCP (rollback), or keep the current non-staged transport.
+            allow_legacy = 0
+        if (args.transport, new_port, allow_legacy) == (old_transport, old_port, old_allow):
+            print(json.dumps({"router_id": row["id"], "unchanged": True}))
+            return
         router_id = row["id"]
-    result = {"router_id": router_id, "transport": args.transport,
-              "vless_port": new_port, "xray": "not reloaded"}
-    if args.sync_xray:
-        try:
-            result["xray"] = reload_vps_xray(args.db)
-        except Exception:
-            # A failed candidate must not leave DB and live Xray disagreeing.
-            with connect(args.db) as conn:
-                init_db(conn)
-                conn.execute("update routers set vps_transport = ?, vless_port = ?, updated_at = ? where id = ?",
-                             (old_transport, old_port, now_ts(), router_id))
-                conn.commit()
-            raise
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+        conn.execute(
+            "update routers set vps_transport=?, vless_port=?, vps_allow_legacy=?, updated_at=? where id=?",
+            (args.transport, new_port, allow_legacy, now_ts(), router_id),
+        )
+        conn.commit()
+    try:
+        xray_result = reload_vps_xray(args.db)
+    except Exception:
+        with connect(args.db) as conn:
+            init_db(conn)
+            conn.execute(
+                "update routers set vps_transport=?, vless_port=?, vps_allow_legacy=?, updated_at=? where id=?",
+                (old_transport, old_port, old_allow, now_ts(), router_id),
+            )
+            conn.commit()
+        raise
+    print(json.dumps({
+        "router_id": router_id,
+        "transport": args.transport,
+        "vless_port": new_port,
+        "tcp_fallback_enabled": bool(allow_legacy),
+        "xray": xray_result,
+    }, ensure_ascii=False, indent=2))
 
 
 
@@ -20606,7 +20646,10 @@ def parser():
     transport = sub.add_parser("set-router-transport", help="migrate a router between legacy TCP and WSS without changing UUIDs")
     transport.add_argument("--id", required=True)
     transport.add_argument("--transport", choices=("tcp", "ws"), required=True)
-    transport.add_argument("--sync-xray", action="store_true", help="validate and reload VPS Xray")
+    transport.add_argument("--sync-xray", action="store_true", help="required: validate and reload VPS Xray")
+    transport.add_argument("--stage", action="store_true", help="enable WS while retaining TCP auth until verification")
+    transport.add_argument("--finalize", action="store_true", help="remove temporary TCP auth after successful WSS verification")
+    transport.add_argument("--direct", action="store_true", help="only if router already uses WSS but legacy DB records TCP")
     transport.set_defaults(func=cmd_set_router_transport)
 
     sep = sub.add_parser("set-entry-port", help="set router VPS entry port without changing UUID")
