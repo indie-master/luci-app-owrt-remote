@@ -178,6 +178,7 @@ save_config() {
 	case "$transport" in tcp|ws) ;; *) set_result "Настройки не сохранены" "Транспорт должен быть TCP или WSS" "bad"; return 1 ;; esac
 	sni="$(param vps_sni)"
 	ws_path="$(param vps_ws_path)"
+	[ -n "$ws_path" ] || ws_path=/owrt-ws/
 	case "$ws_path" in /*) ;; *) set_result "Настройки не сохранены" "WebSocket path должен начинаться с /" "bad"; return 1 ;; esac
 	if [ "$transport" = ws ]; then
 		[ -n "$sni" ] || { set_result "Настройки не сохранены" "Для WSS требуется домен TLS SNI" "bad"; return 1; }
@@ -202,7 +203,8 @@ save_config() {
 	uci_set enabled "$enabled"
 
 	for field in router_id router_name role hub_url hub_token heartbeat_interval xray_bin xray_config vps_host vps_port vps_transport vps_sni vps_ws_path vless_uuid vless_encryption vless_flow reverse_tag ssh_vless_uuid ssh_reverse_tag admin_host admin_port ssh_host ssh_port public_url; do
-		uci_set "$field" "$(param "$field")"
+		if [ "$field" = vps_ws_path ]; then uci_set "$field" "$ws_path"
+		else uci_set "$field" "$(param "$field")"; fi
 	done
 	if has_param vps_host_auto; then uci_set vps_host_mode auto; else uci_set vps_host_mode manual; fi
 	if has_param wan_direct; then uci_set wan_direct 1; else uci_set wan_direct 0; fi
@@ -409,6 +411,7 @@ field() {
 	type="${3:-text}"
 	help="${4:-}"
 	value="$(uci_get "$name" '')"
+	[ "$name" != vps_ws_path ] || [ -n "$value" ] || value=/owrt-ws/
 	printf '<label class="field"><span>%s</span>' "$(h "$label")"
 	if [ -n "$help" ]; then
 		printf '<small>%s</small>' "$(h "$help")"
