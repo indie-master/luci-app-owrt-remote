@@ -87,6 +87,8 @@ critical() {
   expected_xray="$(sed -n '2p' "$STATE/backup/critical.sha256")"
   hex64 "$expected_uci" || fail 'bad UCI backup hash'
   hex64 "$expected_xray" || fail 'bad Xray backup hash'
+  [ "$(sha "$STATE/backup/files/etc/config/owrtremote")" = "$expected_uci" ] || fail 'UCI recovery copy corrupted'
+  [ "$(sha "$STATE/backup/files/etc/xray/owrt-remote-client.json")" = "$expected_xray" ] || fail 'Xray recovery copy corrupted'
   [ "$(sha "$(at etc/config/owrtremote)")" = "$expected_uci" ] || fail 'UCI changed during pilot'
   [ "$(sha "$(at etc/xray/owrt-remote-client.json)")" = "$expected_xray" ] || fail 'Xray JSON changed during pilot'
 }
@@ -94,15 +96,51 @@ critical() {
 verify_backup() {
   present "$STATE/backup/present.txt" || fail 'backup inventory missing'
   [ "$(wc -l < "$STATE/backup/present.txt")" -eq 10 ] || fail 'invalid backup inventory'
+  present "$STATE/backup/original.sha256" || fail 'original digest inventory missing'
+  [ "$(wc -l < "$STATE/backup/original.sha256")" -eq 10 ] || fail 'original digest inventory invalid'
   for rel in $FILES; do
     record="$(awk -v name="$rel" '$2==name{print $0}' "$STATE/backup/present.txt" || true)"
+    seal="$(awk -v name="$rel" '$2==name{print $1}' "$STATE/backup/original.sha256" || true)"
     case "$record" in
-      "1 $rel") present "$STATE/backup/files/$rel" || fail "backup missing $rel" ;;
-      "0 $rel") [ ! -e "$STATE/backup/files/$rel" ] || fail "backup conflict $rel" ;;
+      "1 $rel")
+        present "$STATE/backup/files/$rel" || fail "backup missing $rel"
+        hex64 "$seal" || fail "original digest missing for $rel"
+        [ "$(sha "$STATE/backup/files/$rel")" = "$seal" ] || fail "backup corrupted for $rel"
+        ;;
+      "0 $rel")
+        [ "$seal" = '-' ] || fail "absent-file seal invalid for $rel"
+        [ ! -e "$STATE/backup/files/$rel" ] || fail "backup conflict $rel"
+        ;;
       *) fail "backup inventory invalid for $rel" ;;
     esac
   done
   critical
+}
+
+verify_originals() {
+  # Between snapshot and apply no original client file may change unnoticed.
+  for rel in $FILES; do
+    record="$(awk -v name="$rel" '$2==name{print $0}' "$STATE/backup/present.txt")"
+    live="$(at "$rel")"
+    if [ "$record" = "1 $rel" ]; then
+      present "$live" || fail "original client file disappeared: $rel"
+      cmp -s "$live" "$STATE/backup/files/$rel" || fail "original client changed after snapshot: $rel"
+    else
+      [ ! -e "$live" ] && [ ! -L "$live" ] || fail "previously absent path now exists: $rel"
+    fi
+  done
+}
+
+verify_resources() {
+  if [ "${RO_TEST_MODE:-0}" != 1 ]; then
+    [ "$(id -u)" = 0 ] || fail 'apply requires root'
+    available="$(awk '$1=="MemAvailable:"{print $2}' /proc/meminfo)"
+    case "$available" in ''|*[!0-9]*) fail 'cannot read MemAvailable' ;; esac
+    [ "$available" -ge 20480 ] || fail 'less than 20 MiB available RAM'
+  fi
+  free_kb="$(df -Pk "$(at etc)" | awk 'END{print $4}')"
+  case "$free_kb" in ''|*[!0-9]*) fail 'cannot read overlay free space' ;; esac
+  [ "$free_kb" -ge 16384 ] || fail 'less than 16 MiB persistent storage reserve'
 }
 
 verify_candidate() {
@@ -180,7 +218,9 @@ apply() {
   [ ! -e "$STATE/armed" ] || fail 'watchdog already armed'
   [ ! -e "$STATE/transaction.sh" ] || fail 'transaction already installed; investigate'
   identity
+  verify_resources
   verify_backup
+  verify_originals
   verify_candidate "$1"
   lock
   # Check preexisting state after obtaining the exclusive lock.
