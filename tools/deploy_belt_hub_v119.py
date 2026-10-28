@@ -267,6 +267,7 @@ def backup_files(args, info, folder):
         "xray_pid": info["xray_pid"],
         "hub_before_sha": sha256(info["installed"]),
         "source_sha": sha256(info["source"]),
+        "maintenance_hold": str(info["db"].parent / ".xray-maintenance-hold"),
     }
     (folder / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
     for name in ("manifest.json", "owrt-hub-unit.txt", "owrt-xray-unit.txt",
@@ -310,6 +311,13 @@ def apply(args):
         backup_files(args, info, backup_dir / "files")
         files = backup_dir / "files"
         migrate_db(info["db"], info["ws_router"])
+        # Keep the new Hub from reloading/restarting Xray in response to
+        # heartbeat, WAN-reconnect or registration during the acceptance window.
+        hold = info["db"].parent / ".xray-maintenance-hold"
+        require(not hold.exists(), "Maintenance hold already exists; refusing to overwrite it")
+        hold.write_text("Guarded v119+WSS upgrade: verify live TCP and WSS before removal.\n",
+                        encoding="utf-8")
+        hold.chmod(0o600)
         validate_render(args, info, files / "candidate.json")
         atomic_install(info["source"], info["installed"])
         require(sha256(info["installed"]) == sha256(info["source"]),
@@ -320,6 +328,7 @@ def apply(args):
         verify_xray_untouched(args, info)
         print("UPGRADE: PASS. HUB v119+WSS is running.", flush=True)
         print("Core unchanged. Router UUIDs unchanged. No Xray restart requested.", flush=True)
+        print("Xray maintenance HOLD remains active until manual acceptance:", hold, flush=True)
         print("Rollback snapshot:", files, flush=True)
     except BaseException:
         if changed:
