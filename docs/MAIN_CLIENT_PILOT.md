@@ -227,6 +227,33 @@ No `install.sh` commands or router-side deployment commands are published
 here intentionally; only the developer canary fixture is covered by CI. Do
 not remove Belt's maintenance HOLD or update Xray-core.
 
+## Next hardware gate: isolated OpenWrt applet probe (safe, no update)
+
+`tools/openwrt_hardware_compat_probe.sh` provides a **separate,
+non-mutating-to-production** check of the exact router's BusyBox tools,
+tar streaming (`tar -xOf`), checksum, copy/rename, random nonce,
+overlay `df -Pk`, and `MemAvailable` parsing.
+
+The script creates one private `mktemp -d /tmp/ro-hardware-probe.XXXXXX`
+directory, uses only synthetic text fixtures inside it, and deletes only
+that temporary directory. It does **not** run the transaction updater,
+read credentials, edit /etc/config, restart Xray, stop procd, change
+routing/DNS or invoke an init script.
+
+After the CI check has passed, obtain the script at a **pinned Git commit
+SHA**. Review before use. On the chosen `main` OpenWrt shell:
+
+```sh
+wget -O /tmp/ro-hardware-probe.sh 'https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/<VERIFIED_COMMIT_SHA>/tools/openwrt_hardware_compat_probe.sh'
+sh -n /tmp/ro-hardware-probe.sh && sh /tmp/ro-hardware-probe.sh
+```
+
+The placeholder SHA must be replaced with the latest known CI-passed
+commit: do NOT run the literal placeholder. This gate is *not* a full
+client update test and **cannot** establish that reboot, persistent
+rollback or reverse access will work after installing the new agent.
+The original on-router client must stay running and unchanged.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
