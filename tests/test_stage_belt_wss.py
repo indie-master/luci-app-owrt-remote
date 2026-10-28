@@ -59,11 +59,11 @@ class BeltOfflineStageTests(unittest.TestCase):
         self.before_hash = hashlib.sha256(self.db.read_bytes()).hexdigest()
         self.live_before_hash = hashlib.sha256(self.live.read_bytes()).hexdigest()
 
-    def stage(self):
+    def stage(self, *extra_args):
         return subprocess.run(
             [sys.executable, str(STAGER), "--db", str(self.db),
              "--live", str(self.live), "--hub-source", str(SOURCE),
-             "--xray-bin", str(self.bin), "--output-root", str(self.root)],
+             "--xray-bin", str(self.bin), "--output-root", str(self.root), *extra_args],
             capture_output=True, text=True, timeout=60
         )
 
@@ -82,6 +82,22 @@ class BeltOfflineStageTests(unittest.TestCase):
             self.assertEqual(db.execute("select count(*) from routers where vps_transport='ws'").fetchone()[0], 1)
             self.assertEqual(db.execute(
                 "select vless_port from routers where id=?", ("wss-router",)).fetchone()[0], 443)
+
+    def test_simulated_dual_transport_fallback_keeps_live_unchanged(self):
+        result = self.stage("--simulate-fallback")
+        self.assertEqual(result.returncode, 0, result.stderr + "\n" + result.stdout)
+        self.assertIn("Temporary fallback simulated: SNAPSHOT ONLY", result.stdout)
+        self.assertIn("Existing TCP clients: 8, preserved unchanged", result.stdout)
+        self.assertIn("WSS clients: 4", result.stdout)
+        self.assertEqual(self.before_hash, hashlib.sha256(self.db.read_bytes()).hexdigest())
+        self.assertEqual(self.live_before_hash, hashlib.sha256(self.live.read_bytes()).hexdigest())
+        candidate = list(self.root.glob("owrt-wss-v119-*/fallback-rehearsal.json"))
+        self.assertEqual(len(candidate), 1)
+        config = json.loads(candidate[0].read_text())
+        clients = {x["tag"]: x["settings"]["clients"] for x in config["inbounds"]
+                   if x["tag"] in ("owrt-remote-vless", "owrt-remote-wss")}
+        self.assertEqual(len(clients["owrt-remote-vless"]), 8)
+        self.assertEqual(len(clients["owrt-remote-wss"]), 4)
 
     def test_mismatched_live_client_refuses_stage(self):
         live = json.loads(self.live.read_text())
