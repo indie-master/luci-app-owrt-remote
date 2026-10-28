@@ -247,6 +247,11 @@ apply() {
   lock
   # Check preexisting state after obtaining the exclusive lock.
   [ ! -e "$STATE/pending" ] && [ ! -e "$STATE/armed" ] || fail 'update already started'
+  # Don't create a boot hook or pending state if the required watchdog
+  # launcher is absent. A real OpenWrt replacement must have an independently
+  # supervised lifetime before this safety gate can be removed.
+  command -v nohup >/dev/null 2>&1 ||
+    fail 'watchdog launcher unavailable (nohup missing); live update prohibited'
   # Validate crypto availability before adding any recovery hooks or files.
   # Missing od alone must not block devices with BusyBox hexdump.
   nonce="$(secure_nonce)" || fail 'no supported secure nonce generator (hexdump, od or openssl)'
