@@ -6,7 +6,7 @@ production deployment or changes to the Belt VPS or any OpenWrt router.
 ## Naming and provenance
 
 - Product/repository name (planned): **Router Orchestrator**
-- VPS Web UI product label (exact spelling): **Rmote HUB**
+- VPS Web UI product label (exact spelling): **Remote HUB**
 - Proposed eventual repository: `indie-master/router-orchestrator`
 - Current GitHub repository: `indie-master/luci-app-owrt-remote`
 - Upstream: https://github.com/kzolotarev95/luci-app-owrt-remote
