@@ -33,6 +33,19 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
           python3 tools/build_router_bundle.py --out "$RUNNER_TEMP/router-candidate.tar"
           test -s "$RUNNER_TEMP/router-candidate.tar"
+      - name: Exercise OpenWrt pilot transactions with BusyBox ash and applets
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox-static
+          BB="$(command -v busybox)"
+          mkdir -p "$RUNNER_TEMP/ro-busybox"
+          for app in sh tar awk grep sed sort sha256sum cp mv rm mkdir rmdir chmod ln df wc head tr od nohup sleep cat date dirname; do
+            ln -s "$BB" "$RUNNER_TEMP/ro-busybox/$app"
+          done
+          RO_TEST_SHELL="$BB sh" PATH="$RUNNER_TEMP/ro-busybox:$PATH" \
+            python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+          RO_TEST_SHELL="$BB sh" PATH="$RUNNER_TEMP/ro-busybox:$PATH" \
+            python3 -m unittest discover -s tests -p 'test_router_pilot_transaction.py' -v
       - name: Test original v119 features and protocol surfaces are retained
         run: python3 -m unittest discover -s tests -p 'test_original_feature_contract.py' -v
       - name: Test main router read-only pilot safety guards
