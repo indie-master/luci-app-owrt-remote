@@ -12,10 +12,29 @@ pass() { printf 'PROBE: PASS - %s\n' "$*"; }
 printf '%s\n' '===== ISOLATED OPENWRT COMPATIBILITY PROBE ====='
 printf '%s\n' 'No production files, services, UCI or tunnels are changed.'
 
-for app in mktemp mkdir rm cat cp mv chmod cmp tar sha256sum awk grep df od tr nohup sleep sh wc; do
+for app in mktemp mkdir rm cat cp mv chmod cmp tar sha256sum awk grep df tr nohup sleep sh wc; do
   command -v "$app" >/dev/null 2>&1 || fail "missing applet: $app"
 done
 pass 'required command applets are present'
+
+secure_nonce() {
+  # Exactly 16 unpredictable bytes, hexadecimal-encoded. Never use timestamps,
+  # shell PIDs or weak PRNG values for confirmation tokens.
+  [ -r /dev/urandom ] || return 1
+  nonce_hex=''
+  if command -v dd >/dev/null 2>&1 && command -v hexdump >/dev/null 2>&1; then
+    nonce_hex="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '16/1 "%02x"' 2>/dev/null)" || nonce_hex=''
+  fi
+  if [ "${#nonce_hex}" -ne 32 ] && command -v od >/dev/null 2>&1; then
+    nonce_hex="$(od -An -tx1 -N 16 /dev/urandom 2>/dev/null | tr -d ' \n')" || nonce_hex=''
+  fi
+  if [ "${#nonce_hex}" -ne 32 ] && command -v openssl >/dev/null 2>&1; then
+    nonce_hex="$(openssl rand -hex 16 2>/dev/null)" || nonce_hex=''
+  fi
+  case "$nonce_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#nonce_hex}" -eq 32 ] || return 1
+  printf '%s\n' "$nonce_hex"
+}
 
 # /tmp must exist; the probe never mounts anything or touches /etc.
 [ -d /tmp ] && [ ! -L /tmp ] || fail '/tmp is missing or a symlink'
@@ -63,9 +82,9 @@ b="$(sha256sum "$dir/restore/current" | awk '{print $1}')" || fail 'second sha25
 [ "${#a}" -eq 64 ] && [ "$a" = "$b" ] || fail 'SHA-256 mismatch'
 pass 'SHA-256 checks'
 
-nonce="$(od -An -tx1 -N 16 /dev/urandom | tr -d ' \n')" || fail 'od random bytes failure'
+nonce="$(secure_nonce)" || fail 'no supported secure nonce generator (hexdump, od or openssl)'
 [ "${#nonce}" -eq 32 ] || fail 'random nonce is not 16 bytes'
-pass 'od and nonce generation'
+pass 'cryptographic nonce generation (no od dependency)'
 
 # Must work on the actual OpenWrt BusyBox, not just a desktop's coreutils.
 # /overlay exists on OpenWrt; use /tmp on generic CI hosts without overlayfs.
