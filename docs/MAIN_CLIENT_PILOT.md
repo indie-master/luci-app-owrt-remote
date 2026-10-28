@@ -125,6 +125,55 @@ The dedicated pilot entry point must:
 The watchdog timeout needs real-world measurements and explicit approval
 before implementation; it must not be chosen blindly.
 
+## Guarded bundle milestone (development branch only)
+
+Two **new, separate** tools now exist. This does NOT mean the live upgrade is
+ready or that the original installer has been replaced:
+
+- `tools/build_router_bundle.py`: creates a deterministic, UNCOMPRESSED tar
+  containing exactly the ten files the original `install.sh` updates (excluding
+  the UCI config, selected Xray binary, optional packages and service actions).
+  Outputs SHA-256; no router commands.
+- `tools/router_bundle_guard.sh`: accepts a **pre-downloaded local bundle and
+  a separately reviewed exact SHA-256**. The `stage` command rejects mismatched
+  hashes, unexpected archive members, links and invalid per-file checksums.
+  It limits archives to 6 MiB and requires 24 MiB free on persistent overlay.
+  The `snapshot` command prepares a private persistent copy of the old ten
+  files plus UCI and default client JSON. Existing backups are never
+  overwritten. Only the `main` router on TCP none/18443 is supported.
+- Importantly, this version **does not implement `apply`, `confirm`,
+  `watchdog` or `rollback` yet**. Those commands are intentionally rejected.
+  It neither updates nor restarts any service, nor installs a boot recovery
+  mechanism. Do not interpret `STAGED` or `SNAPSHOT READY` as safe to run
+  the original `install.sh`.
+
+### Developer-only offline checks
+
+On a disposable source checkout (not Belt or the router):
+
+```sh
+python3 tools/build_router_bundle.py --out /tmp/ro-candidate.tar
+python3 -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+```
+
+CI runs the builder and eight isolated synthetic-root tests, checking digest
+mismatches, archive path/link injection, wrong router/transport/port, repeat
+snapshot protection and absence of any apply action.
+
+### Outstanding safeguards before pilot
+
+- Complete the router-local automatic rollback/watchdog with a persistent
+  boot-safe recovery mechanism and authenticated outside-in LuCI + SSH
+  acknowledgment from Belt; test power loss and remote connection drop.
+- Make the 10-file installation transaction recoverable on interrupted writes;
+  preserve exact UCI/client JSON, Xray binary, reverse tags and auth state.
+- Add explicit rollback validation, concurrency locks, space and RAM budgets,
+  release manifest provenance, per-platform BusyBox `tar -xOf` validation
+  and actual hardware exercise before permitting `apply`.
+- All previous original service behavior (including WOL, updates, WAN,
+  logging, user auth) must still work. Never install this experimental bundle
+  with an untested manual copy step.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
