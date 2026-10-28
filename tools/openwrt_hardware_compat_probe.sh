@@ -68,11 +68,17 @@ nonce="$(od -An -tx1 -N 16 /dev/urandom | tr -d ' \n')" || fail 'od random bytes
 pass 'od and nonce generation'
 
 # Must work on the actual OpenWrt BusyBox, not just a desktop's coreutils.
-overlay="$(df -Pk /overlay 2>/dev/null | awk 'END{print $4}')"
+# /overlay exists on OpenWrt; use /tmp on generic CI hosts without overlayfs.
+storage_path=/overlay
+if [ ! -d "$storage_path" ]; then
+  storage_path=/tmp
+  printf '%s\n' 'PROBE: INFO - no /overlay on this test host; measuring /tmp instead'
+fi
+overlay="$(df -Pk "$storage_path" 2>/dev/null | awk 'END{print $4}')"
 case "$overlay" in
-  ''|*[!0-9]*) fail 'df -Pk /overlay unavailable' ;;
+  ''|*[!0-9]*) fail "df -Pk $storage_path unavailable" ;;
 esac
-pass 'df -Pk /overlay'
+pass "df -Pk $storage_path"
 
 available="$(awk '$1=="MemAvailable:"{print $2}' /proc/meminfo)"
 case "$available" in
@@ -84,7 +90,7 @@ printf '%s\n' '===== NON-SENSITIVE DEVICE DETAILS ====='
 if command -v busybox >/dev/null 2>&1; then
   busybox 2>&1 | head -n 1 || true
 fi
-printf 'Overlay available: %s KiB\n' "$overlay"
+printf 'Filesystem available (%s): %s KiB\n' "$storage_path" "$overlay"
 printf 'MemAvailable: %s KiB\n' "$available"
 printf '%s\n' 'PROBE: PASS - isolated temporary filesystem checks complete.'
 printf '%s\n' 'No client upgrade was performed.'
