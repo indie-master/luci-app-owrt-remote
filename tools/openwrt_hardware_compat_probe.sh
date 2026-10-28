@@ -31,6 +31,20 @@ for app in dd hexdump od openssl; do
   fi
 done
 
+printf '%s\n' '===== FUTURE UPDATER DEPENDENCIES (INVENTORY ONLY) ====='
+future_missing=''
+for app in uci jq sed id kill ln rmdir; do
+  if command -v "$app" >/dev/null 2>&1; then
+    printf 'PROBE: PRESENT - %s\n' "$app"
+  else
+    printf 'PROBE: FUTURE MISSING - %s\n' "$app"
+    future_missing="$future_missing $app"
+  fi
+done
+if [ -n "$future_missing" ]; then
+  printf 'PROBE: FUTURE UPDATE BLOCKED - missing:%s\n' "$future_missing"
+fi
+
 printf '%s\n' '===== WATCHDOG LAUNCH OPTIONS (INVENTORY ONLY) ====='
 for app in nohup start-stop-daemon setsid procd ubus; do
   if command -v "$app" >/dev/null 2>&1; then
