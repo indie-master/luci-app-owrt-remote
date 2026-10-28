@@ -1,6 +1,20 @@
+# Router Orchestrator
+
+**Rmote HUB** — будущая web-панель для управления OpenWrt, Xray Reverse, Telegram и сетевыми сервисами. Разработка ведётся отдельно от работающего HUB.
+
+> **ВНИМАНИЕ: экспериментальная ветка, НЕ инструкция по обновлению Belt.** Команды установки ниже сохранены из документации исходного проекта и не являются безопасным маршрутом обновления этой ветки. Не запускайте их на действующем сервере и роутерах; используйте только отдельно проверенный план и версии, привязанные к commit SHA. Не отключайте maintenance HOLD и не обновляйте Xray-core без отдельного пилота.
+
+- [Архитектура, Docker, Telegram, безопасность и совместимость](docs/ROUTER_ORCHESTRATOR_ARCHITECTURE.md)
+- [Первый безопасный пилот OpenWrt-клиента: роутер `main`](docs/MAIN_CLIENT_PILOT.md)
+- [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
+- [Оригинальный проект](https://github.com/kzolotarev95/luci-app-owrt-remote) — автор kzolotarev95. Сохраняются оригинальные copyright и [MIT LICENSE](LICENSE).
+- Текущий рабочий форк: [indie-master/luci-app-owrt-remote](https://github.com/indie-master/luci-app-owrt-remote). Будущее имя репозитория **router-orchestrator** пока не активировано; URL обновлений не менять до проверки миграции.
+
+---
+
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:00A3E0,45:7C3AED,100:F97316&height=210&section=header&text=OpenWrt%20Remote%20Hub&fontSize=42&fontColor=ffffff&animation=fadeIn&fontAlignY=36&desc=Remote%20LuCI%20%2B%20SSH%20access%20through%20your%20own%20VPS&descAlignY=58&descSize=16" alt="OpenWrt Remote Hub" width="100%" />
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:00A3E0,45:7C3AED,100:F97316&height=210&section=header&text=Router%20Orchestrator&fontSize=42&fontColor=ffffff&animation=fadeIn&fontAlignY=36&desc=Remote%20LuCI%20%2B%20SSH%20access%20through%20your%20own%20VPS&descAlignY=58&descSize=16" alt="Router Orchestrator" width="100%" />
 
 <p>
   <a href="#-быстрый-старт"><img alt="Quick start" src="https://img.shields.io/badge/QUICK%20START-ONE%20COMMAND-22C55E?style=for-the-badge&labelColor=111827"></a>
