@@ -187,7 +187,79 @@ def run_stage(args):
     log.write_text(xray.stdout + "\n" + xray.stderr, encoding="utf-8")
     log.chmod(0o600)
     require(xray.returncode == 0, "Xray rejected candidate. See private " + str(log))
+
     print("Xray -test:", "OK")
+    if args.simulate_fallback:
+        # Rehearse the next legacy TCP -> WSS cutover on the DATABASE COPY only.
+        # The existing legacy route must remain valid during this temporary state.
+        from_db = stage / "hub-snapshot.db"
+        with sqlite3.connect(from_db) as conn:
+            names = {item[1] for item in conn.execute("pragma table_info(routers)")}
+            if "vps_allow_legacy" not in names:
+                conn.execute(
+                    "alter table routers add column vps_allow_legacy integer not null default 0"
+                )
+            old_tcp = sorted(rid for rid in found if rid != active_ws_router)
+            require(len(old_tcp) == 4, "Expected four eligible legacy routers")
+            rehearsal_router = old_tcp[0]  # no private router ID is printed
+            conn.execute(
+                "update routers set vps_transport='ws', vless_port=443, "
+                "vps_allow_legacy=1 where id=?",
+                (rehearsal_router,),
+            )
+            conn.commit()
+
+        rehearsal_file = stage / "fallback-rehearsal.json"
+        rehearsal_command = command[:]
+        rehearsal_command[-1] = str(rehearsal_file)
+        generated = subprocess.run(
+            rehearsal_command, env=env, capture_output=True,
+            text=True, timeout=35,
+        )
+        require(generated.returncode == 0 and rehearsal_file.is_file(),
+                "Fallback rehearsal render failed")
+        rehearsal_file.chmod(0o600)
+        rehearsal = json.loads(rehearsal_file.read_text(encoding="utf-8"))
+        expected_original_in = inbound_index(original)
+        rehearsed_in = inbound_index(rehearsal)
+        require(set(expected_original_in) == set(rehearsed_in),
+                "Fallback rehearsal changed inbound tags")
+        require(rehearsal["routing"] == original["routing"],
+                "Fallback rehearsal changed routing")
+        for tag in expected_original_in:
+            if tag not in (LEGACY, WSS):
+                require(rehearsed_in[tag] == expected_original_in[tag],
+                        "Fallback rehearsal changed an entry/SSH inbound")
+        original_tcp = client_index(expected_original_in[LEGACY])
+        new_tcp = client_index(rehearsed_in[LEGACY])
+        original_wss = client_index(expected_original_in[WSS])
+        new_wss = client_index(rehearsed_in[WSS])
+        require(new_tcp == original_tcp,
+                "Fallback rehearsal changed legacy TCP authentication")
+        require(len(new_wss) == len(original_wss) + 2,
+                "Fallback rehearsal did not add exactly two WSS clients")
+        require(all(new_wss.get(tag) == client
+                    for tag, client in original_wss.items()),
+                "Fallback rehearsal changed existing WSS authentication")
+        migrated_admin = "reverse-" + rehearsal_router
+        migrated_ssh = migrated_admin + "-ssh"
+        require(new_wss.get(migrated_admin) == original_tcp.get(migrated_admin)
+                and new_wss.get(migrated_ssh) == original_tcp.get(migrated_ssh),
+                "Fallback rehearsal rotated legacy router UUIDs or reverse tags")
+        test = subprocess.run(
+            [str(binary), "run", "-test", "-config", str(rehearsal_file)],
+            capture_output=True, text=True, timeout=30,
+        )
+        check_log = stage / "fallback-xray-check.log"
+        check_log.write_text(test.stdout + "\n" + test.stderr, encoding="utf-8")
+        check_log.chmod(0o600)
+        require(test.returncode == 0, "Xray rejected simultaneous TCP+WSS reverse clients. DO NOT DEPLOY.")
+        print("===== OPTIONAL FALLBACK REHEARSAL =====")
+        print("Existing TCP clients: 8, preserved unchanged")
+        print("WSS clients: 4 (existing 2 + staged router 2)")
+        print("Existing LuCI / SSH inbounds and routing: preserved")
+        print("Duplicate reverse UUIDs on TCP and WSS: Xray -test OK")
+        print("Temporary fallback simulated: SNAPSHOT ONLY")
     print("===== SAFE STAGING PASSED =====")
     print("Changes to live DB, live Xray and running services: NONE")
     print("Private stage files:", stage)
@@ -200,6 +272,8 @@ def main():
     parser.add_argument("--hub-source", default="vps/owrt-remote-hub.py")
     parser.add_argument("--xray-bin", default="/usr/local/bin/xray")
     parser.add_argument("--output-root", default="/root")
+    parser.add_argument("--simulate-fallback", action="store_true",
+                        help="also verify a temporary TCP+WSS dual-authorization candidate without changing live DB")
     args = parser.parse_args()
     try:
         run_stage(args)
