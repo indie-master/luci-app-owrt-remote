@@ -229,6 +229,22 @@ not remove Belt's maintenance HOLD or update Xray-core.
 
 ## Next hardware gate: isolated OpenWrt applet probe (safe, no update)
 
+First real Cudy WBR3000UAX / OpenWrt 24.10.5 run (operator):
+`PROBE: FAIL - missing applet: od`. The probe stopped before creating any
+temporary fixture or touching live paths. **No package installation is
+required.** `od` was an unnecessary hard dependency. The probe and
+experimental transaction now use a secure 16-byte nonce from
+`/dev/urandom` encoded by BusyBox `hexdump`, or `od` if present, or
+`openssl rand -hex 16` if available. They fail closed if no secure encoding
+method works (never use timestamp/PID fallback). The transaction attempts
+random generation **before** adding its boot recovery hook.
+
+The initial `od` failure does not establish that tar, BusyBox extraction,
+overlay capacity or the rest of the pilot passed; re-run the immutable
+CI-verified corrected probe on the router to check those separately.
+
+
+
 `tools/openwrt_hardware_compat_probe.sh` provides a **separate,
 non-mutating-to-production** check of the exact router's BusyBox tools,
 tar streaming (`tar -xOf`), checksum, copy/rename, random nonce,
