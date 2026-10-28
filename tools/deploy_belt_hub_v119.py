@@ -111,6 +111,7 @@ def active_ws_router(live, stage):
 
 
 def inspect(args):
+    require(args.source is not None, "Reviewed candidate source (--source) is required")
     source = args.source.resolve()
     installed = args.installed.resolve()
     db_path = args.db.resolve()
@@ -122,6 +123,19 @@ def inspect(args):
     require(os.geteuid() == 0, "Must be run as root")
     require(is_active(XRAY_SERVICE), "Xray service is not active")
     require(is_active(HUB_SERVICE), "Hub service is not active")
+    require(not (db_path.parent / ".xray-maintenance-hold").exists(),
+            "Existing Xray maintenance hold detected; investigate before applying another upgrade")
+    # The protection sentinel is resolved using the Hub process state directory.
+    # It must match the SQLite parent or an upgrade would be unprotected.
+    hub_pid = pid(HUB_SERVICE)
+    current_env = Path(f"/proc/{hub_pid}/environ").read_bytes().split(b"\x00")
+    state_entry = next(
+        (x.split(b"=", 1)[1] for x in current_env
+         if x.startswith(b"OWRT_REMOTE_STATE_DIR=")), b"/var/lib/owrt-remote"
+    )
+    require(Path(os.fsdecode(state_entry)).resolve() == db_path.parent,
+            "Live Hub state directory differs from DB directory; maintenance hold would be ineffective")
+
     require(health(), "Hub /health is not responding")
     require(check_listen(18443) and check_listen(18444), "TCP or WSS listener is absent")
     stage, stage_script = stage_module(source)
@@ -268,6 +282,7 @@ def backup_files(args, info, folder):
         "hub_before_sha": sha256(info["installed"]),
         "source_sha": sha256(info["source"]),
         "maintenance_hold": str(info["db"].parent / ".xray-maintenance-hold"),
+        "maintenance_hold_created": True,
     }
     (folder / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
     for name in ("manifest.json", "owrt-hub-unit.txt", "owrt-xray-unit.txt",
@@ -291,6 +306,13 @@ def restore_from_backup(args, folder):
             "Xray JSON differs from pre-upgrade backup")
     require(sha256(args.xray_bin) == manifest["xray_sha"],
             "Xray executable differs from pre-upgrade backup")
+    require(sha256(manifest["installed"]) == manifest["hub_before_sha"],
+            "Restored Hub code checksum differs from pre-upgrade version")
+    if manifest.get("maintenance_hold_created"):
+        hold = Path(manifest["maintenance_hold"])
+        if hold.exists():
+            require(hold.is_file() and not hold.is_symlink(), "Unexpected maintenance hold path")
+            hold.unlink()
     print("ROLLBACK: previous Hub Python and database restored.", flush=True)
 
 
@@ -344,7 +366,7 @@ def apply(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["check", "apply", "rollback"])
-    parser.add_argument("--source", type=Path, required=True,
+    parser.add_argument("--source", type=Path, default=None,
                         help="Path to reviewed v119+WSS Hub source in a pinned checkout")
     parser.add_argument("--backup", type=Path, default=None,
                         help="For rollback: path to the upgrade backup's files directory")
