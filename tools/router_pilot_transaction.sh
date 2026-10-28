@@ -95,7 +95,7 @@ verify_backup() {
   present "$STATE/backup/present.txt" || fail 'backup inventory missing'
   [ "$(wc -l < "$STATE/backup/present.txt")" -eq 10 ] || fail 'invalid backup inventory'
   for rel in $FILES; do
-    record="$(grep -F " $rel" "$STATE/backup/present.txt" || true)"
+    record="$(awk -v name="$rel" '$2==name{print $0}' "$STATE/backup/present.txt" || true)"
     case "$record" in
       "1 $rel") present "$STATE/backup/files/$rel" || fail "backup missing $rel" ;;
       "0 $rel") [ ! -e "$STATE/backup/files/$rel" ] || fail "backup conflict $rel" ;;
@@ -157,7 +157,7 @@ restore() {
   verify_backup
   for rel in $FILES; do
     dst="$(at "$rel")"
-    record="$(grep -F " $rel" "$STATE/backup/present.txt")"
+    record="$(awk -v name="$rel" '$2==name{print $0}' "$STATE/backup/present.txt")"
     if [ "$record" = "0 $rel" ]; then
       rm -f "$dst" || fail "could not remove new $rel"
     else
