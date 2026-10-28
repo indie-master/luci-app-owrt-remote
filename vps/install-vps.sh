@@ -279,6 +279,14 @@ print_result() {
 }
 
 main() {
+	# This is a fresh-install script, NOT a safe in-place Hub upgrader.
+	# An accidental reinstall could replace service units, install a new
+	# core or reset login. Refuse production installations by default.
+	if [ -s /opt/owrt-remote/owrt-remote-hub.py ] || [ -s "$STATE_DIR/hub.db" ]; then
+		if [ "${OWRT_REMOTE_ALLOW_REINSTALL:-0}" != 1 ]; then
+			die "Существующий HUB обнаружен. install-vps.sh не предназначен для безопасного обновления: используйте staged Hub upgrade. Для сознательной переустановки требуется OWRT_REMOTE_ALLOW_REINSTALL=1."
+		fi
+	fi
 	info "Ставлю $APP_NAME..."
 	info "Installer: $INSTALLER_VERSION"
 	install_packages
