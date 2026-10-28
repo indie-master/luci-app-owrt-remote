@@ -33,10 +33,17 @@ per-router authorization, idempotency keys, job IDs, status, timeout and audit t
 
 Proposed components:
 
-1. `hub-api`: authentication, router registry, inventory, statuses, metrics,
-   capability negotiation, RBAC and API.
-2. `hub-worker`: serialized per-router operations, staging, snapshots,
-   apply/verify/rollback, reconnect monitoring, concurrency limits and audit.
+1. `hub` / `hub-api`: **the original v119 Python HUB application** remains the
+   operational core (existing login/auth, GUI, registration, inventory, Xray
+   generation, router commands, logs, updates, metrics and every original
+   workflow). Package and harden it; do not rewrite it into a different product.
+   Expose an authenticated versioned adapter/API for new integrations without
+   dropping legacy routes.
+2. `hub-worker` (logical module, not automatically a new resident service):
+   add typed, serialized, audited per-router operations with staging,
+   snapshots, apply/verify/rollback and concurrency limits **around existing HUB
+   commands**. Preserve their semantics. Only split into an optional separate
+   process/container when compatibility and resource tests justify it.
 3. `telegram-bot` (disabled by default): separate optional container, polls
    Telegram only when enabled; strict user ID AND chat ID allowlist, scoped roles,
    confirmation for risky operations, rate limit and no secrets in notifications.
