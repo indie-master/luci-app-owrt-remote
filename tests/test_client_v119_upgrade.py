@@ -10,6 +10,15 @@ FORK_SOURCE = "https://raw.githubusercontent.com/indie-master/luci-app-owrt-remo
 
 
 class ClientV119UpgradeTests(unittest.TestCase):
+    def test_pilot_installer_supports_no_core_or_wol_changes(self):
+        installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+        wol_block = installer.split("ensure_wol_support() {", 1)[1].split("install_xray_runtime() {", 1)[0]
+        xray_block = installer.split("install_xray_runtime() {", 1)[1].split("# Abort before changing any installed component", 1)[0]
+        self.assertIn('OWRT_REMOTE_SKIP_WOL_PACKAGES:-0', wol_block)
+        self.assertIn('OWRT_REMOTE_SKIP_XRAY_PREPARE:-0', xray_block)
+        self.assertIn('return 0', xray_block)
+        self.assertIn('return 0', wol_block)
+
     def test_fork_installer_provenance_and_client_xray_version(self):
         installer = (ROOT / "install.sh").read_text()
         agent = (ROOT / "files/usr/sbin/owrt-remote").read_text()
