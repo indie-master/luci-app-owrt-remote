@@ -4744,7 +4744,7 @@ def active_ssh_http_sessions(router_id=None):
 
 
 def maybe_restart_vps_xray_after_wan_reconnect(router_id):
-    if str(os.environ.get("OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT", "1")).lower() in {"0", "no", "false", "off"}:
+    if str(os.environ.get("OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT", "0")).lower() in {"0", "no", "false", "off"}:
         return {"skipped": "disabled"}
     active_sessions = active_ssh_http_sessions(router_id)
     if active_sessions:
