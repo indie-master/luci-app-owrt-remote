@@ -71,7 +71,7 @@ except Exception:
 
 
 APP_NAME = "OpenWrt Remote Hub"
-RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main").rstrip("/")
+RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119").rstrip("/")
 APP_DIR = Path(__file__).resolve().parent
 
 
@@ -111,7 +111,7 @@ ACME_WEBROOT = STATE_DIR / "acme-webroot"
 # Heartbeats normally arrive every 30 seconds. A short WAN/Xray rebind can
 # take longer than the old 75-second window while the reverse tunnel remains usable.
 ONLINE_AFTER_SECONDS = max(75, int(os.environ.get("OWRT_REMOTE_ONLINE_AFTER", "180")))
-DEFAULT_VLESS_PORT = int(os.environ.get("OWRT_REMOTE_VLESS_PORT", "8443"))
+DEFAULT_VLESS_PORT = int(os.environ.get("OWRT_REMOTE_VLESS_PORT", "18443"))
 REQUEST_QUEUE_SIZE = int(os.environ.get("OWRT_REMOTE_REQUEST_QUEUE_SIZE", "128"))
 ROUTER_PROXY_LIMIT = max(1, int(os.environ.get("OWRT_REMOTE_ROUTER_PROXY_LIMIT", "4")))
 PROXY_TIMEOUT = float(os.environ.get("OWRT_REMOTE_PROXY_TIMEOUT", "25"))
@@ -3589,6 +3589,10 @@ def init_db(conn):
     ensure_column(conn, "routers", "ssh_host", "text not null default '127.0.0.1'")
     ensure_column(conn, "routers", "ssh_port", "integer not null default 22")
     ensure_column(conn, "routers", "notes", "text not null default ''")
+    # Existing router records are always legacy TCP; new records default to WSS.
+    ensure_column(conn, "routers", "vps_transport", "text not null default 'tcp'")
+    # Temporary TCP fallback for planned WSS migration; disabled for all existing rows.
+    ensure_column(conn, "routers", "vps_allow_legacy", "integer not null default 0")
     conn.execute(
         """
         update routers
@@ -4083,6 +4087,19 @@ def upsert_router(conn, values):
             return int(current[key] or default)
         return default
 
+    # A missing value means preserve existing transport; use WSS for new records.
+    transport = str(values.get("vps_transport") or (current["vps_transport"] if current else "ws")).strip().lower()
+    if transport not in ("tcp", "ws"):
+        raise ValueError("vps_transport must be tcp or ws")
+    port_value = values.get("vless_port")
+    if port_value in (None, ""):
+        if current and transport == current["vps_transport"]:
+            port_value = current["vless_port"]
+        else:
+            port_value = 443 if transport == "ws" else DEFAULT_VLESS_PORT
+    port_value = int(port_value)
+    if not 1 <= port_value <= 65535:
+        raise ValueError("Invalid VLESS port")
     reverse_tag = keep_str("reverse_tag", "reverse-in")
     ssh_vless_uuid = values.get("ssh_vless_uuid") or (current["ssh_vless_uuid"] if current and current["ssh_vless_uuid"] else str(uuid.uuid4()))
     ssh_reverse_tag = values.get("ssh_reverse_tag") or (current["ssh_reverse_tag"] if current and current["ssh_reverse_tag"] else f"{reverse_tag}-ssh")
@@ -4104,7 +4121,9 @@ def upsert_router(conn, values):
         "group_id": clean_router_group_id(keep_str("group_id", "")),
         "entry_port": keep_int("entry_port", 0),
         "vps_host": keep_str("vps_host", ""),
-        "vless_port": keep_int("vless_port", DEFAULT_VLESS_PORT),
+        "vless_port": port_value,
+        "vps_transport": transport,
+        "vps_allow_legacy": int(current["vps_allow_legacy"] or 0) if current else 0,
         "vless_uuid": keep_str("vless_uuid", str(uuid.uuid4())),
         "vless_encryption": keep_str("vless_encryption", "none"),
         "vless_decryption": keep_str("vless_decryption", "none"),
@@ -4137,6 +4156,8 @@ def upsert_router(conn, values):
                 entry_port = :entry_port,
                 vps_host = :vps_host,
                 vless_port = :vless_port,
+                vps_transport = :vps_transport,
+                vps_allow_legacy = :vps_allow_legacy,
                 vless_uuid = :vless_uuid,
                 vless_encryption = :vless_encryption,
                 vless_decryption = :vless_decryption,
@@ -4162,13 +4183,13 @@ def upsert_router(conn, values):
         conn.execute(
             """
             insert into routers (
-                id, name, role, group_id, entry_port, vps_host, vless_port, vless_uuid,
+                id, name, role, group_id, entry_port, vps_host, vless_port, vps_transport, vps_allow_legacy, vless_uuid,
                 vless_encryption, vless_decryption, vless_flow, reverse_tag,
                 public_url, admin_host, admin_port, ssh_entry_port, ssh_vless_uuid,
                 ssh_reverse_tag, ssh_host, ssh_port, notes,
                 created_at, updated_at, deleted_at
             ) values (
-                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vless_uuid,
+                :id, :name, :role, :group_id, :entry_port, :vps_host, :vless_port, :vps_transport, :vps_allow_legacy, :vless_uuid,
                 :vless_encryption, :vless_decryption, :vless_flow, :reverse_tag,
                 :public_url, :admin_host, :admin_port, :ssh_entry_port, :ssh_vless_uuid,
                 :ssh_reverse_tag, :ssh_host, :ssh_port, :notes,
@@ -4206,6 +4227,7 @@ def heartbeat(conn, payload):
                 "id": router_id,
                 "name": payload.get("name") or router_id,
                 "role": payload.get("role") or "node",
+                "vps_transport": "tcp",  # Unknown heartbeat clients remain legacy.
                 "entry_port": payload.get("entry_port") or 0,
                 "vps_host": payload.get("vps_host") or "",
                 "admin_host": payload.get("admin_host") or "127.0.0.1",
@@ -4376,6 +4398,7 @@ def delete_router_note_entry(conn, router_id, note_id):
 
 def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLESS_PORT, decryption="none"):
     clients = []
+    ws_clients = []
     inbounds = [
         {
             "tag": "owrt-remote-vless",
@@ -4392,6 +4415,19 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
             },
         }
     ]
+    # Nginx terminates TLS on :443, then proxies /owrt-ws/ to localhost.
+    inbounds.append({
+        "tag": "owrt-remote-wss",
+        "listen": "127.0.0.1",
+        "port": 18444,
+        "protocol": "vless",
+        "settings": {"clients": ws_clients, "decryption": decryption},
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": "/owrt-ws/"},
+        },
+    })
     rules = []
 
     for row in rows:
@@ -4403,6 +4439,7 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
         reverse_out = f"reverse-{router_id}"
         ssh_reverse_out = f"{reverse_out}-ssh"
         portal_in = f"entry-{router_id}"
+        transport_clients = ws_clients if row_str_value(row, "vps_transport", "tcp") == "ws" else clients
         client = {
             "id": row["vless_uuid"],
             "email": f"{router_id}@owrt-remote",
@@ -4412,7 +4449,10 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
         }
         if row["vless_flow"]:
             client["flow"] = row["vless_flow"]
-        clients.append(client)
+        transport_clients.append(client)
+        if transport_clients is ws_clients and row_int_value(row, "vps_allow_legacy", 0):
+            # During migration, leave the old TCP authentication available.
+            clients.append(client)
         if ssh_entry_port > 0:
             ssh_client = {
                 "id": row["ssh_vless_uuid"],
@@ -4423,7 +4463,9 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
             }
             if row["vless_flow"]:
                 ssh_client["flow"] = row["vless_flow"]
-            clients.append(ssh_client)
+            transport_clients.append(ssh_client)
+            if transport_clients is ws_clients and row_int_value(row, "vps_allow_legacy", 0):
+                clients.append(ssh_client)
         inbounds.append(
             {
                 "tag": portal_in,
@@ -4479,6 +4521,28 @@ def make_server_xray_config(rows, listen_host="0.0.0.0", listen_port=DEFAULT_VLE
 def make_router_xray_config(row):
     bridge_tag = row["reverse_tag"]
     ssh_bridge_tag = row["ssh_reverse_tag"] or f"{bridge_tag}-ssh"
+    transport = row_str_value(row, "vps_transport", "tcp")
+    sni = (vps_host_name(os.environ.get("OWRT_REMOTE_PUBLIC_URL", ""))
+           or vps_host_name(row_str_value(row, "public_url", ""))
+           or row_str_value(row, "vps_host", ""))
+    stream = ({"network": "ws", "security": "tls",
+               "tlsSettings": {"serverName": sni, "allowInsecure": False, "alpn": ["http/1.1"]},
+               "wsSettings": {"path": "/owrt-ws/", "host": sni}}
+              if transport == "ws" else {"network": "tcp", "security": "none"})
+    admin_settings = {"redirect": f"{row['admin_host']}:{int(row['admin_port'])}"}
+    ssh_settings = {"redirect": f"{row['ssh_host'] or '127.0.0.1'}:{int(row['ssh_port'] or 22)}"}
+    if transport == "ws":
+        # WSS is intended for modern Xray; allow only the two redirect ports.
+        def local_allow(host, port):
+            rule = {"action": "allow", "network": "tcp", "port": str(int(port))}
+            try:
+                address = ipaddress.ip_address(host)
+                rule["ip"] = [str(address) + ("/32" if address.version == 4 else "/128")]
+            except ValueError:
+                pass  # The outbound redirect still fixes the destination.
+            return [rule]
+        admin_settings["finalRules"] = local_allow(row["admin_host"], row["admin_port"])
+        ssh_settings["finalRules"] = local_allow(row["ssh_host"] or "127.0.0.1", row["ssh_port"] or 22)
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [],
@@ -4487,14 +4551,14 @@ def make_router_xray_config(row):
                 "tag": "router-admin",
                 "protocol": "freedom",
                 "settings": {
-                    "redirect": f"{row['admin_host']}:{int(row['admin_port'])}",
+                    **admin_settings,
                 },
             },
             {
                 "tag": "router-ssh",
                 "protocol": "freedom",
                 "settings": {
-                    "redirect": f"{row['ssh_host'] or '127.0.0.1'}:{int(row['ssh_port'] or 22)}",
+                    **ssh_settings,
                 },
             },
             {
@@ -4508,7 +4572,7 @@ def make_router_xray_config(row):
                     "flow": row["vless_flow"],
                     "reverse": {"tag": bridge_tag},
                 },
-                "streamSettings": {"network": "tcp", "security": "none"},
+                "streamSettings": stream,
             },
             {
                 "tag": "vps-ssh-interconn",
@@ -4521,7 +4585,7 @@ def make_router_xray_config(row):
                     "flow": row["vless_flow"],
                     "reverse": {"tag": ssh_bridge_tag},
                 },
-                "streamSettings": {"network": "tcp", "security": "none"},
+                "streamSettings": stream,
             },
         ],
         "routing": {
@@ -4542,33 +4606,112 @@ def make_router_xray_config(row):
     }
 
 
+_XRAY_RELOAD_LOCK = threading.RLock()
+_XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"
+
+
+def assert_xray_mutation_allowed():
+    """Fail closed during a guarded Hub upgrade without touching Xray service."""
+    if _XRAY_MAINTENANCE_HOLD.exists():
+        raise RuntimeError(
+            "Xray restart/reload is locked during a guarded Hub upgrade; "
+            "verify all reverse tunnels before removing the maintenance hold."
+        )
+
+
+
 def reload_vps_xray(db_path=DB_PATH):
+    """Validate a private candidate, retain a backup and roll back failed restarts."""
+    assert_xray_mutation_allowed()
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
-    with connect(db_path) as conn:
-        init_db(conn)
-        rows = list_router_rows(conn)
-    config = make_server_xray_config(rows)
-    atomic_write_text(out, json.dumps(config, ensure_ascii=False, indent=2) + "\n", mode=0o600)
-    try:
-        os.chmod(out, 0o600)
-    except OSError:
-        pass
-    result = subprocess.run(
-        ["systemctl", "restart", service],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=20,
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"systemctl restart {service} failed: {detail}")
-    return {"config": str(out), "service": service, "routers": len(rows)}
+    binary = os.environ.get("OWRT_REMOTE_XRAY_BIN", "/usr/local/bin/xray")
+    with _XRAY_RELOAD_LOCK:
+        # Never move an already-running legacy listener when regenerating Xray.
+        legacy_port = DEFAULT_VLESS_PORT
+        legacy_listen = "0.0.0.0"
+        if out.exists():
+            existing = json.loads(out.read_text(encoding="utf-8"))
+            legacy_inbound = next((item for item in existing.get("inbounds", [])
+                                   if item.get("tag") == "owrt-remote-vless"), None)
+            if legacy_inbound is None:
+                raise RuntimeError("Existing legacy inbound not found; refusing to overwrite Xray config")
+            legacy_port = int(legacy_inbound["port"])
+            legacy_listen = legacy_inbound.get("listen", "0.0.0.0")
+        with connect(db_path) as conn:
+            init_db(conn)
+            rows = list_router_rows(conn)
+        config = make_server_xray_config(rows, listen_host=legacy_listen, listen_port=legacy_port)
+        text = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        data = text.encode("utf-8")
+        # Semantically identical JSON must not force a disconnect merely
+        # because the existing file uses different whitespace/key ordering.
+        # Keep all list ordering intact (Xray routing rules are ordered).
+        if out.exists() and json.loads(out.read_text(encoding="utf-8")) == config:
+            return {"config": str(out), "service": service, "routers": len(rows), "unchanged": True}
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fd, candidate_name = tempfile.mkstemp(prefix=".owrt-xray-", suffix=".json", dir=str(out.parent))
+        candidate = Path(candidate_name)
+        previous = out.read_bytes() if out.exists() else None
+        backup = None
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            check = subprocess.run(
+                [binary, "run", "-test", "-config", str(candidate)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                timeout=25, check=False,
+            )
+            if check.returncode:
+                raise RuntimeError("Xray candidate validation failed: " + (check.stderr or check.stdout)[-1500:])
+            if previous is not None:
+                archive = out.parent / "owrt-remote-backups"
+                archive.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(archive, 0o700)
+                backup = archive / ("owrt-remote-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".json")
+                atomic_write_text(backup, previous.decode("utf-8"), mode=0o600)
+            atomic_write_text(out, text, mode=0o600)
+
+            def restart_and_check():
+                result = subprocess.run(
+                    ["systemctl", "restart", service],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=25, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError("systemctl restart failed: " + (result.stderr or result.stdout)[-1000:])
+                # systemd can report 'active' before Xray has bound its sockets.
+                for attempt in range(15):
+                    status = subprocess.run(["systemctl", "is-active", "--quiet", service],
+                                            timeout=5, check=False)
+                    if status.returncode == 0:
+                        try:
+                            with socket.create_connection(("127.0.0.1", int(config["inbounds"][0]["port"])), timeout=1):
+                                with socket.create_connection(("127.0.0.1", 18444), timeout=1):
+                                    return
+                        except OSError:
+                            pass
+                    time.sleep(1)
+                raise RuntimeError("Xray did not open both reverse inbounds")
+
+            try:
+                restart_and_check()
+            except Exception as exc:
+                if previous is not None:
+                    atomic_write_text(out, previous.decode("utf-8"), mode=0o600)
+                    recovery = subprocess.run(["systemctl", "restart", service],
+                                              timeout=25, text=True, capture_output=True, check=False)
+                    if recovery.returncode:
+                        raise RuntimeError(f"Xray reload failed ({exc}); rollback restart also failed: {recovery.stderr}") from exc
+                raise RuntimeError(f"Xray reload failed; previous config restored: {exc}") from exc
+        finally:
+            candidate.unlink(missing_ok=True)
+    return {"config": str(out), "service": service, "routers": len(rows),
+            "backup": str(backup) if backup else "", "unchanged": False}
 
 
 def restart_vps_xray():
+    assert_xray_mutation_allowed()
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
     result = subprocess.run(
         ["systemctl", "restart", service],
@@ -4601,7 +4744,7 @@ def active_ssh_http_sessions(router_id=None):
 
 
 def maybe_restart_vps_xray_after_wan_reconnect(router_id):
-    if str(os.environ.get("OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT", "1")).lower() in {"0", "no", "false", "off"}:
+    if str(os.environ.get("OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT", "0")).lower() in {"0", "no", "false", "off"}:
         return {"skipped": "disabled"}
     active_sessions = active_ssh_http_sessions(router_id)
     if active_sessions:
@@ -4644,6 +4787,9 @@ def build_openwrt_config_payload(row, hub_url, vps_host_override="", public_url_
         "vps_host": effective_vps_host,
         "vps_host_mode": router_reported_connection(row, legacy_mode="manual")[0],
         "vps_port": row_int_value(row, "vless_port", DEFAULT_VLESS_PORT),
+        "vps_transport": row_str_value(row, "vps_transport", "tcp"),
+        "vps_sni": vps_host_name(hub_url) or effective_vps_host,
+        "vps_ws_path": "/owrt-ws/",
         "vless_uuid": row_str_value(row, "vless_uuid"),
         "vless_encryption": row_str_value(row, "vless_encryption", "none"),
         "vless_flow": row_str_value(row, "vless_flow", ""),
@@ -4667,6 +4813,7 @@ def build_openwrt_config_lines(payload, mode="manual"):
     lines = [
         "owrt_saved_host=\"$(uci -q get owrtremote.main.vps_host 2>/dev/null || true)\"",
         "owrt_saved_mode=\"$(uci -q get owrtremote.main.vps_host_mode 2>/dev/null || echo manual)\"",
+        "owrt_saved_xray_bin=\"$(uci -q get owrtremote.main.xray_bin 2>/dev/null || true)\"",
         "uci -q get owrtremote.main >/dev/null 2>&1 || uci set owrtremote.main=remote",
         "uci set owrtremote.main.enabled='1'",
         f"uci set owrtremote.main.router_id='{sh_quote(payload['id'])}'",
@@ -4675,7 +4822,9 @@ def build_openwrt_config_lines(payload, mode="manual"):
         f"uci set owrtremote.main.hub_url='{sh_quote(payload['hub_url'])}'",
         f"uci set owrtremote.main.hub_token='{sh_quote(agent_token())}'",
         "uci set owrtremote.main.heartbeat_interval='30'",
-        "uci set owrtremote.main.xray_bin='/usr/bin/xray'",
+        "if [ -z \"$owrt_saved_xray_bin\" ]; then",
+        "  uci set owrtremote.main.xray_bin='/usr/bin/xray'",
+        "fi",
         "uci set owrtremote.main.xray_config='/etc/xray/owrt-remote-client.json'",
         "if [ \"$owrt_saved_mode\" = auto ] || [ -z \"$owrt_saved_host\" ]; then",
         f"  uci set owrtremote.main.vps_host='{sh_quote(payload['vps_host'])}'",
@@ -4684,6 +4833,9 @@ def build_openwrt_config_lines(payload, mode="manual"):
         "  uci set owrtremote.main.vps_host_mode='manual'",
         "fi",
         f"uci set owrtremote.main.vps_port='{payload['vps_port']}'",
+        f"uci set owrtremote.main.vps_transport='{sh_quote(payload['vps_transport'])}'",
+        f"uci set owrtremote.main.vps_sni='{sh_quote(payload['vps_sni'])}'",
+        f"uci set owrtremote.main.vps_ws_path='{sh_quote(payload['vps_ws_path'])}'",
         f"uci set owrtremote.main.vless_uuid='{sh_quote(payload['vless_uuid'])}'",
         f"uci set owrtremote.main.vless_encryption='{sh_quote(payload['vless_encryption'])}'",
         f"uci set owrtremote.main.vless_flow='{sh_quote(payload['vless_flow'])}'",
@@ -5547,6 +5699,10 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <select name="group_id" id="routerGroupInput"><option value="">Без группы</option></select>
     <input name="entry_port" placeholder="18080" inputmode="numeric" required>
     <input name="vps_host" placeholder="VPS IP/domain" required>
+    <select name="vps_transport" aria-label="Транспорт Xray">
+      <option value="ws" selected>WSS / TLS · 443 (новые роутеры)</option>
+      <option value="tcp">TCP · 18443 (legacy)</option>
+    </select>
     <button class="primary">Добавить</button>
   </form>
   <div id="routerMsg" class="formMsg" hidden></div>
@@ -8012,6 +8168,7 @@ function render(list) {{
       renderModelMetric(model, modelGetsLegendBadge(model)),
       metric('Система', release),
       metric('Xray', statusRu(xray)),
+      metric('Транспорт', r.vps_transport === 'ws' ? (Number(r.vps_allow_legacy || 0) ? 'WSS/TLS · 443 + TCP (временный fallback)' : 'WSS/TLS · 443') : 'TCP · ' + (r.vless_port || 18443)),
       metric('SSH', statusRu(ssh)),
       metric('В сети уже', uptime),
       metric('Был на связи', ago(r.last_seen_iso)),
@@ -8894,7 +9051,10 @@ routerForm.addEventListener('submit', async (ev) => {{
     syncOwnerChrome();
     await loadRouters();
     fillRouterForm(true);
-    showRouterMsg('Роутер добавлен. Теперь открой OpenWrt config в его карточке и вставь команды на роутер.');
+    showRouterMsg(data.xray && data.xray.error
+      ? 'Роутер добавлен, но Xray не синхронизирован: ' + data.xray.error
+      : 'Роутер зарегистрирован в Xray. Открой OpenWrt config в карточке и вставь команды на роутер.',
+      Boolean(data.xray && data.xray.error));
   }} else {{
     showRouterMsg(await res.text(), true);
   }}
@@ -19445,6 +19605,10 @@ exit 127
                 payload = self.read_payload()
                 router_id = clean_router_id(payload.get("id"))
                 payload["group_id"] = clean_router_group_id(payload.get("group_id"))
+                payload["vps_transport"] = str(payload.get("vps_transport") or "ws").strip().lower()
+                if payload["vps_transport"] not in ("ws", "tcp"):
+                    raise ValueError("Недопустимый транспорт Xray")
+                payload["vless_port"] = 443 if payload["vps_transport"] == "ws" else DEFAULT_VLESS_PORT
                 entry_port = int(payload.get("entry_port") or 0)
                 ssh_entry_port = int(payload.get("ssh_entry_port") or (entry_port + 1000))
                 if entry_port <= 0:
@@ -19480,7 +19644,15 @@ exit 127
                     router = row_to_router(row)
                 if current and not current.get("is_owner"):
                     grant_delegated_router_flag(load_auth(), current.get("username", ""), router_id, "G")
-                self.send_json(200, {"ok": True, "router": router, "auth": self.build_auth_meta()})
+                # Register new reverse UUIDs and entry/SSH inbounds immediately.
+                # An Xray failure never deletes a successfully registered router.
+                try:
+                    xray_sync = reload_vps_xray(self.app.db_path)
+                except Exception as exc:
+                    self.log_message("new router xray sync failed: %s", exc)
+                    xray_sync = {"error": str(exc)}
+                self.send_json(200, {"ok": True, "router": router,
+                                     "xray": xray_sync, "auth": self.build_auth_meta()})
             except Exception as exc:
                 self.send_text(400, str(exc))
             return
@@ -20167,6 +20339,7 @@ def cmd_add_router(args):
                 "entry_port": args.entry_port,
                 "vps_host": args.vps_host,
                 "vless_port": args.vless_port,
+                "vps_transport": args.vps_transport,
                 "vless_uuid": args.vless_uuid,
                 "vless_encryption": args.vless_encryption,
                 "vless_decryption": args.vless_decryption,
@@ -20184,6 +20357,68 @@ def cmd_add_router(args):
         )
     router = row_to_router(row)
     print(json.dumps(router, ensure_ascii=False, indent=2))
+
+
+def cmd_set_router_transport(args):
+    """Staged TCP -> WSS migration, preserving UUIDs and reverse endpoints."""
+    if not args.sync_xray:
+        raise SystemExit("Transport migration requires --sync-xray; database-only changes are unsafe.")
+    if sum(bool(v) for v in (args.stage, args.finalize, args.direct)) > 1:
+        raise SystemExit("--stage, --finalize and --direct are mutually exclusive")
+    with connect(args.db) as conn:
+        init_db(conn)
+        row = get_router(conn, args.id)
+        if not row or router_deleted(row):
+            raise SystemExit("router not found")
+        old_transport = row_str_value(row, "vps_transport", "tcp")
+        old_port = int(row["vless_port"])
+        old_allow = int(row["vps_allow_legacy"] or 0)
+        new_port = 443 if args.transport == "ws" else DEFAULT_VLESS_PORT
+        if args.stage:
+            if args.transport != "ws" or old_transport != "tcp":
+                raise SystemExit("--stage requires an existing TCP router and --transport ws")
+            allow_legacy = 1
+        elif args.finalize:
+            if args.transport != "ws" or old_transport != "ws" or old_allow != 1:
+                raise SystemExit("--finalize requires a staged WSS router")
+            allow_legacy = 0
+        elif args.direct:
+            if args.transport != "ws" or old_transport != "tcp":
+                raise SystemExit("--direct is only for a router already connected via WSS, with the DB still marked TCP")
+            allow_legacy = 0
+        elif args.transport == "ws" and old_transport == "tcp":
+            raise SystemExit("Refusing abrupt TCP -> WSS migration. Use --stage, then --finalize after live verification.")
+        else:
+            # Return to TCP (rollback), or keep the current non-staged transport.
+            allow_legacy = 0
+        if (args.transport, new_port, allow_legacy) == (old_transport, old_port, old_allow):
+            print(json.dumps({"router_id": row["id"], "unchanged": True}))
+            return
+        router_id = row["id"]
+        conn.execute(
+            "update routers set vps_transport=?, vless_port=?, vps_allow_legacy=?, updated_at=? where id=?",
+            (args.transport, new_port, allow_legacy, now_ts(), router_id),
+        )
+        conn.commit()
+    try:
+        xray_result = reload_vps_xray(args.db)
+    except Exception:
+        with connect(args.db) as conn:
+            init_db(conn)
+            conn.execute(
+                "update routers set vps_transport=?, vless_port=?, vps_allow_legacy=?, updated_at=? where id=?",
+                (old_transport, old_port, old_allow, now_ts(), router_id),
+            )
+            conn.commit()
+        raise
+    print(json.dumps({
+        "router_id": router_id,
+        "transport": args.transport,
+        "vless_port": new_port,
+        "tcp_fallback_enabled": bool(allow_legacy),
+        "xray": xray_result,
+    }, ensure_ascii=False, indent=2))
+
 
 
 def cmd_set_entry_port(args):
@@ -20407,7 +20642,8 @@ def parser():
     add.add_argument("--role", default="node")
     add.add_argument("--entry-port", type=int, required=True)
     add.add_argument("--vps-host", required=True)
-    add.add_argument("--vless-port", type=int, default=DEFAULT_VLESS_PORT)
+    add.add_argument("--vless-port", type=int, default=None)
+    add.add_argument("--vps-transport", choices=("tcp", "ws"), default=None)
     add.add_argument("--vless-uuid", default="")
     add.add_argument("--vless-encryption", default="none")
     add.add_argument("--vless-decryption", default="none")
@@ -20422,6 +20658,15 @@ def parser():
     add.add_argument("--ssh-host", default="127.0.0.1")
     add.add_argument("--ssh-port", type=int, default=22)
     add.set_defaults(func=cmd_add_router)
+
+    transport = sub.add_parser("set-router-transport", help="migrate a router between legacy TCP and WSS without changing UUIDs")
+    transport.add_argument("--id", required=True)
+    transport.add_argument("--transport", choices=("tcp", "ws"), required=True)
+    transport.add_argument("--sync-xray", action="store_true", help="required: validate and reload VPS Xray")
+    transport.add_argument("--stage", action="store_true", help="enable WS while retaining TCP auth until verification")
+    transport.add_argument("--finalize", action="store_true", help="remove temporary TCP auth after successful WSS verification")
+    transport.add_argument("--direct", action="store_true", help="only if router already uses WSS but legacy DB records TCP")
+    transport.set_defaults(func=cmd_set_router_transport)
 
     sep = sub.add_parser("set-entry-port", help="set router VPS entry port without changing UUID")
     sep.add_argument("--id", required=True)

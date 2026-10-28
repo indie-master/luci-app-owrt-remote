@@ -3,7 +3,7 @@ set -u
 
 APP_NAME="OpenWrt Remote Hub"
 INSTALLER_VERSION="2026-08-17-https-bootstrap-v1"
-RAW_BASE="${RAW_URL:-https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main}"
+RAW_BASE="${RAW_URL:-https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119}"
 XRAY_INSTALL_SCRIPT_URL="${XRAY_INSTALL_SCRIPT_URL:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}"
 STATE_DIR="${OWRT_REMOTE_STATE_DIR:-/var/lib/owrt-remote}"
 HUB_LOGIN="${HUB_LOGIN:-admin}"
@@ -279,6 +279,14 @@ print_result() {
 }
 
 main() {
+	# This is a fresh-install script, NOT a safe in-place Hub upgrader.
+	# An accidental reinstall could replace service units, install a new
+	# core or reset login. Refuse production installations by default.
+	if [ -s /opt/owrt-remote/owrt-remote-hub.py ] || [ -s "$STATE_DIR/hub.db" ]; then
+		if [ "${OWRT_REMOTE_ALLOW_REINSTALL:-0}" != 1 ]; then
+			die "Существующий HUB обнаружен. install-vps.sh не предназначен для безопасного обновления: используйте staged Hub upgrade. Для сознательной переустановки требуется OWRT_REMOTE_ALLOW_REINSTALL=1."
+		fi
+	fi
 	info "Ставлю $APP_NAME..."
 	info "Installer: $INSTALLER_VERSION"
 	install_packages

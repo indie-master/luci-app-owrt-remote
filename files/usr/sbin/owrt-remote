@@ -580,8 +580,24 @@ validate_xray_config() {
 	fi
 }
 
+# Xray 26.5+ changed Freedom's default policy for reverse connections.
+# Older binaries keep the proven legacy config, while 26.5+ must receive
+# explicit scoped finalRules for LuCI and SSH on BOTH TCP and WSS.
+xray_reverse_finalrules_required() {
+	local binary first version major minor
+	binary="$(xray_bin_path)"
+	[ -x "$binary" ] || return 1
+	first="$("$binary" version 2>/dev/null | sed -n '1p')" || return 1
+	version="$(printf '%s\n' "$first" | sed -n 's/^Xray \([0-9][0-9]*\)\.\([0-9][0-9]*\)\..*/\1 \2/p')"
+	[ -n "$version" ] || return 1
+	set -- $version
+	major="$1"
+	minor="$2"
+	[ "$major" -gt 26 ] || { [ "$major" -eq 26 ] && [ "$minor" -ge 5 ]; }
+}
+
 render_client_config() (
-	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir
+	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir vps_transport vps_sni vps_ws_path stream_fields admin_rules ssh_rules
 	temp_dir=""
 	out=""
 	trap 'rm -f "$out"; [ -z "$temp_dir" ] || rmdir "$temp_dir" 2>/dev/null || true' EXIT
@@ -594,6 +610,9 @@ render_client_config() (
 
 	router_id="$(safe_id "$(uci_get router_id main)")"
 	vps_host="$(uci_get vps_host '')"
+	vps_transport="$(uci_get vps_transport tcp)"
+	vps_sni="$(uci_get vps_sni "$vps_host")"
+	vps_ws_path="$(uci_get vps_ws_path /owrt-ws/)"
 	local wan_sockopt wan_xray_device
 	wan_sockopt=''
 	if truthy "$(uci_get wan_direct 0)"; then
@@ -632,6 +651,25 @@ render_client_config() (
 		fi
 	done
 	case "$vps_host" in *://*|*/*) die "vps_host должен содержать IP или домен без http(s):// и пути" ;; esac
+	case "$vps_transport" in tcp|ws) ;; *) die "vps_transport должен быть tcp или ws" ;; esac
+	stream_fields='"network": "tcp", "security": "none"'
+	admin_rules=''
+	ssh_rules=''
+	if [ "$vps_transport" = ws ]; then
+		[ -n "$vps_sni" ] || die "WSS требует vps_sni"
+		case "$vps_sni" in *://*|*/*|*[!a-zA-Z0-9._-]*) die "Некорректный vps_sni" ;; esac
+		case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
+		stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
+	fi
+	if [ "$vps_transport" = ws ] || xray_reverse_finalrules_required; then
+		# Modern Xray blocks reverse-originated Freedom requests by default.
+		# Scope access to the exact LuCI/SSH redirect ports, on both transports.
+		admin_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"port\":\"$admin_port\"}]"
+		ssh_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"port\":\"$ssh_port\"}]"
+		case "$admin_host" in *[!0-9.]*|'') ;; *) admin_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"ip\":[\"$admin_host/32\"],\"port\":\"$admin_port\"}]" ;; esac
+		case "$ssh_host" in *[!0-9.]*|'') ;; *) ssh_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"ip\":[\"$ssh_host/32\"],\"port\":\"$ssh_port\"}]" ;; esac
+	fi
+	stream_fields="$stream_fields$wan_sockopt"
 
 	if [ "$stdout" = "1" ]; then
 		xray_config_dir="${TMPDIR:-/tmp}"
@@ -656,14 +694,14 @@ render_client_config() (
       "tag": "router-admin",
       "protocol": "freedom",
       "settings": {
-        "redirect": "$(json_escape "$admin_host"):$admin_port"
+        "redirect": "$(json_escape "$admin_host"):$admin_port"$admin_rules
       }
     },
     {
       "tag": "router-ssh",
       "protocol": "freedom",
       "settings": {
-        "redirect": "$(json_escape "$ssh_host"):$ssh_port"
+        "redirect": "$(json_escape "$ssh_host"):$ssh_port"$ssh_rules
       }
     },
     {
@@ -680,8 +718,7 @@ render_client_config() (
         }
       },
       "streamSettings": {
-        "network": "tcp",
-        "security": "none"$wan_sockopt
+        $stream_fields
       }
     },
     {
@@ -698,8 +735,7 @@ render_client_config() (
         }
       },
       "streamSettings": {
-        "network": "tcp",
-        "security": "none"$wan_sockopt
+        $stream_fields
       }
     }
   ],

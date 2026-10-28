@@ -1,0 +1,89 @@
+name: WSS reverse compatibility
+on:
+  push:
+    branches:
+      - feature/wss-reverse-v119
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  wss-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Python and BusyBox/POSIX shell syntax
+        run: |
+          python3 -m py_compile vps/owrt-remote-hub.py
+          sh -n files/usr/sbin/owrt-remote
+          sh -n install.sh
+          sh -n vps/install-vps.sh
+          sh -n files/www/cgi-bin/owrt-remote
+      - name: Run WSS backwards-compatibility tests
+        run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Test original v119 client upgrade without TCP config changes
+        run: python3 -m unittest discover -s tests -p 'test_client_v119_upgrade.py' -v
+      - name: Test isolated Belt database migration
+        run: python3 -m unittest discover -s tests -p 'test_stage_belt_wss.py' -v
+      - name: Test guarded Belt Hub-only upgrade and rollback preflight
+        run: python3 -m unittest discover -s tests -p 'test_belt_hub_upgrade.py' -v
+      - name: Check agent Xray config validation regressions
+        run: |
+          mkdir -p /tmp/owrt-test-shell
+          ln -s "$(command -v bash)" /tmp/owrt-test-shell/sh
+          PATH="/tmp/owrt-test-shell:$PATH" python3 -m unittest discover -s tests -p 'test_xray_validation.py' -v
+
+  xray-26-10-compat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify official Xray-core 26.10.21
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --connect-timeout 15 --max-time 180 \
+            'https://github.com/XTLS/Xray-core/releases/download/v26.10.21/Xray-linux-64.zip' \
+            -o "$RUNNER_TEMP/xray-26.10.21.zip"
+          echo '0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978  '"$RUNNER_TEMP/xray-26.10.21.zip" | sha256sum -c -
+          unzip -p "$RUNNER_TEMP/xray-26.10.21.zip" xray > "$RUNNER_TEMP/xray-next"
+          chmod 700 "$RUNNER_TEMP/xray-next"
+          "$RUNNER_TEMP/xray-next" version | head -n 1
+      - name: Validate old TCP and WSS + transitional dual authentication on real Xray
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/xray-next" <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import subprocess
+          import sys
+          binary = Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location("belt_staging_tests", "tests/test_stage_belt_wss.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          case = mod.BeltOfflineStageTests("test_produces_exact_working_config_without_live_changes")
+          case.setUp()
+          try:
+              cmd = [
+                  sys.executable, "tools/stage_belt_wss.py",
+                  "--db", str(case.db),
+                  "--live", str(case.live),
+                  "--hub-source", "vps/owrt-remote-hub.py",
+                  "--xray-bin", str(case.bin),
+                  "--next-xray-bin", str(binary),
+                  "--output-root", str(case.root),
+                  "--simulate-fallback",
+              ]
+              result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+              print(result.stdout)
+              if result.returncode:
+                  print(result.stderr, file=sys.stderr)
+                  sys.exit(result.returncode)
+              assert "Temporary fallback simulated: SNAPSHOT ONLY" in result.stdout
+              assert "Alternate Xray syntax check: baseline-next-core OK" in result.stdout
+              assert "Alternate Xray syntax check: fallback-next-core OK" in result.stdout
+          finally:
+              case.doCleanups()
+          PY

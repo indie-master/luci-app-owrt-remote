@@ -4,7 +4,8 @@ set -eu
 
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 
-RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/kzolotarev95/luci-app-owrt-remote/main}"
+# The v119 client is maintained in our WSS branch. An explicit RAW_URL overrides it.
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119}"
 ROOT="${ROOT:-/}"
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 
@@ -39,19 +40,25 @@ fetch() {
 }
 
 install_file() {
-	local rel mode src dst bust
+	# Stage each file beside its destination so a download failure cannot
+	# corrupt a running OpenWrt installation. Existing UCI stays untouched.
+	local rel mode src dst bust tmp
 	rel="$1"
 	mode="$2"
 	src="$SCRIPT_DIR/files/$rel"
 	dst="$(target_path "$rel")"
 	mkdir -p "$(dirname "$dst")"
+	tmp="${dst}.new.$$"
+	rm -f "$tmp"
 	if [ -f "$src" ]; then
-		cp "$src" "$dst"
+		cp "$src" "$tmp" || { rm -f "$tmp"; die "failed to stage $rel"; }
 	else
 		bust="$(date +%s 2>/dev/null || echo $$)"
-		fetch "$RAW_URL/files/$rel?v=$bust" "$dst"
+		fetch "$RAW_URL/files/$rel?v=$bust" "$tmp" || { rm -f "$tmp"; die "failed to download $rel, existing file preserved"; }
 	fi
-	chmod "$mode" "$dst"
+	[ -s "$tmp" ] || { rm -f "$tmp"; die "empty download for $rel, existing file preserved"; }
+	chmod "$mode" "$tmp" || { rm -f "$tmp"; die "chmod failed for $rel"; }
+	mv -f "$tmp" "$dst" || { rm -f "$tmp"; die "cannot install $rel"; }
 }
 
 install_config() {
@@ -71,6 +78,31 @@ install_config() {
 		fetch "$RAW_URL/files/$rel?v=$bust" "$dst"
 	fi
 	chmod 0644 "$dst"
+}
+
+# Do not replace a manually WSS-patched agent if UCI still says TCP.
+# The new agent uses UCI as the source of truth after its next restart.
+transport_preflight() {
+	local config transport existing client_config
+	[ "${ROOT%/}" = "" ] || return 0
+	command -v uci >/dev/null 2>&1 || return 0
+	config="$(uci -q get owrtremote.main.xray_config 2>/dev/null || true)"
+	[ -n "$config" ] || config=/etc/xray/owrt-remote-client.json
+	[ -s "$config" ] || return 0
+	transport="$(uci -q get owrtremote.main.vps_transport 2>/dev/null || true)"
+	existing=""
+	if command -v jq >/dev/null 2>&1; then
+		existing="$(jq -r '[.outbounds[]? | select(.tag == "vps-interconn" or .tag == "vps-ssh-interconn") | .streamSettings.network] | unique | if length == 1 then .[0] else "unknown" end' "$config" 2>/dev/null || true)"
+	else
+		# Without a JSON parser, err on the side of keeping existing WS setups intact.
+		if grep -Eq '"network"[[:space:]]*:[[:space:]]*"ws"' "$config"; then existing=ws; fi
+	fi
+	if [ "$existing" = ws ] && [ "$transport" != ws ]; then
+		die "Роутер сейчас работает через WSS, но в UCI нет vps_transport=ws. Обновление отменено; перенеси текущие WSS/TLS настройки в UCI до обновления агента."
+	fi
+	if [ "$transport" = ws ] && [ "$existing" = tcp ]; then
+		die "UCI уже настроен на WSS, но действующий Xray ещё TCP. Обновление отменено до завершения миграции."
+	fi
 }
 
 make_key() {
@@ -176,6 +208,10 @@ install_packages() {
 ensure_wol_support() {
 	local need manager tool_pkg candidate
 	[ "${ROOT%/}" = "" ] || return 0
+	if [ "${OWRT_REMOTE_SKIP_WOL_PACKAGES:-0}" = 1 ]; then
+		info "Skipping optional Wake-on-LAN package changes (pilot upgrade)."
+		return 0
+	fi
 	manager="$(package_manager)"
 	[ "$manager" != "unknown" ] || {
 		warn "не найден пакетный менеджер для установки WOL-пакетов"
@@ -208,11 +244,18 @@ ensure_wol_support() {
 install_xray_runtime() {
 	local remote_bin
 	[ "${ROOT%/}" = "" ] || return 0
+	if [ "${OWRT_REMOTE_SKIP_XRAY_PREPARE:-0}" = 1 ]; then
+		info "Keeping existing Xray executable and boot cache unchanged (pilot upgrade)."
+		return 0
+	fi
 	remote_bin="$(target_path usr/sbin/owrt-remote)"
 	[ -x "$remote_bin" ] || die "missing $remote_bin after install"
 	info "Preparing Xray and its persistent boot cache..."
 	"$remote_bin" prepare-xray || die "failed to prepare Xray"
 }
+
+# Abort before changing any installed component if transport state is unsafe.
+transport_preflight
 
 # Stop the old log writer before replacing its storage code. Its bounded legacy
 # archive is migrated by the new log service, without moving any other /tmp data.
