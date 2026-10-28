@@ -49,6 +49,28 @@ class ClientV119UpgradeTests(unittest.TestCase):
             self.assertEqual(installed, (ROOT / "files/usr/sbin/owrt-remote").read_bytes())
             self.assertIn("OpenWrt Remote установлен.", result.stdout)
 
+    def test_preflight_refuses_existing_wss_without_uci_flag(self):
+        installer = (ROOT / "install.sh").read_text()
+        segment = installer.split("transport_preflight() {", 1)[1].split("\nmake_key() {", 1)[0]
+        source = "transport_preflight() {" + segment
+        with tempfile.TemporaryDirectory(prefix="owrt-client-preflight-") as d:
+            config = Path(d) / "client.json"
+            config.write_text('{"outbounds":[{"tag":"vps-interconn","streamSettings":{"network":"ws"}}]}')
+            script = (
+                "ROOT=/\n"
+                "uci() { case \"$*\" in "
+                "'-q get owrtremote.main.xray_config') printf '%s' \"$TEST_CONFIG\" ;; "
+                "'-q get owrtremote.main.vps_transport') printf '' ;; "
+                "esac; }\n"
+                "die() { echo \"BLOCKED: $*\"; exit 55; }\n"
+                + source + "\ntransport_preflight\n"
+            )
+            result = subprocess.run(["sh", "-c", script],
+                                    env={**os.environ, "TEST_CONFIG": str(config)},
+                                    capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 55, result.stderr)
+        self.assertIn("BLOCKED", result.stdout)
+
     def test_new_install_is_tcp_safe_until_hub_provisions_wss(self):
         with tempfile.TemporaryDirectory(prefix="owrt-v119-new-client-") as d:
             root = Path(d)
