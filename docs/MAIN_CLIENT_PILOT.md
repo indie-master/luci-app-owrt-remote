@@ -380,6 +380,49 @@ client agent works after controlled activation. We must not infer live
 readiness from a successful simulation. Original installer and live Xray
 remain untouched.
 
+## Confirmation / procd supervisor lifecycle safety (development only)
+
+The synthetic transaction and procd blueprint now cover several
+**previously unsafe states**, with dedicated CI tests:
+
+- `confirm` rechecks `deadline.uptime` **under the transaction lock**
+  before recording success. Even when the watchdog has died or not yet
+  woken up, an expired deadline rejects confirmation and restores the
+  original client code.
+- A successful commit writes the `confirmed` marker, then removes
+  `armed`, and **only then** removes `pending`. If a power failure
+  occurs after either of the first two steps, boot recovery sees pending,
+  restores the original files, and removes the stale success marker.
+  Fault-injection tests simulate both interruption points.
+- Backup integrity is checked separately from the live UCI/Xray JSON
+  contents. `apply` and `confirm` still require unchanged private
+  configurations, but **rollback must not refuse to restore the agent**
+  just because an unrelated UCI change happened during the pilot.
+  The rollback never overwrites UCI or Xray JSON.
+- The test-only procd blueprint now exposes `cleanup_confirmed` as
+  an **explicit coordinator step**. It refuses a pending or armed
+  transaction and, after confirmation, invokes a mocked
+  `procd_kill ro-pilot-recovery rollback-watchdog`. The synthetic
+  integration test exercises this gate with the real test transaction.
+  It is **not wired into the live confirmation path**.
+
+### Still unresolved before approving production
+
+OpenWrt `respawn` with a finite retry limit can stop restarting a
+frequently crashing watchdog. The blueprint currently uses `respawn
+3600 2 3`, which **is not adequate as a sole fail-safe**; retries can
+be exhausted before the original deadline. An indefinitely restarting
+watchdog (`retry=0`) alone would not fix a persistent failing program
+and would also need explicit service cleanup after confirmation.
+Neither behavior has been validated on real Cudy `procd`.
+
+The eventual production flow must supervise the worker independently
+of the SSH session, preserve the fixed deadline, provide an independent
+local recovery mechanism when supervision fails, unregister the service
+after `confirm`, and validate it under abrupt connection loss,
+forced worker exits and power-cycle recovery. The existing live-mode
+lockout remains enabled, and the original v119 installer is unchanged.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
