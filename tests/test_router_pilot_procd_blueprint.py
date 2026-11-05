@@ -29,19 +29,25 @@ class ProcdRecoveryBlueprintTests(unittest.TestCase):
         )
         self.transaction.chmod(0o700)
 
-    def run_blueprint(self, *, test_mode=True, root=None, exit_code="0", boot=False):
+    def run_blueprint(self, *, test_mode=True, root=None, exit_code="0", boot=False, cleanup=False):
         # Source in a detached test shell and mock procd helper functions.
         cmd = '''
 procd_open_instance() { printf 'open %s\\n' "$*" >> "$RO_PROCD_TEST_LOG"; }
 procd_set_param() { printf 'set %s\\n' "$*" >> "$RO_PROCD_TEST_LOG"; }
 procd_close_instance() { printf 'close\\n' >> "$RO_PROCD_TEST_LOG"; }
+procd_kill() { printf 'kill %s\\n' "$*" >> "$RO_PROCD_TEST_LOG"; }
 . "$1"
 [ "$RO_TEST_BOOT" = 1 ] && RO_PILOT_BOOT=1
-start_service
+if [ "$RO_TEST_CLEANUP" = 1 ]; then
+    cleanup_confirmed
+else
+    start_service
+fi
 '''
         env = {**os.environ, "RO_PROCD_TEST_LOG": str(self.log),
                "RO_PROCD_TRANSACTION_EXIT": exit_code,
                "RO_TEST_BOOT": "1" if boot else "0",
+               "RO_TEST_CLEANUP": "1" if cleanup else "0",
                "RO_TEST_ROOT": str(root or self.root)}
         if test_mode:
             env["RO_PROCD_TEST_MODE"] = "1"
@@ -108,6 +114,28 @@ start_service
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, "")
         self.assertIn("TEST-ONLY", result.stderr)
+
+    def test_cleanup_rejected_during_active_transaction(self):
+        (self.state / "pending").touch()
+        (self.state / "armed").touch()
+        (self.state / "confirmed").touch()
+        result, calls = self.run_blueprint(cleanup=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refuse cleanup", result.stderr)
+        self.assertNotIn("kill", calls)
+
+    def test_cleanup_allowed_only_after_complete_confirmation(self):
+        (self.state / "confirmed").touch()
+        result, calls = self.run_blueprint(cleanup=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, "kill ro-pilot-recovery rollback-watchdog\n")
+
+    def test_cleanup_live_registration_is_disabled(self):
+        (self.state / "confirmed").touch()
+        result, calls = self.run_blueprint(cleanup=True, test_mode=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TEST-ONLY", result.stderr)
+        self.assertEqual(calls, "")
 
     def test_root_slash_and_relative_root_are_rejected(self):
         for bad in ("/", "relative", "/tmp/../etc"):
