@@ -31,6 +31,9 @@ class ProcdTransactionSyntheticE2ETests(unittest.TestCase):
         self.fx.setUp()
         self.addCleanup(self.fx.doCleanups)
         self.fx.prepared()
+        (self.fx.router / ".ro-pilot-synthetic-root").write_text("TEST ONLY\n")
+        (self.fx.state / "secondary-guard.sh").write_bytes(
+            (BASE / "tools/router_pilot_secondary_guard.sh").read_bytes())
         self.events = self.fx.temp / "procd-events.log"
 
     def procd(self, boot=False, cleanup=False):
@@ -105,6 +108,31 @@ fi
         p, lines=self.procd(cleanup=True)
         self.assertEqual(p.returncode,0,p.stdout+p.stderr)
         self.assertIn("kill ro-pilot-recovery rollback-watchdog",lines)
+        self.assertIn("kill ro-pilot-recovery independent-deadline-guard", lines)
+
+    def test_secondary_guard_restores_when_primary_is_crashed(self):
+        self.fx.apply(timeout=12)
+        pinned = int((self.fx.state / "deadline.uptime").read_text())
+        p, lines = self.procd(boot=False)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("open independent-deadline-guard", lines)
+        env_lines = [line[len("param env "):] for line in lines
+                     if line.startswith("param env ")]
+        cmd_lines = [line[len("param command "):] for line in lines
+                     if line.startswith("param command ")]
+        self.assertEqual(len(cmd_lines), 2)
+        self.assertEqual(len(env_lines), 2)
+        secondary_argv = shlex.split(cmd_lines[1])
+        env = dict(part.split("=", 1) for part in shlex.split(env_lines[1]))
+        env = {**os.environ, **env, "RO_TEST_NOW": str(pinned + 1)}
+        # Primary watchdog remains alive but is not the process performing
+        # this recovery; the separate command must independently roll back.
+        worker = subprocess.run(secondary_argv, env=env,
+                                capture_output=True,text=True, timeout=8)
+        self.assertEqual(worker.returncode, 0, worker.stdout + worker.stderr)
+        self.assertTrue((self.fx.state / "rolled-back").exists())
+        self.fx.restore_assertions()
+        self.assertFalse((self.fx.state / "pending").exists())
 
     def test_boot_recovery_runs_real_transaction_before_procd_registration(self):
         self.fx.apply(timeout=12)
