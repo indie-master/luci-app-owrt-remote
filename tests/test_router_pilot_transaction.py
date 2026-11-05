@@ -107,6 +107,49 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.restore_assertions()
         self.assertFalse((self.state/'pending').exists())
 
+    def test_respawn_reuses_persisted_deadline_instead_of_resetting(self):
+        self.prepared()
+        self.apply(timeout=12)
+        original_deadline=int((self.state/'deadline.uptime').read_text().strip())
+        self.assertGreater(original_deadline, 0)
+        # A fresh watchdog process after a simulated procd respawn is already
+        # beyond the original deadline. It must roll back immediately, not
+        # grant another full twelve-second interval.
+        env={**self.env, 'RO_TEST_NOW': str(original_deadline+1)}
+        before=time.monotonic()
+        r=self.run_cmd(TRANSACTION, 'watchdog', env=env, timeout=6)
+        elapsed=time.monotonic()-before
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertLess(elapsed,3.0)
+        self.assertTrue((self.state/'rolled-back').exists())
+        self.restore_assertions()
+        self.assertFalse((self.state/'pending').exists())
+
+    def test_corrupt_deadline_fails_closed_and_restores(self):
+        self.prepared()
+        self.apply(timeout=12)
+        (self.state/'deadline.uptime').write_text('invalid\n')
+        r=self.run_cmd(TRANSACTION, 'watchdog', timeout=6)
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('deadline missing or invalid',r.stderr)
+        self.assertTrue((self.state/'rolled-back').exists())
+        self.restore_assertions()
+
+    def test_confirmed_candidate_is_not_rolled_back_after_relaunch(self):
+        self.prepared()
+        self.apply(timeout=12)
+        nonce=(self.state/'confirm-nonce').read_text().strip()
+        r=self.run_cmd(TRANSACTION,'confirm',nonce)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        deadline=int((self.state/'deadline.uptime').read_text().strip())
+        r=self.run_cmd(TRANSACTION,'watchdog',timeout=6,
+                       env={**self.env,'RO_TEST_NOW':str(deadline+100)})
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        for name,_ in builder.FILES:
+            self.assertEqual((self.router/name).read_bytes(),
+                             (self.repo/'files'/name).read_bytes())
+        self.assertFalse((self.state/'pending').exists())
+
     def test_boot_recovery_works_without_network_or_hub(self):
         self.prepared()
         self.apply(timeout=12)
