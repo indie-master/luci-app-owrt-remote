@@ -74,6 +74,29 @@ attempted real service registration, never fall back to shell workers
 or print a false full-test PASS. The new hardware run must include
 both missing procd-specific PASS lines before this gate is accepted.
 
+### Cudy result: ten-file synthetic rollback PASS; real procd mode NOT established
+
+The operator's 2026-11-05 Cudy output reports `STAGED`,
+`SNAPSHOT READY`, `SUPERVISED ARM READY`,
+`SUPERVISED APPLIED ON DISK`, and successful restoration of all ten
+fake client files, with unchanged live agent/UCI/Xray hashes. The outer
+check also reports no temporary supervised service and preserved
+`heartbeat` and `xray` instances.
+
+**Important evidence gap:** the output does **not** include
+`SYNTHETIC-CYCLE: PASS - both real procd workers ready: ...` or
+`SYNTHETIC-CYCLE: PASS - temporary real procd service removed`,
+which are unconditionally emitted by the `--run-procd` branch of
+the exact pinned source script. The observed output instead matches
+`--self-test-procd` (ordinary shell workers). Therefore *do not mark*
+the full real procd + ten-file integration hardware gate as PASS.
+Require a follow-up run with an explicitly visible `--run-procd`
+command and both procd-specific PASS lines before proceeding.
+
+This discrepancy does not negate the earlier real-procd marker-only
+tests or the full ten-file synthetic rollback tests. The working
+router never had its original client updated in this rehearsal.
+
 **Combined procd/ten-file hardware rehearsal prepared:**
 `tools/openwrt_synthetic_update_cycle.sh --run-procd` creates a unique
 marked `/tmp/ro-pilot-fixture.XXXXXX/router` fake OpenWrt tree, builds
