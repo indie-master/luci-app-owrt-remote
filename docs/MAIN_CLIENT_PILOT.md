@@ -566,6 +566,30 @@ Belt-originated SSH/LuCI probes after activation. All real upgrade
 paths remain explicitly disabled. Do not interpret hardware
 marker-only PASS as approval to install the new client.
 
+## Follow-up hardware gate: secondary instance SIGKILL/respawn
+
+New **explicitly opt-in** `--run-secondary-crash` mode in
+`tools/openwrt_procd_dual_isolated_probe.sh` validates the missing
+failure direction on a newly created `ro-procd-dual-<random>`
+temporary test service. The first on-device real procd test
+(`ro-procd-dual-9e316732`) established primary restart and
+independent marker-only secondary timer; this follow-up instead:
+
+- Starts separately supervised primary and secondary instances.
+- Sends SIGKILL *only* to that test service's `secondary` instance via
+  `ubus call service signal`.
+- Requires secondary instance to restart with a different PID and
+  exactly two secondary starts; verifies primary did not restart.
+- Requires the restarted secondary to expire the **same original
+  fictitious deadline** and clear the `/tmp`-only `pending` marker.
+- Removes the ephemeral service and marker files. Safety cleanup
+  instance independently requests service deletion after 45 seconds.
+
+This **does not** update files, register a persistent init script,
+use the transaction rollback code, touch existing Remote HUB/Xray
+instances, or reboot. Only run after the matching commit's CI is
+green and read-only residual-service check is clean.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
