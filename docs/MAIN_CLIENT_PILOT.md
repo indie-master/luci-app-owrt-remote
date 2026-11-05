@@ -344,6 +344,42 @@ Important open items before any live client upgrade:
    proof of the updated agent's behavior.
 5. Keep production `apply` blocked until separately reviewed and approved.
 
+## Fixed-deadline procd integration tests (development only)
+
+The experimental `router_pilot_transaction.sh` now computes an immutable
+deadline from Linux `/proc/uptime` and saves `deadline.uptime` before
+arming the local watchdog. Every new watchdog invocation reads that **same
+absolute boot-relative deadline**. It does not reset the countdown on
+process restart, and it fails closed by attempting a snapshot rollback
+when deadline metadata is unreadable or corrupt during a pending update.
+No wall-clock/NTP changes can extend the deadline. On a router reboot,
+the separate early boot recovery path immediately restores the old files
+when a `pending` marker exists; it does not reuse the old boot's uptime.
+
+The non-deployable `router_pilot_procd_recovery.init` has separate
+same-boot versus real-boot behavior:
+
+- Normal `start_service` with `armed`, including `pending`, registers
+  a supervised watchdog without prematurely rolling back.
+- `boot` with `pending` runs `boot-recover` before normal v119
+  `owrt-remote` startup.
+- Both service registration and the watchdog process are still **test-only**;
+  the `RO_TEST_MODE=1`/synthetic-root restrictions and live-mode hard
+  rejection remain in force.
+- CI includes a synthetic integration test that captures the procd command
+  and environment, launches the **real transaction watchdog** with a
+  simulated uptime beyond the original deadline, and checks full snapshot
+  restoration. A second test checks boot-time rollback using the real
+  transaction script. These tests do not contact live procd.
+
+**Release blockers remain:** real-device supervision, safe service shutdown
+after confirmation, repeated watchdog crashes exhausting procd retry limits,
+signal/session behavior, critical-file integrity under power loss, actual
+boot testing, out-of-band Belt confirmation, and proof that the *new*
+client agent works after controlled activation. We must not infer live
+readiness from a successful simulation. Original installer and live Xray
+remain untouched.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
