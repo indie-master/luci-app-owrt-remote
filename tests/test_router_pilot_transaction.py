@@ -150,6 +150,44 @@ class RouterPilotTransactionTests(unittest.TestCase):
                              (self.repo/'files'/name).read_bytes())
         self.assertFalse((self.state/'pending').exists())
 
+    def test_late_confirmation_forces_rollback_even_without_watchdog_wakeup(self):
+        self.prepared()
+        self.apply(timeout=12)
+        nonce=(self.state/'confirm-nonce').read_text().strip()
+        deadline=int((self.state/'deadline.uptime').read_text().strip())
+        r=self.run_cmd(TRANSACTION,'confirm',nonce,
+                       env={**self.env,'RO_TEST_NOW':str(deadline+1)}, timeout=8)
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('confirmation deadline expired',r.stderr)
+        self.assertTrue((self.state/'rolled-back').exists())
+        self.assertFalse((self.state/'pending').exists())
+        self.restore_assertions()
+        self.assertFalse((self.state/'confirmed').exists())
+
+    def test_invalid_deadline_disallows_confirmation_and_restores(self):
+        self.prepared()
+        self.apply(timeout=12)
+        nonce=(self.state/'confirm-nonce').read_text().strip()
+        (self.state/'deadline.uptime').write_text('invalid\n')
+        r=self.run_cmd(TRANSACTION,'confirm',nonce,timeout=8)
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('missing deadline',r.stderr)
+        self.assertTrue((self.state/'rolled-back').exists())
+        self.restore_assertions()
+
+    def test_rollback_restores_agent_if_live_private_config_was_edited(self):
+        self.prepared()
+        self.apply(timeout=12)
+        modified=self.router/'etc/config/owrtremote'
+        modified.write_text('EXTERNAL CHANGE\n')
+        r=self.run_cmd(TRANSACTION,'rollback',timeout=8)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        for name,_ in builder.FILES:
+            self.assertEqual((self.router/name).read_bytes(), self.old[name])
+        # Snapshot is protected but the updater must NEVER rewrite UCI.
+        self.assertEqual(modified.read_text(),'EXTERNAL CHANGE\n')
+        self.assertFalse((self.state/'pending').exists())
+
     def test_boot_recovery_works_without_network_or_hub(self):
         self.prepared()
         self.apply(timeout=12)
