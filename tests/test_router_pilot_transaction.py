@@ -95,6 +95,74 @@ class RouterPilotTransactionTests(unittest.TestCase):
             expected = self.old["usr/lib/owrt-remote/" + name]
             self.assertEqual((saved / name).read_bytes(), expected)
 
+    def test_supervised_two_phase_blocks_changes_until_both_workers_ready(self):
+        self.prepared()
+        secondary=(BASE/"tools/router_pilot_secondary_guard.sh")
+        (self.state/"secondary-guard.sh").write_bytes(secondary.read_bytes())
+        r=self.run_cmd(TRANSACTION,"arm-supervised",self.digest,
+                       env={**self.env,"RO_PILOT_TIMEOUT":"20"})
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertTrue((self.state/"armed").exists())
+        self.assertFalse((self.state/"pending").exists())
+        for n,_ in builder.FILES:
+            self.assertEqual((self.router/n).read_bytes(),self.old[n])
+        r=self.run_cmd(TRANSACTION,"apply-supervised",self.digest)
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn("both watchdogs",r.stderr)
+        self.assertFalse((self.state/"pending").exists())
+        (self.state/"watchdog-ready").touch()
+        r=self.run_cmd(TRANSACTION,"apply-supervised",self.digest)
+        self.assertNotEqual(r.returncode,0)
+        self.assertFalse((self.state/"pending").exists())
+        (self.state/"secondary-ready").touch()
+        r=self.run_cmd(TRANSACTION,"apply-supervised",self.digest)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertTrue((self.state/"pending").exists())
+        for n,_ in builder.FILES:
+            self.assertEqual((self.router/n).read_text(),"NEW:"+n+"\\n")
+        nonce=(self.state/"confirm-nonce").read_text().strip()
+        confirmed=self.run_cmd(TRANSACTION,"confirm",nonce)
+        self.assertEqual(confirmed.returncode,0,confirmed.stdout+confirmed.stderr)
+        self.assertFalse((self.state/"pending").exists())
+
+    def test_supervised_primary_and_secondary_workers_acknowledge_ready(self):
+        self.prepared()
+        secondary=(BASE/"tools/router_pilot_secondary_guard.sh")
+        (self.state/"secondary-guard.sh").write_bytes(secondary.read_bytes())
+        arm=self.run_cmd(TRANSACTION,"arm-supervised",self.digest,
+                         env={**self.env,"RO_PILOT_TIMEOUT":"20"})
+        self.assertEqual(arm.returncode,0,arm.stdout+arm.stderr)
+        workers=[
+            subprocess.Popen(["sh",str(self.state/"transaction.sh"),"watchdog"],
+                             env=self.env,stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL),
+            subprocess.Popen(["sh",str(self.state/"secondary-guard.sh")],
+                             env=self.env,stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        ]
+        try:
+            until=time.monotonic()+5
+            while time.monotonic() < until:
+                if (self.state/"watchdog-ready").exists() and (self.state/"secondary-ready").exists():
+                    break
+                time.sleep(.1)
+            self.assertTrue((self.state/"watchdog-ready").exists())
+            self.assertTrue((self.state/"secondary-ready").exists())
+            r=self.run_cmd(TRANSACTION,"apply-supervised",self.digest)
+            self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+            r=self.run_cmd(TRANSACTION,"rollback")
+            self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+            self.restore_assertions()
+        finally:
+            for p in workers:
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=3)
+
     def test_success_requires_explicit_nonce_confirmation(self):
         self.prepared()
         self.apply()
