@@ -50,10 +50,34 @@ recovery interval. CI uses a fake `ubus` implementation to validate
 the exact payload and to exercise arm → coordinated readiness →
 apply-supervised → rollback → stop, without touching production.
 
-**Remaining bridge:** independently test that JSON and all ten-file
-rollback together on an actual OpenWrt `procd` with a fake /tmp root.
-Only then prepare a separate audited production enablement and runtime
-heartbeat activation; the live updater remains disabled.
+**Combined procd/ten-file hardware rehearsal prepared:**
+`tools/openwrt_synthetic_update_cycle.sh --run-procd` creates a unique
+marked `/tmp/ro-pilot-fixture.XXXXXX/router` fake OpenWrt tree, builds
+the ten-file candidate and sealed backup, performs `arm-supervised`,
+registers both watchdogs as a **temporary** real procd service through
+`router_pilot_procd_coordinator.sh`, checks that both are ready,
+then uses `apply-supervised` to install the candidate into the FAKE
+root. It deliberately withholds confirmation and checks that the
+original absolute timeout restores all ten original files; both fake
+UCI and fake Xray JSON must stay unchanged. After a terminal rollback,
+it deletes and checks the temporary procd service and compares hashes
+of three **real** router files before/after without opening or copying
+their content. No actual owrt-remote, Xray, WAN or Belt services are
+restarted or changed.
+
+An offline `--self-test-procd` variant uses shell child workers
+without `ubus` and runs in CI with POSIX and BusyBox ash. Real `--run-procd`
+MUST be executed only by the operator on Cudy after a full green,
+commit-pinned CI run. If cleanup is uncertain, the script preserves its
+temporary root for safe diagnosis instead of deleting the files
+still needed by procd. A separate emergency worker retries synthetic
+rollback before removing its temporary service.
+
+**Remaining bridge:** independently pass `--run-procd` on physical Cudy.
+Then implement separately audited production supervisor/boot recovery,
+activate and rollback the *running* heartbeat without touching Xray,
+and perform the Belt-originated acceptance gate. The live updater
+remains hard-disabled until all these gates pass.
 
 **Release blockers (not yet completed):**
 - The experimental `tools/router_pilot_transaction.sh` deliberately
