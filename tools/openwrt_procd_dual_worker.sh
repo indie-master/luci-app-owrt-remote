@@ -30,7 +30,9 @@ case "$mode" in
     exec sleep 120
     ;;
   secondary)
-    printf '%s\n' "$$" >> "$dir/secondary-starts"
+    printf '%s\n' "$" >> "$dir/secondary-starts"
+    printf 'SECONDARY_START pid=%s uptime=%s pinned=%s\n' \
+      "$" "$(uptime_seconds)" "$(cat "$dir/deadline")" >> "$dir/secondary-events"
     while [ -f "$dir/armed" ]; do
       [ -f "$dir/pending" ] || { sleep 1; continue; }
       IFS= read -r deadline < "$dir/deadline" ||
@@ -38,6 +40,8 @@ case "$mode" in
       case "$deadline" in ''|*[!0-9]*) die 'invalid synthetic deadline' ;; esac
       now="$(uptime_seconds)" || die 'uptime not available'
       if [ "$now" -ge "$deadline" ]; then
+        printf 'SECONDARY_EXPIRE pid=%s uptime=%s pinned=%s\n' \
+          "$" "$now" "$deadline" >> "$dir/secondary-events"
         : > "$dir/synthetic-rollback"
         rm -f "$dir/pending" "$dir/armed"
         break
