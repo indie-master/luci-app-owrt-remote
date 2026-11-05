@@ -55,7 +55,9 @@ case "$mode" in
   safety-cleanup)
     name="${3:-}"
     case "$name" in ro-procd-dual-[0-9a-f]*) ;; *) die 'unsafe service name' ;; esac
-    sleep 45
+    # Give the parent enough time to observe original deadline + grace
+    # even on a slow device; delete independently if SSH disconnects.
+    sleep 75
     # Remove the entire isolated service if the parent shell disconnected.
     # Do NOT remove the temporary fixture: /tmp is cleared on reboot.
     ubus call service delete "{\"name\":\"$name\"}" >/dev/null 2>&1 || true
