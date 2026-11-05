@@ -61,12 +61,24 @@ for rel in etc/config/owrtremote usr/sbin/owrt-remote \
     [ ! -e "$(path "$rel")" ] ||
         fatal "existing state at $rel; use guarded upgrade/recovery instead"
 done
+# --check must validate all directories the installer may touch, not just
+# the six enrollment sentinels.
+for rel in usr/lib/owrt-remote/wan.sh usr/lib/owrt-remote/logs.sh \
+           etc/init.d/owrt-remote-logs etc/hotplug.d/iface/99-owrt-remote \
+           www/cgi-bin/owrt-remote www/luci-static/resources/view/owrt_remote.js \
+           usr/share/luci/menu.d/luci-app-owrt-remote.json \
+           usr/share/rpcd/acl.d/luci-app-owrt-remote.json \
+           etc/init.d/rpcd etc/init.d/uhttpd etc/rc.d \
+           usr/lib/lua/luci/controller/owrt_remote.lua tmp; do
+    safe_path "$rel"
+done
 if [ "$test_mode" != 1 ]; then
-    if command -v ubus >/dev/null 2>&1; then
-        [ -z "$(ubus call service list '{"name":"owrt-remote"}' 2>/dev/null |
-            grep -F '"owrt-remote"' || true)" ] ||
-            fatal 'existing procd owrt-remote service detected'
-    fi
+    command -v ubus >/dev/null 2>&1 ||
+        fatal 'missing prerequisite: ubus'
+    service_json="$(ubus call service list '{"name":"owrt-remote"}' 2>/dev/null)" ||
+        fatal 'cannot inspect existing procd services'
+    [ -z "$(printf '%s\n' "$service_json" | grep -F '"owrt-remote"' || true)" ] ||
+        fatal 'existing procd owrt-remote service detected'
     for cmd in wget sha256sum jq tar cp mv chmod dd hexdump; do
         command -v "$cmd" >/dev/null 2>&1 || fatal "missing prerequisite: $cmd"
     done
