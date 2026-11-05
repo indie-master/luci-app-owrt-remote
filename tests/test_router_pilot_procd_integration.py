@@ -70,8 +70,8 @@ fi
                 for line in lines if line.startswith("param command ")]
         env_parts = [line[len("param env "):]
                      for line in lines if line.startswith("param env ")]
-        self.assertEqual(len(argv), 1)
-        self.assertEqual(len(env_parts), 1)
+        self.assertEqual(len(argv), 2)
+        self.assertEqual(len(env_parts), 2)
         cmd = shlex.split(argv[0])
         self.assertEqual(cmd[-1], "watchdog")
         self.assertEqual(Path(cmd[1]), self.fx.state / "transaction.sh")
