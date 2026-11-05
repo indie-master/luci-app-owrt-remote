@@ -143,9 +143,13 @@ payload="$(jq -nc --arg n "$name" --arg r "$root" --arg st "$state" --arg script
     }
   }
 }')" || die 'failed to build procd JSON'
+# Persist the exact service identifier before registration. If ubus
+# rejects add or SSH disconnects immediately afterwards, cleanup can still
+# target this one generated name without enumerating unrelated services.
+printf '%s\n' "$name" > "$state/procd-service-name" ||
+    die 'cannot record supervisor identity'
 ubus call service add "$payload" >/dev/null ||
-    die 'cannot register procd supervisors'
-printf '%s\n' "$name" > "$state/procd-service-name"
+    die 'cannot register procd supervisors: identity preserved for cleanup'
 i=0
 while [ "$i" -lt 8 ]; do
     if [ -f "$state/watchdog-ready" ] && [ -f "$state/secondary-ready" ]; then
