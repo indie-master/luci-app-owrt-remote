@@ -21,6 +21,7 @@ jobs:
           sh -n tools/openwrt_pilot_preflight.sh
           sh -n tools/router_bundle_guard.sh
           sh -n tools/router_pilot_transaction.sh
+          sh -n tools/router_fresh_install.sh
           sh -n tools/router_pilot_secondary_guard.sh
           sh -n tools/openwrt_synthetic_update_cycle.sh
           sh -n tools/openwrt_procd_dual_worker.sh
@@ -30,6 +31,8 @@ jobs:
           python3 -m py_compile tools/build_router_bundle.py
           sh -n vps/install-vps.sh
           sh -n files/www/cgi-bin/owrt-remote
+      - name: Test pinned fresh-router bootstrap, no network or production root
+        run: python3 -m unittest discover -s tests -p 'test_router_fresh_install.py' -v
       - name: Run WSS backwards-compatibility tests
         run: python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
       - name: Run strictly isolated hardware compatibility probe in CI
