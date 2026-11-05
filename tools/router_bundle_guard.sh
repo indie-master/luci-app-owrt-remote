@@ -14,6 +14,21 @@ case "${RO_TEST_ROOT:-/}" in
     *) abort 'invalid test root' ;;
 esac
 [ "$ROOT" != '' ] || [ "${RO_TEST_MODE:-0}" != 1 ] || abort 'test mode cannot operate on the real root'
+# Synthetic-root mode must never be usable to point at an arbitrary live
+# path. Verify both the path shape and the canonical path, plus a marker
+# created by the disposable fixture before any router code-file writes.
+if [ "${RO_TEST_MODE:-0}" = 1 ]; then
+    case "$ROOT" in
+        /tmp/ro-transaction-test-*/router|/tmp/ro-guard-test-*/router|/tmp/ro-pilot-fixture.*/router) ;;
+        *) abort 'unapproved synthetic-root location' ;;
+    esac
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || abort 'synthetic root missing or symlink'
+    canonical="$(cd -P "$ROOT" && pwd -P)" || abort 'cannot resolve synthetic root'
+    [ "$canonical" = "$ROOT" ] || abort 'synthetic root includes symlink or traversal'
+    [ -f "$ROOT/.ro-pilot-synthetic-root" ] &&
+    [ ! -L "$ROOT/.ro-pilot-synthetic-root" ] || abort 'synthetic-root marker missing'
+fi
+
 STATE="$ROOT/etc/router-orchestrator/upgrade"
 FILES='usr/sbin/owrt-remote
 usr/lib/owrt-remote/wan.sh
