@@ -47,15 +47,20 @@ with events.open("a") as f:
 if cmd=="add":
     assert args["name"].startswith("ro-pilot-supervised-")
     assert set(args["instances"])=={"watchdog","secondary","safety_cleanup"}
+    (state/"mock-ubus-registered").touch()
     (state/"watchdog-ready").touch()
     (state/"secondary-ready").touch()
     print("{}")
 elif cmd=="list":
     name=args["name"]
-    print(json.dumps({name:{"instances":{
-        "watchdog":{"running":True},"secondary":{"running":True}
-    }}}))
+    if (state/"mock-ubus-registered").exists():
+        print(json.dumps({name:{"instances":{
+            "watchdog":{"running":True},"secondary":{"running":True}
+        }}}))
+    else:
+        print("{}")
 elif cmd=="delete":
+    (state/"mock-ubus-registered").unlink(missing_ok=True)
     print("{}")
 else:
     sys.exit(1)
