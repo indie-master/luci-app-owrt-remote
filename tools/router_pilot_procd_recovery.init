@@ -29,7 +29,9 @@ validate_synthetic_state() {
         *) echo 'ro-pilot-recovery: synthetic root must be absolute' >&2; return 1 ;;
     esac
     state="$root/etc/router-orchestrator/upgrade"
-    [ -f "$state/transaction.sh" ] || return 1
+    [ -f "$state/transaction.sh" ] && [ ! -L "$state/transaction.sh" ] || return 1
+    [ -f "$state/secondary-guard.sh" ] && [ ! -L "$state/secondary-guard.sh" ] || return 1
+    [ -f "$root/.ro-pilot-synthetic-root" ] || return 1
 }
 
 # Explicit post-confirm cleanup for the separate coordinator. This is NOT
@@ -43,7 +45,8 @@ cleanup_confirmed() {
         return 1
     fi
     # Simulated procd_kill, never actual service management in this branch.
-    procd_kill ro-pilot-recovery rollback-watchdog
+    procd_kill ro-pilot-recovery rollback-watchdog || return 1
+    procd_kill ro-pilot-recovery independent-deadline-guard
 }
 
 start_service() {
@@ -67,10 +70,23 @@ start_service() {
     # Supply synthetic root to the supervised process. No real /etc paths.
     procd_set_param env RO_TEST_MODE=1 RO_TEST_ROOT="$root" \
         RO_TEST_ROUTER_ID=main RO_TEST_TRANSPORT=tcp RO_TEST_PORT=18443
-    # Respawn on crashes, but the watchdog reads the *original* absolute
-    # /proc/uptime deadline; it never extends that deadline upon restart.
-    # More lifecycle tests are required before changing retry limits.
-    procd_set_param respawn 3600 2 3
+    # "0" means unlimited retries in OpenWrt procd. Keep a fixed
+    # two-second delay to avoid a tight crash loop while pending recovery.
+    # The original deadline is never reset by either worker.
+    procd_set_param respawn 3600 2 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+
+    # Independent process with a separate implementation, not a child of
+    # rollback-watchdog. It can restore if the primary worker is in a crash
+    # loop. The procd manager itself is still a shared failure domain;
+    # persistent boot recovery remains mandatory.
+    procd_open_instance independent-deadline-guard
+    procd_set_param command /bin/sh "$state/secondary-guard.sh"
+    procd_set_param env RO_TEST_MODE=1 RO_TEST_ROOT="$root" \
+        RO_TEST_ROUTER_ID=main RO_TEST_TRANSPORT=tcp RO_TEST_PORT=18443
+    procd_set_param respawn 3600 2 0
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
