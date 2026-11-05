@@ -51,6 +51,36 @@ sha() { sha256sum "$1" | awk '{print $1}'; }
 hex64() { case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -eq 64 ]; }
 present() { [ -f "$1" ] && [ ! -L "$1" ]; }
 
+# Reject a nested symlink escape within the synthetic router tree.
+# Deliberately validate directory components as well as the final file.
+# The early-boot link itself is expected to be a symlink after apply,
+# so validate its parent directory, not the link's target name.
+check_path_no_symlinks() {
+  relative="$1"
+  prefix="$ROOT"
+  rest="$relative"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*) part="${rest%%/*}"; rest="${rest#*/}" ;;
+      *) part="$rest"; rest='' ;;
+    esac
+    [ -n "$part" ] && [ "$part" != . ] && [ "$part" != .. ] ||
+      fail "unsafe path component: $relative"
+    prefix="$prefix/$part"
+    [ ! -L "$prefix" ] || fail "symlink in router path: $relative"
+  done
+}
+check_router_tree() {
+  for rel in $FILES; do
+    check_path_no_symlinks "$rel"
+  done
+  for rel in etc/router-orchestrator/upgrade \
+             etc/config/owrtremote etc/xray/owrt-remote-client.json \
+             etc/init.d/ro-pilot-recovery etc/rc.d; do
+    check_path_no_symlinks "$rel"
+  done
+}
+
 secure_nonce() {
   # Exactly 16 unpredictable bytes, hexadecimal-encoded. Never use timestamps,
   # shell PIDs or weak PRNG values for confirmation tokens.
@@ -259,6 +289,7 @@ EOF
 restore() {
   [ -f "$STATE/pending" ] || fail 'no pending update to restore'
   verify_backup
+  check_router_tree
   for rel in $FILES; do
     dst="$(at "$rel")"
     record="$(awk -v name="$rel" '$2==name{print $0}' "$STATE/backup/present.txt")"
@@ -288,6 +319,7 @@ apply() {
   [ ! -e "$STATE/armed" ] || fail 'watchdog already armed'
   [ ! -e "$STATE/transaction.sh" ] || fail 'transaction already installed; investigate'
   identity
+  check_router_tree
   verify_resources
   verify_backup
   critical
@@ -402,6 +434,7 @@ confirm() {
   [ -r "$STATE/confirm-nonce" ] || fail 'nonce missing'
   [ "$1" = "$(cat "$STATE/confirm-nonce")" ] || fail 'invalid nonce'
   identity
+  check_router_tree
   # Enforce the deadline under the same lock used by watchdog. A dead or
   # delayed watchdog must never allow a late confirmation.
   deadline="$(read_deadline)" || {
@@ -449,6 +482,7 @@ boot_recover() {
   rm -f "$STATE/lock/pid"
   rmdir "$STATE/lock" 2>/dev/null || true
   lock
+  check_router_tree
   [ -f "$STATE/pending" ] && restore
 }
 
