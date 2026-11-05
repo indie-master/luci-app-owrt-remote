@@ -506,7 +506,7 @@ link, or update actual files.
 under a randomly named temporary service. The primary can be signalled by
 `ubus`, and the separately supervised secondary expires a **FAKE**
 deadline and clears a **FAKE** `pending` marker under `/tmp`.
-A third cleanup instance removes the service after 45 seconds even if
+A third cleanup instance removes the service after 75 seconds even if
 the initiating SSH session disconnects; the initiating shell additionally
 attempts service deletion and fixture cleanup in a trap.
 
@@ -583,12 +583,52 @@ independent marker-only secondary timer; this follow-up instead:
 - Requires the restarted secondary to expire the **same original
   fictitious deadline** and clear the `/tmp`-only `pending` marker.
 - Removes the ephemeral service and marker files. Safety cleanup
-  instance independently requests service deletion after 45 seconds.
+  instance independently requests service deletion after 75 seconds.
 
 This **does not** update files, register a persistent init script,
 use the transaction rollback code, touch existing Remote HUB/Xray
 instances, or reboot. Only run after the matching commit's CI is
 green and read-only residual-service check is clean.
+
+## Cudy secondary-crash test: restart PASS, deadline observation INCONCLUSIVE (2026-11-05)
+
+Operator ran commit `034189c996e9083755c8e7803a32918a11ce5d81`:
+
+- Offline secondary marker-only self-test: **PASS**.
+- Isolated real procd service `ro-procd-dual-2bedb7af`,
+  initial primary PID `31328`, secondary PID `31329`.
+- The actual test secondary was killed and relaunched by procd:
+  `31329 -> 31350`: **PASS**.
+- The test then printed
+  `PROCD-DUAL: FAIL - independent secondary deadline did not fire`.
+  It did **not** report a successful fake rollback. This is **not**
+  evidence that a live client rollback failed: there was no live
+  client upgrade and no real rollback in this test.
+
+### Root-cause analysis and next revision
+
+The script pinned its fake deadline to `/proc/uptime + 16s` *before*
+procd registration. After observing the restarted secondary, it checked
+for only 13 one-second poll iterations. A ~1–2s respawn delay plus
+registration overhead and integer uptime rounding could make the
+observer exit **before** the original deadline. This timing bug is
+the most likely explanation, but the old test lacked worker logs,
+so the precise reason is not established.
+
+The updated script therefore polls until the original absolute
+deadline **plus 8 seconds grace**, with a separate bounded iteration
+limit, and prints read-only event diagnostics on failure. The
+secondary worker records its start and expiry uptime values under
+the isolated `/tmp` fixture. A new offline test kills and relaunches
+the real secondary worker and asserts that it preserves the deadline
+and clears only fake pending. The emergency procd cleanup timer is
+extended to 75s so it cannot prematurely remove the test service
+during the observation window.
+
+Do not rerun the old pinned commit; use only a **fully green**,
+matching new SHA and the existing residual-service precheck.
+The test remains fixture-only. Real `apply`, Belt, Xray and working
+Remote HUB services are unchanged and still off limits.
 
 ## Step 3: after the guarded pilot
 
