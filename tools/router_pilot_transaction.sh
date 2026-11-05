@@ -257,6 +257,10 @@ restore() {
     fi
   done
   : > "$STATE/rolled-back"
+  # A reboot may have interrupted confirm after it created the optimistic
+  # confirmed marker but before it removed pending. Rollback wins; clear
+  # the stale marker to avoid a false-success report.
+  rm -f "$STATE/confirmed" || fail 'could not clear stale confirmed marker'
   rm -f "$STATE/pending" "$STATE/armed"
   # Deliberately do not restart Xray, WAN, procd or original agents.
   say 'ROLLED BACK: on-disk original files restored; check existing LuCI/SSH and service state.'
@@ -394,7 +398,14 @@ confirm() {
   # early boot MUST still roll back. Never clear pending before writing the
   # commit marker and disabling the watchdog.
   : > "$STATE/confirmed"
+  # Test-only power-loss injection: fail while pending is still durable.
+  if [ "${RO_TEST_MODE:-0}" = 1 ] && [ "${RO_TEST_CONFIRM_CRASH_AT:-}" = marker ]; then
+    fail 'simulated interruption after confirmed marker'
+  fi
   rm -f "$STATE/armed" || fail 'could not disarm watchdog'
+  if [ "${RO_TEST_MODE:-0}" = 1 ] && [ "${RO_TEST_CONFIRM_CRASH_AT:-}" = disarmed ]; then
+    fail 'simulated interruption after disarming'
+  fi
   rm -f "$STATE/pending" || fail 'could not complete confirmation'
   rm -f "$STATE/confirm-nonce" || true
   # The current prototype does not unregister a procd instance: the test
