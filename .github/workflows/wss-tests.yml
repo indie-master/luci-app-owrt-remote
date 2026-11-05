@@ -47,6 +47,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_blueprint.py' -v
       - name: Exercise complete fake OpenWrt update cycle, no procd or live files
         run: sh tools/openwrt_synthetic_update_cycle.sh
+      - name: Refuse fallback when explicit procd registration fails
+        run: python3 -m unittest discover -s tests -p 'test_openwrt_synthetic_procd_mode.py' -v
       - name: Full ten-file supervised rollback with two real shell watchdogs (offline)
         run: sh tools/openwrt_synthetic_update_cycle.sh --self-test-procd
       - name: Offline-check standalone dual procd marker-only probe
