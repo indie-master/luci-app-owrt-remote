@@ -17,6 +17,21 @@ esac
 # PRODUCTION DISABLED: only synthetic-root tests are permitted in this branch.
 # The live enablement is a separately reviewed release after hardware validation.
 [ "${RO_TEST_MODE:-0}" = 1 ] || fail 'live transactions disabled: use isolated synthetic-root compatibility tests only'
+# Synthetic-root mode must never be usable to point at an arbitrary live
+# path. Verify both the path shape and the canonical path, plus a marker
+# created by the disposable fixture before any router code-file writes.
+if [ "${RO_TEST_MODE:-0}" = 1 ]; then
+    case "$ROOT" in
+        /tmp/ro-transaction-test-*/router|/tmp/ro-guard-test-*/router|/tmp/ro-pilot-fixture.*/router) ;;
+        *) fail 'unapproved synthetic-root location' ;;
+    esac
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || fail 'synthetic root missing or symlink'
+    canonical="$(cd -P "$ROOT" && pwd -P)" || fail 'cannot resolve synthetic root'
+    [ "$canonical" = "$ROOT" ] || fail 'synthetic root includes symlink or traversal'
+    [ -f "$ROOT/.ro-pilot-synthetic-root" ] &&
+    [ ! -L "$ROOT/.ro-pilot-synthetic-root" ] || fail 'synthetic-root marker missing'
+fi
+
 STATE="$ROOT/etc/router-orchestrator/upgrade"
 HOOK="$ROOT/etc/init.d/ro-pilot-recovery"
 BOOT="$ROOT/etc/rc.d/S08ro-pilot-recovery"
