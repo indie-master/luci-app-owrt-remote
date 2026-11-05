@@ -79,6 +79,16 @@ class FreshInstallTests(unittest.TestCase):
         self.assertIn("symlink in target path",x.stderr)
         self.assertEqual(list(outside.iterdir()),[])
 
+    def test_luci_web_symlink_escape_rejected_even_when_core_paths_are_clean(self):
+        outside=self.tmp/"outside-luci"
+        outside.mkdir()
+        (self.router/"www").symlink_to(outside,target_is_directory=True)
+        x=self.script("--install",PIN)
+        self.assertNotEqual(x.returncode,0)
+        self.assertIn("symlink in target path",x.stderr)
+        self.assertEqual(list(outside.iterdir()),[])
+        self.assertFalse((self.router/"usr").exists())
+
     def test_invalid_revision_and_unguarded_usage_blocked(self):
         for argv in ((),("--install",),("--install","main"),
                      ("--install","abcdef; touch /tmp/oops"),):
