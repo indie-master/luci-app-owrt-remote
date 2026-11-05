@@ -28,6 +28,7 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.repo = self.temp/'source'
         self.router = self.temp/'router'
         self.router.mkdir()
+        (self.router / ".ro-pilot-synthetic-root").write_text("TEST ONLY\n")
         self.old = {}
         for n,mode in builder.FILES:
             p=self.repo/'files'/n
