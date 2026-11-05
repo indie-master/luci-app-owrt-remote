@@ -14,7 +14,7 @@ start_service() {
     }
     root="${RO_TEST_ROOT:-}"
     case "$root" in
-        /|''|*[!/-]*/*/../*|*/../*|*/..)
+        /|''|*/../*|*/..|*//*)
             echo 'ro-pilot-recovery: unsafe synthetic root' >&2
             return 1
             ;;
