@@ -1,12 +1,15 @@
 #!/bin/sh
 # SYNTHETIC ONLY: Exercise original bundle stage/snapshot, on-disk apply,
 # watchdog timeout, secondary guard and confirmation on fake OpenWrt files.
-# Nothing under live /etc, /usr, /www or /var is written. No procd registration,
-# service restart, ubus mutation, UCI change, SSH modification or Xray signal.
+# Live /etc, /usr, /www and Xray are read-only for checksum verification.
+# --run-procd temporarily registers a uniquely named TEST-ONLY procd service
+# for a fake /tmp router, and removes it after terminal rollback. No live
+# Remote HUB, Xray, UCI, SSH, WAN or Belt services are changed.
 set -eu
 umask 077
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 cycle_mode="${1:-legacy}"
+readonly cycle_mode
 case "$cycle_mode" in legacy|--self-test-procd|--run-procd) ;;
   *) echo 'SYNTHETIC-CYCLE: invalid mode' >&2; exit 1 ;;
 esac
