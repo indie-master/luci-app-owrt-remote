@@ -50,6 +50,30 @@ recovery interval. CI uses a fake `ubus` implementation to validate
 the exact payload and to exercise arm → coordinated readiness →
 apply-supervised → rollback → stop, without touching production.
 
+### Correction: first combined Cudy run proved shell supervision, NOT real procd
+
+Cudy operator executed the combined `--run-procd` command pinned to
+`2984b9e72b6877821c8a38a1b45cf99dca8f5e01`. Its output showed
+all ten fake files restored, unmodified real agent/UCI/Xray SHA-256,
+and existing `heartbeat` and `xray` instances. **However**, it did
+not show `both real procd workers ready` or
+`temporary real procd service removed`.
+
+Audit found a POSIX-shell global-variable collision: `create_fixture()`
+used `mode=0755`/`mode=0644` for file permission bits, overwriting
+the script's `mode=--run-procd`. The combined test consequently ran
+the offline shell watchdog branch and incorrectly appeared to pass
+the *real procd* gate. No production files were changed. Thus the
+first combined hardware run is **synthetic-worker PASS, real procd
+gate NOT TESTED**.
+
+Revised the script to use distinct `cycle_mode` and `file_mode`
+variables and added a CI regression that mocks `ubus` and rejects
+`service add`: explicit `--run-procd` must fail closed after an
+attempted real service registration, never fall back to shell workers
+or print a false full-test PASS. The new hardware run must include
+both missing procd-specific PASS lines before this gate is accepted.
+
 **Combined procd/ten-file hardware rehearsal prepared:**
 `tools/openwrt_synthetic_update_cycle.sh --run-procd` creates a unique
 marked `/tmp/ro-pilot-fixture.XXXXXX/router` fake OpenWrt tree, builds
