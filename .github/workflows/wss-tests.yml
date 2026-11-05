@@ -22,6 +22,7 @@ jobs:
           sh -n tools/router_bundle_guard.sh
           sh -n tools/router_pilot_transaction.sh
           sh -n tools/router_fresh_install.sh
+          sh -n tools/router_pilot_procd_coordinator.sh
           sh -n tools/router_pilot_secondary_guard.sh
           sh -n tools/openwrt_synthetic_update_cycle.sh
           sh -n tools/openwrt_procd_dual_worker.sh
@@ -52,6 +53,8 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_procd_dual_isolation_contract.py' -v
       - name: Test procd blueprint to real transaction wiring in disposable root
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_integration.py' -v
+      - name: Test two-phase supervised procd coordinator with fake ubus
+        run: python3 -m unittest discover -s tests -p 'test_router_pilot_supervised_coordinator.py' -v
       - name: Test opt-in router apply, timeout rollback and boot recovery
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_transaction.py' -v
       - name: Test safe router candidate bundle and persistent snapshot
