@@ -119,7 +119,7 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.assertEqual(r.returncode,0,r.stdout+r.stderr)
         self.assertTrue((self.state/"pending").exists())
         for n,_ in builder.FILES:
-            self.assertEqual((self.router/n).read_text(),"NEW:"+n+"\\n")
+            self.assertEqual((self.router/n).read_text(),"NEW:"+n+chr(10))
         nonce=(self.state/"confirm-nonce").read_text().strip()
         confirmed=self.run_cmd(TRANSACTION,"confirm",nonce)
         self.assertEqual(confirmed.returncode,0,confirmed.stdout+confirmed.stderr)
