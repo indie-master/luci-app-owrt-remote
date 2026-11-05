@@ -46,6 +46,35 @@ sha_file() { sha256sum "$1" | awk '{print $1}'; }
 hex64() { case "$1" in *[!0-9a-f]*|'') return 1 ;; esac; [ "${#1}" -eq 64 ]; }
 valid_mode() { [ "$1" = 0644 ] || [ "$1" = 0755 ]; }
 
+# Do not follow nested links inside a marked synthetic root. A safe
+# top-level /tmp router fixture is not enough if e.g. its 'etc' child
+# points to the device's real /etc. Validate every prefix before writes.
+check_path_no_symlinks() {
+    relative="$1"
+    prefix="$ROOT"
+    rest="$relative"
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            */*) part="${rest%%/*}"; rest="${rest#*/}" ;;
+            *) part="$rest"; rest='' ;;
+        esac
+        [ -n "$part" ] && [ "$part" != . ] && [ "$part" != .. ] ||
+            abort "unsafe path component: $relative"
+        prefix="$prefix/$part"
+        [ ! -L "$prefix" ] || abort "symlink in router path: $relative"
+    done
+}
+check_router_tree() {
+    for rel in $FILES; do
+        check_path_no_symlinks "$rel"
+    done
+    for rel in etc/router-orchestrator/upgrade \
+               etc/config/owrtremote etc/xray/owrt-remote-client.json \
+               etc/init.d/ro-pilot-recovery etc/rc.d/S08ro-pilot-recovery; do
+        check_path_no_symlinks "$rel"
+    done
+}
+
 check_tar_names() {
     # No arbitrary tar path can be extracted, even when a caller provides its hash.
     tar -tf "$1" > "$2" || abort 'invalid tar archive'
@@ -109,6 +138,7 @@ stage() {
     [ "$(wc -c < "$src")" -le 6291456 ] || abort 'candidate too large for constrained OpenWrt routers'
     [ "$(sha_file "$src")" = "$expected" ] || abort 'bundle SHA-256 mismatch'
     preflight_live
+    check_router_tree
     # Staging requires an overlay reserve; never unpack on tmpfs just because /tmp is large.
     available_kb="$(df -Pk "$(path etc)" | awk 'END {print $4}')"
     case "$available_kb" in ''|*[!0-9]*) abort 'cannot measure persistent overlay free space' ;; esac
@@ -141,6 +171,7 @@ snapshot() {
     # Only prepares a recovery snapshot. It does not stop services or update files.
     [ "$#" -eq 0 ] || abort 'usage: snapshot'
     preflight_live
+    check_router_tree
     [ -s "$STATE/stage/archive.sha256" ] || abort 'verified stage missing'
     [ ! -e "$STATE/backup" ] || abort 'backup already exists; never overwrite'
     [ ! -e "$STATE/pending" ] || abort 'pending transaction exists'
