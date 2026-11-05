@@ -25,9 +25,14 @@ validate_synthetic_state() {
             echo 'ro-pilot-recovery: unsafe synthetic root' >&2
             return 1
             ;;
-        /*) ;;
-        *) echo 'ro-pilot-recovery: synthetic root must be absolute' >&2; return 1 ;;
+        /tmp/ro-transaction-test-*/router|/tmp/ro-pilot-fixture.*/router) ;;
+        *) echo 'ro-pilot-recovery: synthetic root must be dedicated /tmp fixture' >&2; return 1 ;;
     esac
+    [ -d "$root" ] && [ ! -L "$root" ] || return 1
+    canonical="$(cd -P "$root" && pwd -P)" || return 1
+    [ "$canonical" = "$root" ] || return 1
+    [ -f "$root/.ro-pilot-synthetic-root" ] &&
+        [ ! -L "$root/.ro-pilot-synthetic-root" ] || return 1
     state="$root/etc/router-orchestrator/upgrade"
     [ -f "$state/transaction.sh" ] && [ ! -L "$state/transaction.sh" ] || return 1
     [ -f "$state/secondary-guard.sh" ] && [ ! -L "$state/secondary-guard.sh" ] || return 1
