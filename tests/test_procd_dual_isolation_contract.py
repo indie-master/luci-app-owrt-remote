@@ -54,7 +54,7 @@ class ProcdDualIsolationTests(unittest.TestCase):
             (root / ".dual-probe-marker").touch()
             (root / "armed").touch()
             (root / "pending").touch()
-            pinned = int(Path("/proc/uptime").read_text().split()[0]) + 4
+            pinned = int(float(Path("/proc/uptime").read_text().split()[0])) + 4
             (root / "deadline").write_text(str(pinned) + chr(10))
             first = subprocess.Popen(["sh",str(WORKER),"secondary",d],
                                      stdout=subprocess.DEVNULL,
