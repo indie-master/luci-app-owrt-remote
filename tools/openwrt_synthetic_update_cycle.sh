@@ -72,7 +72,7 @@ create_fixture() {
             *) file_mode=0644 ;;
         esac
         digest="$(sha256sum "$src/payload/$rel" | awk '{print $1}')"
-        printf '%s %s %s\n' "$digest" "$cycle_mode" "$rel" >> "$src/manifest.txt"
+        printf '%s %s %s\n' "$digest" "$file_mode" "$rel" >> "$src/manifest.txt"
         set -- "$@" "payload/$rel"
     done
     mkdir -p "$root/etc/config" "$root/etc/xray"
