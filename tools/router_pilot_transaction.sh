@@ -299,8 +299,16 @@ apply() {
   # Don't create a boot hook or pending state if the required watchdog
   # launcher is absent. A real OpenWrt replacement must have an independently
   # supervised lifetime before this safety gate can be removed.
-  command -v nohup >/dev/null 2>&1 ||
-    fail 'watchdog launcher unavailable (nohup missing); live update prohibited'
+  # A detached process with nohup is the historical synthetic test path.
+  # OpenWrt Cudy lacks nohup, so a *disposable fixture only* may test the
+  # transaction using a plain background subprocess. This never qualifies
+  # as a production watchdog; live mode is hard-rejected at script startup.
+  if [ "${RO_TEST_MODE:-0}" = 1 ] && [ "${RO_TEST_WATCHDOG_MODE:-}" = fixture-background ]; then
+    :
+  else
+    command -v nohup >/dev/null 2>&1 ||
+      fail 'watchdog launcher unavailable (nohup missing); live update prohibited'
+  fi
   # Validate crypto availability before adding any recovery hooks or files.
   # Missing od alone must not block devices with BusyBox hexdump.
   nonce="$(secure_nonce)" || fail 'no supported secure nonce generator (hexdump, od or openssl)'
@@ -322,7 +330,12 @@ apply() {
   : > "$STATE/armed"
   # Start watchdog independently of the SSH session. Arming happens BEFORE
   # the first mutation. Persisted boot recovery handles power loss.
-  if [ "${RO_TEST_MODE:-0}" = 1 ]; then
+  if [ "${RO_TEST_MODE:-0}" = 1 ] && [ "${RO_TEST_WATCHDOG_MODE:-}" = fixture-background ]; then
+    # ONLY for a fake root under /tmp. Does not survive a dropped SSH session.
+    # Never deploy this launcher to live OpenWrt.
+    RO_TEST_ROOT="$ROOT" RO_TEST_MODE=1 RO_TEST_ROUTER_ID=main RO_TEST_TRANSPORT=tcp RO_TEST_PORT=18443 RO_PILOT_TIMEOUT="$duration" \
+      sh "$STATE/transaction.sh" watchdog > "$STATE/watchdog.log" 2>&1 < /dev/null &
+  elif [ "${RO_TEST_MODE:-0}" = 1 ]; then
     RO_TEST_ROOT="$ROOT" RO_TEST_MODE=1 RO_TEST_ROUTER_ID=main RO_TEST_TRANSPORT=tcp RO_TEST_PORT=18443 RO_PILOT_TIMEOUT="$duration" \
       nohup sh "$STATE/transaction.sh" watchdog > "$STATE/watchdog.log" 2>&1 < /dev/null &
   else
