@@ -354,6 +354,27 @@ arm_supervised() {
   say "ONE-TIME CONFIRM NONCE: $nonce"
 }
 
+# Cancel a never-applied synthetic transaction after a startup/preflight
+# failure. Do not remove the procd instance here: the separate coordinator
+# can stop it only after this terminal marker is durable.
+abort_supervised() {
+  [ "${RO_TEST_MODE:-0}" = 1 ] || fail 'abort prototype is synthetic-only'
+  [ "$#" -eq 0 ] || fail 'usage: abort-supervised'
+  lock
+  [ ! -e "$STATE/pending" ] ||
+    fail 'cannot abort a pending transaction: rollback required'
+  [ -f "$STATE/armed" ] ||
+    fail 'no armed-only supervised transaction to abort'
+  check_router_tree
+  verify_backup
+  # A previous on-disk candidate is impossible without durable pending.
+  # No original router file is written during this cancellation.
+  rm -f "$STATE/armed" "$STATE/watchdog-ready" "$STATE/secondary-ready" ||
+    fail 'could not disarm supervised transaction'
+  : > "$STATE/rolled-back"
+  say 'SUPERVISED ABORTED BEFORE APPLY: no client file changed.'
+}
+
 apply_supervised() {
   [ "${RO_TEST_MODE:-0}" = 1 ] || fail 'supervised prototype is synthetic-only'
   [ "$#" -eq 1 ] && hex64 "$1" ||
@@ -567,6 +588,7 @@ boot_recover() {
 case "${1:-}" in
   arm-supervised) shift; arm_supervised "$@" ;;
   apply-supervised) shift; apply_supervised "$@" ;;
+  abort-supervised) shift; abort_supervised "$@" ;;
   apply) shift; apply "$@" ;;
   confirm) shift; confirm "$@" ;;
   rollback) shift; [ "$#" -eq 0 ] || fail 'rollback accepts no args'; lock; restore ;;
