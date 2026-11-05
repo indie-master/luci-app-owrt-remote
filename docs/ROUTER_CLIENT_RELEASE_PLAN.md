@@ -39,6 +39,22 @@ cover both missing-ready cases, real worker readiness and rollback.
 These commands remain hard-blocked on real OpenWrt and are **not** a
 production updater or permission to install on `main`.
 
+The new `tools/router_pilot_procd_coordinator.sh` is likewise
+**synthetic-only**, restricted to marked and canonical `/tmp` router
+fixtures. It registers primary and secondary instances with the
+real procd `service add` JSON schema, verifies both readiness
+markers **and** both running-instance statuses, and refuses to remove
+the service while the transaction is `armed` or `pending`. An
+independent emergency cleanup is scheduled only after a bounded
+recovery interval. CI uses a fake `ubus` implementation to validate
+the exact payload and to exercise arm → coordinated readiness →
+apply-supervised → rollback → stop, without touching production.
+
+**Remaining bridge:** independently test that JSON and all ten-file
+rollback together on an actual OpenWrt `procd` with a fake /tmp root.
+Only then prepare a separate audited production enablement and runtime
+heartbeat activation; the live updater remains disabled.
+
 **Release blockers (not yet completed):**
 - The experimental `tools/router_pilot_transaction.sh` deliberately
   rejects live operation; its background process is synthetic-only.
