@@ -482,6 +482,53 @@ power-loss recovery, SSH lifetime, running-agent activation, or any
 real update. These remain release blockers. The existing live-mode
 `apply` hard-lock remains in place.
 
+## Hardware evidence: real OpenWrt procd respawn PASS (2026-11-05)
+
+The operator ran a **real procd** test on Cudy WBR3000UAX v1,
+OpenWrt 24.10.5, using a uniquely named temporary `procd` service.
+The output confirmed:
+
+- Initial isolated worker: PID `31736`.
+- `ubus call service signal` used to terminate **that test instance only**.
+- Replacement isolated worker: PID `31751`.
+- `PASS: procd automatically restarted isolated worker`.
+- The script printed `Cleaning up isolated service`; this is a request
+  for deletion, **not independent proof** that the registration disappeared.
+
+The test did not invoke the transaction installer, operate on the real
+`owrt-remote` instances `heartbeat` or `xray`, change the TCP/18443
+link, or update actual files.
+
+### Next, separate **dual-instance** procd test (still no real upgrade)
+
+`tools/openwrt_procd_dual_isolated_probe.sh` plus
+`tools/openwrt_procd_dual_worker.sh` exercises two actual procd instances
+under a randomly named temporary service. The primary can be signalled by
+`ubus`, and the separately supervised secondary expires a **FAKE**
+deadline and clears a **FAKE** `pending` marker under `/tmp`.
+A third cleanup instance removes the service after 45 seconds even if
+the initiating SSH session disconnects; the initiating shell additionally
+attempts service deletion and fixture cleanup in a trap.
+
+The test never launches the real transaction installer, real rollback,
+Xray, real Remote HUB service, UCI mutation, firewall changes, network
+traffic or SSH configuration changes. It is opt-in, **not read-only**,
+because it registers a temporary service. The command `--self-test`
+runs only a local fake deadline worker and never calls `ubus`; the
+`--run` mode requires separate operator execution after a successful CI.
+
+Post-run safety checklist:
+
+- `ubus call service list '{"name":"ro-procd-dual-..."}'` must no longer
+  contain the exact test service (unique name comes from script output).
+- Existing `owrt-remote` procd service still has `heartbeat` and `xray`.
+- The synthetic marker-only rollback is **not proof** that real procd
+  supervision can perform full transaction rollback. It merely verifies
+  two independent managed instances and a timer under real OpenWrt.
+
+Do not unlock production `apply`, merge the draft PR, update other
+routers or remove Belt's HOLD based on these results.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
