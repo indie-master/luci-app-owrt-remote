@@ -65,6 +65,9 @@ deadline="$(read_number "$state/deadline.uptime")" || {
   rollback_if_pending
   die 'missing/corrupt deadline'
 }
+# A supervised apply must not modify even one client file until both
+# worker processes have reached their validated loops.
+: > "$state/secondary-ready"
 
 while [ -f "$state/armed" ] || [ -f "$state/pending" ]; do
   now="$(now_uptime)" || {
