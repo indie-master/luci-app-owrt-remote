@@ -29,6 +29,11 @@ esac
     die 'synthetic-root marker missing'
 state="$root/etc/router-orchestrator/upgrade"
 [ -d "$state" ] && [ ! -L "$state" ] || die 'transaction state missing'
+prefix="$root"
+for component in etc router-orchestrator upgrade; do
+    prefix="$prefix/$component"
+    [ ! -L "$prefix" ] || die 'nested symlink in fake router state'
+done
 command -v ubus >/dev/null 2>&1 || die 'ubus unavailable'
 command -v jq >/dev/null 2>&1 || die 'jq unavailable'
 
@@ -56,9 +61,20 @@ name_ok() {
 if [ "$action" = emergency-cleanup ]; then
     name="${3:-}"
     name_ok "$name" || die 'untrusted emergency service name'
-    # The management shell may have disconnected. The two workers still
-    # restore pending files; this fallback removes ONLY this test service.
+    # Detached in procd. Only remove test supervision once a terminal
+    # state is reached. If rollback fails, DO NOT abandon a pending update.
     sleep 90
+    if [ -f "$state/pending" ]; then
+        RO_TEST_MODE=1 RO_TEST_ROOT="$root" RO_TEST_ROUTER_ID=main \
+        RO_TEST_TRANSPORT=tcp RO_TEST_PORT=18443 \
+            /bin/sh "$state/transaction.sh" rollback >/dev/null 2>&1 || exit 1
+    fi
+    if [ -f "$state/armed" ]; then
+        RO_TEST_MODE=1 RO_TEST_ROOT="$root" RO_TEST_ROUTER_ID=main \
+        RO_TEST_TRANSPORT=tcp RO_TEST_PORT=18443 \
+            /bin/sh "$state/transaction.sh" abort-supervised >/dev/null 2>&1 || exit 1
+    fi
+    [ -f "$state/rolled-back" ] || [ -f "$state/confirmed" ] || exit 1
     delete_service "$name" >/dev/null 2>&1 || true
     exit 0
 fi
@@ -97,10 +113,14 @@ id="$(dd if=/dev/urandom bs=4 count=1 2>/dev/null |
 [ "${#id}" -eq 8 ] || die 'invalid service nonce'
 case "$id" in ''|*[!0-9a-f]*) die 'non-hex service nonce' ;; esac
 name="ro-pilot-supervised-$id"
-[ -z "$(service_present "$name" | jq -r --arg n "$name" '.[$n].instances | keys[]?' 2>/dev/null || true)" ] ||
+existing="$(service_present "$name")" ||
+    die 'cannot verify procd service name uniqueness'
+if printf '%s\n' "$existing" | jq -e --arg n "$name" 'has($n)' >/dev/null 2>&1; then
     die 'procd service name collision'
+fi
 
-self="$0"
+self="$(cd -P "$(dirname "$0")" && pwd -P)/$(basename "$0")" ||
+    die 'cannot resolve coordinator path'
 [ -f "$self" ] && [ ! -L "$self" ] ||
     die 'coordinator must be a regular file'
 # This is an exact JSON table accepted by procd's service/add API.
