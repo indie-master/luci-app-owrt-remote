@@ -37,6 +37,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_secure_nonce_portability.py' -v
       - name: Test non-deployable procd watchdog blueprint and boot ordering
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_blueprint.py' -v
+      - name: Test procd blueprint to real transaction wiring in disposable root
+        run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_integration.py' -v
       - name: Test opt-in router apply, timeout rollback and boot recovery
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_transaction.py' -v
       - name: Test safe router candidate bundle and persistent snapshot
