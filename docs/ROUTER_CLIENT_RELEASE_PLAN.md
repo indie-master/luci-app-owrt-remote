@@ -26,6 +26,19 @@ owrt-remote service starts. After confirmation, remove the watchdog
 instances and recovery hook safely. Do not signal or restart the Xray
 instance as a side effect.
 
+**Supervised transaction work in this branch:** the synthetic-only
+`arm-supervised SHA256` command now validates the sealed backup and candidate,
+creates the original absolute deadline and boot recovery hook, and arms the
+watchdogs **without modifying the ten client files**. After a supervisor
+starts both processes and they write distinct `watchdog-ready` and
+`secondary-ready` acknowledgments, `apply-supervised SHA256` rechecks
+the deadline, integrity and originals under the transaction lock,
+then replaces the bundle under a durable `pending` marker. Missing
+either acknowledgment prevents all mutation. Independent synthetic tests
+cover both missing-ready cases, real worker readiness and rollback.
+These commands remain hard-blocked on real OpenWrt and are **not** a
+production updater or permission to install on `main`.
+
 **Release blockers (not yet completed):**
 - The experimental `tools/router_pilot_transaction.sh` deliberately
   rejects live operation; its background process is synthetic-only.
