@@ -114,6 +114,16 @@ Contents:
 - `RELEASE-INFO.txt` (source commit and explicit non-deployable status)
 
 Validate with `sha256sum -c` against the sibling checksum file.
+**Important:** GitHub Actions triggered by `pull_request` check out a
+*temporary PR merge commit*, not necessarily the feature-branch HEAD.
+The artifact name uses this actual checkout SHA; the metadata now
+includes `CHECKOUT_SHA`, event type and the original `PR_HEAD_SHA`,
+and marks PR merge artifacts `PR_MERGE_TEST_TREE=YES`, `DEPLOYABLE=NO`.
+Never use a PR-merge artifact as a production release. When the
+branch is frozen and reviewed, explicitly dispatch the workflow at
+an immutable ref, verify its checkout SHA and both green jobs,
+then separately approve its bundle for a canary.
+
 An artifact is **not** authorization to execute production `apply`.
 The full workflow, including the Xray compatibility job, must be green.
 
