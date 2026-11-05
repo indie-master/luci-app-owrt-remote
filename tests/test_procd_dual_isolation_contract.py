@@ -106,7 +106,7 @@ class ProcdDualIsolationTests(unittest.TestCase):
     def test_worker_pid_shell_expansion_is_not_lost(self):
         code = WORKER.read_text()
         self.assertNotIn('"$"', code)
-        self.assertIn('printf \'%s\\n\' "$" >> "$dir/secondary-starts"', code)
+        self.assertIn('printf \'%s\\n\' "$$" >> "$dir/secondary-starts"', code)
         self.assertIn('printf \'SECONDARY_START pid=%s', code)
         self.assertIn('printf \'SECONDARY_EXPIRE pid=%s', code)
 
