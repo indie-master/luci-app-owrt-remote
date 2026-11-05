@@ -175,6 +175,28 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.assertTrue((self.state/'rolled-back').exists())
         self.restore_assertions()
 
+    def _assert_power_loss_during_confirm_recovers(self, point):
+        self.prepared()
+        self.apply(timeout=12)
+        nonce=(self.state/'confirm-nonce').read_text().strip()
+        r=self.run_cmd(TRANSACTION,'confirm',nonce,
+                       env={**self.env,'RO_TEST_CONFIRM_CRASH_AT':point})
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('simulated interruption',r.stderr)
+        self.assertTrue((self.state/'pending').exists())
+        r=self.run_cmd(TRANSACTION,'boot-recover',timeout=8)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertFalse((self.state/'confirmed').exists())
+        self.assertTrue((self.state/'rolled-back').exists())
+        self.restore_assertions()
+        self.assertFalse((self.state/'pending').exists())
+
+    def test_power_loss_after_confirm_marker_recovers(self):
+        self._assert_power_loss_during_confirm_recovers('marker')
+
+    def test_power_loss_after_disarming_recovers(self):
+        self._assert_power_loss_during_confirm_recovers('disarmed')
+
     def test_rollback_restores_agent_if_live_private_config_was_edited(self):
         self.prepared()
         self.apply(timeout=12)
