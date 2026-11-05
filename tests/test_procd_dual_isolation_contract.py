@@ -84,6 +84,15 @@ class ProcdDualIsolationTests(unittest.TestCase):
                 logs = (root/"secondary-events").read_text()
                 self.assertEqual(logs.count("SECONDARY_START"), 2)
                 self.assertIn("SECONDARY_EXPIRE", logs)
+                # Assert actual numeric shell PIDs, not merely start counts.
+                # A prior shell-template bug wrote a literal "$" instead of
+                # "$", passing all earlier tests until the on-router probe.
+                pids = (root / "secondary-starts").read_text().splitlines()
+                self.assertEqual(pids, [str(first.pid), str(second.pid)])
+                self.assertTrue(all(pid.isascii() and pid.isdecimal() for pid in pids))
+                self.assertIn(f"SECONDARY_START pid={first.pid}", logs)
+                self.assertIn(f"SECONDARY_START pid={second.pid}", logs)
+                self.assertIn(f"SECONDARY_EXPIRE pid={second.pid}", logs)
             finally:
                 if second.poll() is None:
                     second.terminate()
@@ -93,6 +102,13 @@ class ProcdDualIsolationTests(unittest.TestCase):
                         second.kill()
                         second.wait(timeout=2)
                 second.stderr.close()
+
+    def test_worker_pid_shell_expansion_is_not_lost(self):
+        code = WORKER.read_text()
+        self.assertNotIn('"$"', code)
+        self.assertIn('printf \'%s\\n\' "$" >> "$dir/secondary-starts"', code)
+        self.assertIn('printf \'SECONDARY_START pid=%s', code)
+        self.assertIn('printf \'SECONDARY_EXPIRE pid=%s', code)
 
     def test_probe_waits_for_absolute_deadline_plus_grace(self):
         s = PROBE.read_text()
