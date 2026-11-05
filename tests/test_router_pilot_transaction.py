@@ -125,6 +125,39 @@ class RouterPilotTransactionTests(unittest.TestCase):
         self.assertEqual(confirmed.returncode,0,confirmed.stdout+confirmed.stderr)
         self.assertFalse((self.state/"pending").exists())
 
+    def test_supervised_abort_never_installs_or_overwrites_originals(self):
+        self.prepared()
+        second = BASE / "tools/router_pilot_secondary_guard.sh"
+        (self.state/"secondary-guard.sh").write_bytes(second.read_bytes())
+        armed = self.run_cmd(TRANSACTION,"arm-supervised",self.digest,
+                             env={**self.env,"RO_PILOT_TIMEOUT":"20"})
+        self.assertEqual(armed.returncode,0,armed.stdout+armed.stderr)
+        result=self.run_cmd(TRANSACTION,"abort-supervised")
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse((self.state/"armed").exists())
+        self.assertFalse((self.state/"pending").exists())
+        self.assertTrue((self.state/"rolled-back").exists())
+        self.restore_assertions()
+
+    def test_supervised_abort_refuses_pending_update(self):
+        self.prepared()
+        second = BASE / "tools/router_pilot_secondary_guard.sh"
+        (self.state/"secondary-guard.sh").write_bytes(second.read_bytes())
+        armed = self.run_cmd(TRANSACTION,"arm-supervised",self.digest,
+                             env={**self.env,"RO_PILOT_TIMEOUT":"20"})
+        self.assertEqual(armed.returncode,0,armed.stdout+armed.stderr)
+        (self.state/"watchdog-ready").touch()
+        (self.state/"secondary-ready").touch()
+        applied=self.run_cmd(TRANSACTION,"apply-supervised",self.digest)
+        self.assertEqual(applied.returncode,0,applied.stdout+applied.stderr)
+        blocked=self.run_cmd(TRANSACTION,"abort-supervised")
+        self.assertNotEqual(blocked.returncode,0)
+        self.assertIn("rollback required",blocked.stderr)
+        self.assertTrue((self.state/"pending").exists())
+        rollback=self.run_cmd(TRANSACTION,"rollback")
+        self.assertEqual(rollback.returncode,0,rollback.stdout+rollback.stderr)
+        self.restore_assertions()
+
     def test_supervised_primary_and_secondary_workers_acknowledge_ready(self):
         self.prepared()
         secondary=(BASE/"tools/router_pilot_secondary_guard.sh")
