@@ -423,6 +423,65 @@ after `confirm`, and validate it under abrupt connection loss,
 forced worker exits and power-cycle recovery. The existing live-mode
 lockout remains enabled, and the original v119 installer is unchanged.
 
+## Independent procd guard + disposable real-Cudy exercise (development only)
+
+The recovery blueprint now launches **two independent foreground instances**:
+
+1. `rollback-watchdog`: the original transaction deadline worker.
+2. `independent-deadline-guard`: a separate shell implementation that
+   independently reads the same persisted `/proc/uptime` deadline and,
+   if the primary watchdog is crashed, invokes the **sealed transaction
+   rollback** when `pending` remains.
+
+Both use `procd_set_param respawn 3600 2 0`; the trailing `0` means
+**unlimited retries** in OpenWrt procd. These are NOT independent of
+procd itself or of the underlying rollback script. Early boot recovery
+remains essential. Both instances are stopped by the explicit
+test-only, post-commit cleanup gate.
+
+The **full shell-only hardware fixture** is
+`tools/openwrt_synthetic_update_cycle.sh`. It:
+
+- Creates dedicated `/tmp/ro-pilot-fixture.XXXXXX/router` directories
+  with an explicit `.ro-pilot-synthetic-root` marker and synthetic
+  samples of all ten client files, plus FAKE UCI and FAKE Xray JSON.
+- Generates an 11-entry tar bundle in shell (no Python/Node required),
+  performs the real bundle-guard `stage` and `snapshot`, then runs the
+  test-mode transaction code and its background fixture watchdog.
+- Demonstrates a failed/no-confirm timeout rollback, an independent
+  secondary rollback, and a successful one-time-token confirmation.
+- Checks the real agent, UCI and Xray **hashes only** before/after;
+  it never copies, prints or edits those live files.
+- Removes only its own validated temporary fixture directories under
+  `/tmp`. It **does not register procd**, alter init scripts, restart
+  clients, signal Xray or trigger any network configuration.
+- Uses the plain background watchdog **solely for this synthetic fixture**.
+  It does not claim to survive SSH disconnection or make the live update
+  safe. No production use of this launcher is permitted.
+
+For a later router-specific exercise, download these four **matching,
+commit-pinned** files to a dedicated `/tmp` folder and run only
+`openwrt_synthetic_update_cycle.sh`:
+
+```sh
+REV='<CI-PASSED-FULL-COMMIT-SHA>'
+mkdir -p /tmp/ro-pilot-validation
+BASE="https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/$REV/tools"
+for name in router_bundle_guard.sh router_pilot_transaction.sh router_pilot_secondary_guard.sh openwrt_synthetic_update_cycle.sh; do
+  wget -O "/tmp/ro-pilot-validation/$name" "$BASE/$name" || exit 1
+done
+sh -n /tmp/ro-pilot-validation/openwrt_synthetic_update_cycle.sh &&
+sh /tmp/ro-pilot-validation/openwrt_synthetic_update_cycle.sh
+```
+
+Do not execute the placeholder SHA. Replace it with a **verified,
+successfully tested** commit from GitHub Actions, and review the scripts.
+The Cudy hardware exercise validates file operations and rollback on a
+fake filesystem; it still does **not** validate real procd registration,
+power-loss recovery, SSH lifetime, running-agent activation, or any
+real update. These remain release blockers. The existing live-mode
+`apply` hard-lock remains in place.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
