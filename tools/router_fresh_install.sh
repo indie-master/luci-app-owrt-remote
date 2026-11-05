@@ -103,6 +103,13 @@ www/cgi-bin/owrt-remote
 usr/share/luci/menu.d/luci-app-owrt-remote.json
 usr/share/rpcd/acl.d/luci-app-owrt-remote.json
 www/luci-static/resources/view/owrt_remote.js'
+# The original installer also touches CGI/LuCI caches and may reload
+# existing rpcd/uhttpd; never traverse a nested synthetic-root symlink.
+for rel in $files \
+           etc/init.d/rpcd etc/init.d/uhttpd etc/rc.d \
+           usr/lib/lua/luci/controller/owrt_remote.lua tmp; do
+    safe_path "$rel"
+done
 for rel in install.sh $files; do
     case "$rel" in
         install.sh) dst="$stage/install.sh" ;;
