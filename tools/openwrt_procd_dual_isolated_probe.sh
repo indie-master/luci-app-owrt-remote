@@ -100,7 +100,7 @@ name="ro-procd-dual-$id"
 say "isolated procd service: $name"
 say 'Worker and fake rollback marker are the ONLY test targets.'
 
-# Safety-cleanup instance deletes just this randomly named service after 45s
+# Safety-cleanup instance deletes just this randomly named service after 75s
 # in case the initiating SSH connection drops before normal cleanup.
 payload="$(jq -nc --arg n "$name" --arg w "$worker" --arg d "$dir" '{
   name:$n, instances:{
