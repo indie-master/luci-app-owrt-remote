@@ -25,7 +25,7 @@ validate_synthetic_state() {
             echo 'ro-pilot-recovery: unsafe synthetic root' >&2
             return 1
             ;;
-        /tmp/ro-transaction-test-*/router|/tmp/ro-pilot-fixture.*/router) ;;
+        /tmp/ro-transaction-test-*/router|/tmp/procd-recovery-test-*/synthetic-router|/tmp/ro-pilot-fixture.*/router) ;;
         *) echo 'ro-pilot-recovery: synthetic root must be dedicated /tmp fixture' >&2; return 1 ;;
     esac
     [ -d "$root" ] && [ ! -L "$root" ] || return 1
