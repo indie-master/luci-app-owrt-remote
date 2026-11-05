@@ -4,8 +4,11 @@ No ubus/procd service is contacted by this test. It checks explicit opt-in,
 isolated naming and cleanup, then executes the marker-only offline worker.
 """
 from pathlib import Path
+import os
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 BASE=Path(__file__).resolve().parents[1]
@@ -42,6 +45,60 @@ class ProcdDualIsolationTests(unittest.TestCase):
         self.assertIn('exec sleep 120',worker)
         self.assertIn('rm -f "$dir/pending" "$dir/armed"',worker)
         self.assertIn('ubus call service delete',worker)
+
+    def test_secondary_worker_survives_sigkill_with_same_original_deadline(self):
+        # Simulate procd relaunch using actual worker processes in /tmp,
+        # with no ubus calls and no real OpenWrt service.
+        with tempfile.TemporaryDirectory(prefix="ro-procd-dual.", dir="/tmp") as d:
+            root = Path(d)
+            (root / ".dual-probe-marker").touch()
+            (root / "armed").touch()
+            (root / "pending").touch()
+            pinned = int(Path("/proc/uptime").read_text().split()[0]) + 4
+            (root / "deadline").write_text(f"{pinned}\\n")
+            first = subprocess.Popen(["sh",str(WORKER),"secondary",d],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE, text=True)
+            try:
+                limit = time.monotonic() + 2
+                while not (root/"secondary-starts").exists() and time.monotonic() < limit:
+                    time.sleep(.05)
+                self.assertTrue((root/"secondary-starts").exists())
+                os.kill(first.pid, signal.SIGKILL)
+                first.wait(timeout=2)
+            finally:
+                if first.poll() is None:
+                    first.kill()
+                    first.wait(timeout=2)
+                first.stderr.close()
+            second = subprocess.Popen(["sh",str(WORKER),"secondary",d],
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.PIPE,text=True)
+            try:
+                limit = time.monotonic() + 9
+                while not (root/"synthetic-rollback").exists() and time.monotonic() < limit:
+                    time.sleep(.1)
+                self.assertTrue((root/"synthetic-rollback").exists())
+                self.assertFalse((root/"pending").exists())
+                self.assertEqual(int((root/"deadline").read_text()),pinned)
+                logs = (root/"secondary-events").read_text()
+                self.assertEqual(logs.count("SECONDARY_START"), 2)
+                self.assertIn("SECONDARY_EXPIRE", logs)
+            finally:
+                if second.poll() is None:
+                    second.terminate()
+                    try:
+                        second.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        second.kill()
+                        second.wait(timeout=2)
+                second.stderr.close()
+
+    def test_probe_waits_for_absolute_deadline_plus_grace(self):
+        s = PROBE.read_text()
+        self.assertIn('stop_at=$((deadline + 8))', s)
+        self.assertIn('[ "$check_now" -lt "$stop_at" ] || break', s)
+        self.assertIn('max_polls=35', s)
 
     def test_offline_worker_clears_only_fake_pending(self):
         r=subprocess.run(["sh",str(PROBE),"--self-test"],
