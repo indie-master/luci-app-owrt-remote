@@ -33,18 +33,24 @@ class ProcdTransactionSyntheticE2ETests(unittest.TestCase):
         self.fx.prepared()
         self.events = self.fx.temp / "procd-events.log"
 
-    def procd(self, boot=False):
+    def procd(self, boot=False, cleanup=False):
         shell = r'''
 procd_open_instance() { printf 'open %s\n' "$*" >> "$RO_PROCD_EVENTS"; }
 procd_set_param() { printf 'param %s\n' "$*" >> "$RO_PROCD_EVENTS"; }
 procd_close_instance() { printf 'close\n' >> "$RO_PROCD_EVENTS"; }
+procd_kill() { printf 'kill %s\n' "$*" >> "$RO_PROCD_EVENTS"; }
 . "$1"
 [ "$RO_PROCD_BOOT" = 1 ] && RO_PILOT_BOOT=1
-start_service
+if [ "$RO_PROCD_CLEANUP" = 1 ]; then
+    cleanup_confirmed
+else
+    start_service
+fi
 '''
         env = {**os.environ, "RO_PROCD_TEST_MODE": "1",
                "RO_TEST_ROOT": str(self.fx.router),
                "RO_PROCD_BOOT": "1" if boot else "0",
+               "RO_PROCD_CLEANUP": "1" if cleanup else "0",
                "RO_PROCD_EVENTS": str(self.events)}
         p = subprocess.run(["sh", "-c", shell, "sh", str(INIT)],
                            text=True, capture_output=True, env=env, timeout=8)
@@ -80,6 +86,25 @@ start_service
         self.assertEqual(int((self.fx.state / "deadline.uptime").read_text()), pinned)
         self.assertTrue((self.fx.state / "rolled-back").exists())
         self.fx.restore_assertions()
+
+    def test_cleanup_rejected_before_real_transaction_confirm(self):
+        self.fx.apply(timeout=12)
+        p, lines = self.procd(cleanup=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertNotIn("kill ro-pilot-recovery", lines)
+        r = self.fx.run_cmd(self.fx.state / "transaction.sh", "rollback")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_cleanup_succeeds_after_real_transaction_confirm(self):
+        self.fx.apply(timeout=12)
+        nonce=(self.fx.state/"confirm-nonce").read_text().strip()
+        r=self.fx.run_cmd(self.fx.state/"transaction.sh","confirm",nonce)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertFalse((self.fx.state/"pending").exists())
+        self.assertFalse((self.fx.state/"armed").exists())
+        p, lines=self.procd(cleanup=True)
+        self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        self.assertIn("kill ro-pilot-recovery rollback-watchdog",lines)
 
     def test_boot_recovery_runs_real_transaction_before_procd_registration(self):
         self.fx.apply(timeout=12)
