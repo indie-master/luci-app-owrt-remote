@@ -78,6 +78,23 @@ class RouterPilotTransactionTests(unittest.TestCase):
         # Wait briefly for the watchdog to exit before tempfile teardown.
         time.sleep(0.2)
 
+    def test_nested_symlink_escape_blocks_apply_without_modification(self):
+        self.prepared()
+        # Attempt to redirect a pre-existing target directory to a
+        # different location after the verified snapshot was created.
+        nested = self.router / "usr/lib/owrt-remote"
+        saved = self.temp / "outside-original-client-dir"
+        nested.rename(saved)
+        nested.symlink_to(saved, target_is_directory=True)
+        r = self.run_cmd(TRANSACTION, "apply", self.digest)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("symlink in router path", r.stderr)
+        self.assertFalse((self.state / "pending").exists())
+        self.assertFalse((self.state / "armed").exists())
+        for name in ("wan.sh", "logs.sh"):
+            expected = self.old["usr/lib/owrt-remote/" + name]
+            self.assertEqual((saved / name).read_bytes(), expected)
+
     def test_success_requires_explicit_nonce_confirmation(self):
         self.prepared()
         self.apply()
