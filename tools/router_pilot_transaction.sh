@@ -101,9 +101,10 @@ identity() {
   jq -e '[.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn") | .streamSettings] as $l | ($l|length==2) and all($l[]; ((.network//"tcp")=="tcp") and ((.security//"none")=="none"))' "$cfg" >/dev/null || fail 'reverse changed'
 }
 
-critical() {
-  # Do NOT restore these private configs in a blind rollback; this updater
-  # never writes them. If they changed concurrently, stop for manual review.
+critical_copy() {
+  # The updater never writes UCI or Xray JSON. Verify snapshot integrity
+  # independently of the current live config, so an unrelated config edit
+  # cannot prevent rollback of already-changed agent files.
   [ -s "$STATE/backup/critical.sha256" ] || fail 'critical digest snapshot missing'
   read -r expected_uci < "$STATE/backup/critical.sha256"
   expected_xray="$(sed -n '2p' "$STATE/backup/critical.sha256")"
@@ -111,6 +112,11 @@ critical() {
   hex64 "$expected_xray" || fail 'bad Xray backup hash'
   [ "$(sha "$STATE/backup/files/etc/config/owrtremote")" = "$expected_uci" ] || fail 'UCI recovery copy corrupted'
   [ "$(sha "$STATE/backup/files/etc/xray/owrt-remote-client.json")" = "$expected_xray" ] || fail 'Xray recovery copy corrupted'
+}
+critical() {
+  # Applying and confirming a candidate require unchanged private configs.
+  # Rollback does NOT require live configs to remain unchanged.
+  critical_copy
   [ "$(sha "$(at etc/config/owrtremote)")" = "$expected_uci" ] || fail 'UCI changed during pilot'
   [ "$(sha "$(at etc/xray/owrt-remote-client.json)")" = "$expected_xray" ] || fail 'Xray JSON changed during pilot'
 }
@@ -136,7 +142,7 @@ verify_backup() {
       *) fail "backup inventory invalid for $rel" ;;
     esac
   done
-  critical
+  critical_copy
 }
 
 verify_originals() {
@@ -265,6 +271,7 @@ apply() {
   identity
   verify_resources
   verify_backup
+  critical
   verify_originals
   verify_candidate "$1"
   lock
@@ -363,14 +370,36 @@ confirm() {
   [ -r "$STATE/confirm-nonce" ] || fail 'nonce missing'
   [ "$1" = "$(cat "$STATE/confirm-nonce")" ] || fail 'invalid nonce'
   identity
+  # Enforce the deadline under the same lock used by watchdog. A dead or
+  # delayed watchdog must never allow a late confirmation.
+  deadline="$(read_deadline)" || {
+    restore
+    fail 'missing deadline: late/unsafe confirmation rejected and rolled back'
+  }
+  now="$(clock_uptime)" || {
+    restore
+    fail 'clock unavailable: confirmation rejected and rolled back'
+  }
+  if [ "$now" -ge "$deadline" ]; then
+    restore
+    fail 'confirmation deadline expired: original files restored'
+  fi
   critical
   for rel in $FILES; do
     expected="$(awk -v n="$rel" '$3==n{print $1}' "$STATE/stage/unpacked/manifest.txt")"
     hex64 "$expected" || fail 'manifest changed'
     [ "$(sha "$(at "$rel")")" = "$expected" ] || fail "installed file mismatch $rel"
   done
-  rm -f "$STATE/pending" "$STATE/armed" "$STATE/confirm-nonce"
+  # Commit order matters on power loss: until pending is removed,
+  # early boot MUST still roll back. Never clear pending before writing the
+  # commit marker and disabling the watchdog.
   : > "$STATE/confirmed"
+  rm -f "$STATE/armed" || fail 'could not disarm watchdog'
+  rm -f "$STATE/pending" || fail 'could not complete confirmation'
+  rm -f "$STATE/confirm-nonce" || true
+  # The current prototype does not unregister a procd instance: the test
+  # watchdog exits when armed disappears, but live shutdown still requires
+  # separately tested procd lifecycle controls before enabling production.
   say 'CONFIRMED: on-disk files verified. Keep recovery snapshot for manual inspection.'
 }
 
