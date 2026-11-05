@@ -55,15 +55,15 @@ class ProcdDualIsolationTests(unittest.TestCase):
             (root / "armed").touch()
             (root / "pending").touch()
             pinned = int(Path("/proc/uptime").read_text().split()[0]) + 4
-            (root / "deadline").write_text(f"{pinned}\\n")
+            (root / "deadline").write_text(str(pinned) + chr(10))
             first = subprocess.Popen(["sh",str(WORKER),"secondary",d],
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
             try:
                 limit = time.monotonic() + 2
-                while not (root/"secondary-starts").exists() and time.monotonic() < limit:
+                while not (root/"secondary-events").exists() and time.monotonic() < limit:
                     time.sleep(.05)
-                self.assertTrue((root/"secondary-starts").exists())
+                self.assertTrue((root/"secondary-events").exists())
                 os.kill(first.pid, signal.SIGKILL)
                 first.wait(timeout=2)
             finally:
