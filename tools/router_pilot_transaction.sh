@@ -165,6 +165,29 @@ verify_resources() {
   [ "$free_kb" -ge 16384 ] || fail 'less than 16 MiB persistent storage reserve'
 }
 
+# /proc/uptime is monotonic for a single boot. Unlike a per-process sleep
+# counter, this persisted deadline survives procd watchdog respawns without
+# granting another confirmation interval. Reboot uses boot-recover instead.
+clock_uptime() {
+  if [ "${RO_TEST_MODE:-0}" = 1 ] && [ -n "${RO_TEST_NOW:-}" ]; then
+    value="$RO_TEST_NOW"
+  else
+    [ -r /proc/uptime ] || return 1
+    value="$(awk 'NR==1 {print int($1)}' /proc/uptime)" || return 1
+  fi
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#value}" -le 12 ] || return 1
+  printf '%s\n' "$value"
+}
+
+read_deadline() {
+  [ -s "$STATE/deadline.uptime" ] || return 1
+  IFS= read -r value < "$STATE/deadline.uptime" || [ -n "${value:-}" ] || return 1
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#value}" -le 12 ] || return 1
+  printf '%s\n' "$value"
+}
+
 verify_candidate() {
   present "$STATE/stage/archive.sha256" || fail 'staged archive hash missing'
   pinned="$(cat "$STATE/stage/archive.sha256")"
@@ -264,7 +287,12 @@ apply() {
   else
     [ "$duration" -ge 180 ] && [ "$duration" -le 900 ] || fail 'production timeout must be 180..900 seconds'
   fi
+  # Set an absolute deadline once. procd can relaunch the watchdog
+  # but cannot start a fresh countdown. This file is only in synthetic ROOT.
+  now="$(clock_uptime)" || fail 'monotonic uptime unavailable'
+  deadline=$((now + duration))
   printf '%s\n' "$duration" > "$STATE/duration"
+  printf '%s\n' "$deadline" > "$STATE/deadline.uptime"
   : > "$STATE/armed"
   # Start watchdog independently of the SSH session. Arming happens BEFORE
   # the first mutation. Persisted boot recovery handles power loss.
@@ -282,6 +310,9 @@ apply() {
     i=$((i+1))
   done
   [ -e "$STATE/watchdog-ready" ] || fail 'watchdog not ready: no live file changed'
+  # Reject a slow handshake which already exhausted the fixed deadline.
+  check_now="$(clock_uptime)" || fail 'clock unavailable before apply'
+  [ "$check_now" -lt "$deadline" ] || fail 'watchdog deadline elapsed before apply'
   # The persistent marker is created before live file changes.
   : > "$STATE/pending"
   for rel in $FILES; do
@@ -301,19 +332,27 @@ apply() {
 
 watchdog() {
   [ -f "$STATE/armed" ] || exit 0
+  # Never reset the deadline when this process is relaunched by procd.
+  deadline="$(read_deadline)" || {
+    [ -f "$STATE/pending" ] && { lock; restore; }
+    fail 'deadline missing or invalid; recovery attempted if pending'
+  }
   : > "$STATE/watchdog-ready"
-  duration="$(cat "$STATE/duration")"
-  case "$duration" in ''|*[!0-9]*) fail 'invalid watchdog duration' ;; esac
-  # Countdown uses bounded sleeps, independent of wall-clock/NTP adjustments.
-  i=0
-  while [ "$i" -lt "$duration" ]; do
-    [ -f "$STATE/armed" ] || exit 0
+  while [ -f "$STATE/armed" ]; do
+    now="$(clock_uptime)" || {
+      [ -f "$STATE/pending" ] && { lock; restore; }
+      fail 'monotonic clock unavailable; recovery attempted if pending'
+    }
+    if [ "$now" -ge "$deadline" ] && [ -f "$STATE/pending" ]; then
+      lock
+      [ -f "$STATE/pending" ] && restore
+      exit 0
+    fi
+    # An armed transaction without pending is still in the apply preflight.
+    # Do not exit when the deadline expires before pending gets written;
+    # apply will refuse to mutate any live file after that deadline.
     sleep 1
-    i=$((i+1))
   done
-  [ -f "$STATE/pending" ] || exit 0
-  lock
-  [ -f "$STATE/pending" ] && restore
 }
 
 confirm() {
