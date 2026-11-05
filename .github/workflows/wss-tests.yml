@@ -89,6 +89,24 @@ jobs:
           ln -s "$(command -v bash)" /tmp/owrt-test-shell/sh
           PATH="/tmp/owrt-test-shell:$PATH" python3 -m unittest discover -s tests -p 'test_xray_validation.py' -v
 
+      - name: Build deterministic guarded-client release candidate (NO DEPLOY)
+        run: |
+          set -eu
+          mkdir -p build
+          python3 tools/build_router_bundle.py --out build/owrt-remote-client-candidate.tar
+          (cd build && sha256sum owrt-remote-client-candidate.tar > owrt-remote-client-candidate.tar.sha256)
+          printf 'COMMIT=%s\nMODE=ARTIFACT_ONLY\nLIVE_UPDATE_ENABLED=NO\n' "$GITHUB_SHA" > build/RELEASE-INFO.txt
+      - name: Publish verified release-candidate files (NEVER auto-install)
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-client-candidate-${{ github.sha }}
+          path: |
+            build/owrt-remote-client-candidate.tar
+            build/owrt-remote-client-candidate.tar.sha256
+            build/RELEASE-INFO.txt
+          if-no-files-found: error
+          retention-days: 30
+
   xray-26-10-compat:
     runs-on: ubuntu-latest
     permissions:
