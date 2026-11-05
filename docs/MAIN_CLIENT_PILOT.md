@@ -288,6 +288,62 @@ client update test and **cannot** establish that reboot, persistent
 rollback or reverse access will work after installing the new agent.
 The original on-router client must stay running and unchanged.
 
+## Hardware compatibility result: PASS (2026-11-05)
+
+The operator ran the exact pinned isolated probe
+`0f7d75df597871bf7f8a6e46ebc5a99c9a5ff795` on the chosen
+Cudy WBR3000UAX v1 / OpenWrt 24.10.5:
+
+- All required filesystem applets found; `tar -xOf`, `cmp -s`,
+  `cp -p`, same-directory rename and SHA-256: **PASS**.
+- `dd` and `hexdump` present, `od` and `openssl` absent;
+  random-nonce generation using the secure fallback: **PASS**.
+- `uci`, `jq`, `sed`, `id`, `kill`, `ln`, `rmdir`: present.
+- `nohup`: absent. `start-stop-daemon`, `setsid`, `procd`
+  and `ubus`: present. **The legacy prototype watchdog remains blocked**.
+- `/overlay` free **67512 KiB** (~65.9 MiB), `MemAvailable`
+  **256808 KiB** (~250.8 MiB).
+- Final test output: `PROBE: PASS - isolated temporary filesystem checks
+  complete. No client upgrade was performed.`
+- The diagnostic `busybox: applet not found` appeared when invoking
+  `busybox` with no applet to show its version. It did not invalidate the
+  successful tested filesystem applets.
+
+### Independent procd watchdog design (development only)
+
+`tools/router_pilot_procd_recovery.init` is a **NON-DEPLOYABLE,
+test-only blueprint** using the official OpenWrt
+`USE_PROCD=1` / `start_service` contract. It is NOT wired into the
+legacy installer, the live client or `router_pilot_transaction.sh`, and
+refuses live registration:
+
+- `pending` at boot => invoke local `boot-recover` *before* allowing
+  other pilot actions;
+- `armed` with no pending update => register a foreground
+  `rollback-watchdog` instance under `procd`;
+- no markers => no process starts; no changes to the existing
+  `owrt-remote` procd service.
+
+The new synthetic-root tests mock the procd interface, check registration,
+error propagation, fail-closed production refusal, and boot recovery
+ordering. Passing them proves **script structure only**, not procd's real
+process lifetime, SSH-session isolation, or reboot recovery.
+
+Important open items before any live client upgrade:
+
+1. Integrate actual procd supervision (without `nohup`) with the updater
+   while preserving `USE_PROCD=1` and existing v119 services.
+2. Ensure unexpected watchdog termination triggers prompt local rollback,
+   without merely restarting and resetting the deadline. A bounded
+   monotonic deadline and fail-safe recovery across power loss are mandatory.
+3. Demonstrate `procd` instance registration and status, tunnel interruption,
+   manual rollback, reboot recovery and persistent snapshot integrity in
+   disposable OpenWrt or a carefully authorized local test.
+4. Confirm newly installed agent functionality after activation; live
+   LuCI/SSH reachability can be supplied by old running processes and is not
+   proof of the updated agent's behavior.
+5. Keep production `apply` blocked until separately reviewed and approved.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
