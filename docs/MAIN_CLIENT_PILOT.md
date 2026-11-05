@@ -630,6 +630,36 @@ matching new SHA and the existing residual-service precheck.
 The test remains fixture-only. Real `apply`, Belt, Xray and working
 Remote HUB services are unchanged and still off limits.
 
+## Real Cudy secondary crash repeat: malformed PID instrumentation (2026-11-05)
+
+On Cudy, pinned probe `1f366140cc028dd954e0bb6690f53fab5f9a9b21` printed:
+
+- Offline self-test: PASS.
+- Temporary test service `ro-procd-dual-846d2c05` registered.
+- Real procd test terminated early: `PROCD-DUAL: FAIL - bad worker PIDs`.
+  No secondary respawn or deadline outcome was established by this run.
+
+Inspection of the matching worker found a **code-generation error**:
+its secondary branch wrote literal `"$"` to `secondary-starts` and
+its two `secondary-events` records instead of the POSIX shell PID
+`"$"`. This explains the observed PID validation failure. It is an
+instrumentation bug, **not evidence of a procd or deadline failure**.
+The prior temporary service may have been removed by the exit trap or
+75-second timed cleanup; this run did not include an independent
+post-failure service listing, so check before any repeat.
+
+The worker now writes actual numeric `$` in all three locations.
+The offline fault-injection test now compares the recorded PIDs against
+both `subprocess.Popen.pid` values after the synthetic SIGKILL and
+restart, and checks numeric `SECONDARY_START` /
+`SECONDARY_EXPIRE` events. A separate code contract ensures the
+shell's double-dollar expansion cannot regress to a literal dollar.
+
+**Do not repeat on Cudy using the old pinned revision.** Only a new
+revision with complete GitHub Actions SUCCESS, with existing
+`ro-procd-*` service preflight and no live agent changes, is suitable
+for another independent fixture-only test.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
