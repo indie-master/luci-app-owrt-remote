@@ -29,17 +29,19 @@ class ProcdRecoveryBlueprintTests(unittest.TestCase):
         )
         self.transaction.chmod(0o700)
 
-    def run_blueprint(self, *, test_mode=True, root=None, exit_code="0"):
+    def run_blueprint(self, *, test_mode=True, root=None, exit_code="0", boot=False):
         # Source in a detached test shell and mock procd helper functions.
         cmd = '''
 procd_open_instance() { printf 'open %s\\n' "$*" >> "$RO_PROCD_TEST_LOG"; }
 procd_set_param() { printf 'set %s\\n' "$*" >> "$RO_PROCD_TEST_LOG"; }
 procd_close_instance() { printf 'close\\n' >> "$RO_PROCD_TEST_LOG"; }
 . "$1"
+[ "$RO_TEST_BOOT" = 1 ] && RO_PILOT_BOOT=1
 start_service
 '''
         env = {**os.environ, "RO_PROCD_TEST_LOG": str(self.log),
                "RO_PROCD_TRANSACTION_EXIT": exit_code,
+               "RO_TEST_BOOT": "1" if boot else "0",
                "RO_TEST_ROOT": str(root or self.root)}
         if test_mode:
             env["RO_PROCD_TEST_MODE"] = "1"
@@ -58,6 +60,7 @@ start_service
 
     def test_armed_state_registers_watchdog_not_legacy_agent(self):
         (self.state / "armed").touch()
+        (self.state / "deadline.uptime").write_text("12345\n")
         result, calls = self.run_blueprint()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("open rollback-watchdog", calls)
@@ -70,18 +73,37 @@ start_service
     def test_pending_reboots_roll_back_before_registering_watchdog(self):
         (self.state / "pending").touch()
         (self.state / "armed").touch()
-        result, calls = self.run_blueprint()
+        (self.state / "deadline.uptime").write_text("12345\n")
+        result, calls = self.run_blueprint(boot=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, "transaction boot-recover\n")
 
+    def test_same_boot_pending_registers_watchdog_without_rollback(self):
+        (self.state / "pending").touch()
+        (self.state / "armed").touch()
+        (self.state / "deadline.uptime").write_text("12345\n")
+        result, calls = self.run_blueprint(boot=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("open rollback-watchdog", calls)
+        self.assertIn("set env RO_TEST_MODE=1", calls)
+        self.assertNotIn("boot-recover", calls)
+
+    def test_missing_deadline_prevents_registration(self):
+        (self.state / "armed").touch()
+        result, calls = self.run_blueprint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, "")
+        self.assertIn("missing pinned deadline", result.stderr)
+
     def test_boot_recovery_failure_never_claims_success(self):
         (self.state / "pending").touch()
-        result, calls = self.run_blueprint(exit_code="1")
+        result, calls = self.run_blueprint(exit_code="1", boot=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, "transaction boot-recover\n")
 
     def test_live_registration_is_explicitly_disabled(self):
         (self.state / "armed").touch()
+        (self.state / "deadline.uptime").write_text("12345\n")
         result, calls = self.run_blueprint(test_mode=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, "")
