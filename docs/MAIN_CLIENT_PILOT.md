@@ -529,6 +529,43 @@ Post-run safety checklist:
 Do not unlock production `apply`, merge the draft PR, update other
 routers or remove Belt's HOLD based on these results.
 
+## Cudy dual-instance real-procd test: PASS (2026-11-05)
+
+The operator executed the commit-pinned dual-instance probe at
+`c9835c495da6c8b9262f79c4ca59fda825d70021` on the
+Cudy WBR3000UAX v1 (OpenWrt 24.10.5). **Actual on-device stdout**:
+
+- Offline marker-only secondary deadline: `PASS`.
+- Dynamically registered isolated test service:
+  `ro-procd-dual-9e316732`, with primary PID `23682` and secondary
+  PID `23683`.
+- `ubus service signal` forcibly terminated only the primary test
+  instance. procd relaunched primary `23682 -> 23706`: `PASS`.
+- The secondary independently expired the same original fictitious
+  deadline and deleted the **FAKE** `pending` marker: `PASS`.
+- The script requested service deletion, and an independent
+  `ubus call service list` check returned
+  `PASS: test services removed`.
+- The original `owrt-remote` service still listed both
+  `heartbeat` and `xray` instances.
+- Router-reported `jq` is compiled without ONIGURUMA; its
+  `test`/`match`/`sub` builtins are unavailable. External
+  `awk '/^ro-procd-(probe|dual)-/'` worked for checking residual
+  temporary services. Do not use `jq test()` on this router.
+
+**What is proven:** two separate real procd-managed instances can
+coexist, primary SIGKILL/respawn works, secondary follows an independent
+synthetic deadline, and its temporary service can be cleaned up without
+removing the original Remote HUB instances.
+
+**What is NOT proven:** a real `procd`-managed secondary performing
+rollback of all 10 synthetic files in one connected hardware test,
+automatic recovery when the secondary itself crashes, real power-cycle
+safety, service activation of new agent files, and end-to-end
+Belt-originated SSH/LuCI probes after activation. All real upgrade
+paths remain explicitly disabled. Do not interpret hardware
+marker-only PASS as approval to install the new client.
+
 ## Step 3: after the guarded pilot
 
 - If `main` passes end-to-end LuCI/SSH tests, keep it on `TCP none`.
