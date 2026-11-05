@@ -217,8 +217,11 @@ class RouterPilotTransactionTests(unittest.TestCase):
 
     def test_watchdog_restores_when_not_confirmed(self):
         self.prepared()
-        self.apply(timeout=2)
-        for _ in range(14):
+        # A two-second deadline can elapse while the watchdog handshake is
+        # running under loaded GitHub CI before any test files are applied.
+        # Test *eventual* timeout rollback with enough bounded margin.
+        self.apply(timeout=6)
+        for _ in range(26):
             if (self.state/'rolled-back').exists():
                 break
             time.sleep(0.5)
