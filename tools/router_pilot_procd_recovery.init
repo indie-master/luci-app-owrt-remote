@@ -13,8 +13,8 @@ boot() {
     RO_PILOT_BOOT=1 start "$@"
 }
 
-start_service() {
-    # Explicitly forbid any live use of this unfinished prototype.
+validate_synthetic_state() {
+    # Strictly test-only: never register or stop a real OpenWrt service.
     [ "${RO_PROCD_TEST_MODE:-0}" = 1 ] || {
         echo 'ro-pilot-recovery: TEST-ONLY blueprint, live registration disabled' >&2
         return 1
@@ -30,6 +30,24 @@ start_service() {
     esac
     state="$root/etc/router-orchestrator/upgrade"
     [ -f "$state/transaction.sh" ] || return 1
+}
+
+# Explicit post-confirm cleanup for the separate coordinator. This is NOT
+# stop_service(): OpenWrt rc.common calls procd_kill even if stop_service
+# fails, so placing a pending guard there would give false safety.
+# The test-only cleanup must first verify that commit is fully complete.
+cleanup_confirmed() {
+    validate_synthetic_state || return 1
+    if [ ! -f "$state/confirmed" ] || [ -e "$state/pending" ] || [ -e "$state/armed" ]; then
+        echo 'ro-pilot-recovery: pending or unconfirmed transaction; refuse cleanup' >&2
+        return 1
+    fi
+    # Simulated procd_kill, never actual service management in this branch.
+    procd_kill ro-pilot-recovery rollback-watchdog
+}
+
+start_service() {
+    validate_synthetic_state || return 1
     # At *boot* an unfinished transaction must be rolled back before the
     # regular v119 service begins. During the same boot a pending apply
     # needs the watchdog, not an immediate rollback.
