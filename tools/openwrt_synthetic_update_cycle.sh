@@ -6,8 +6,8 @@
 set -eu
 umask 077
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
-mode="${1:-legacy}"
-case "$mode" in legacy|--self-test-procd|--run-procd) ;;
+cycle_mode="${1:-legacy}"
+case "$cycle_mode" in legacy|--self-test-procd|--run-procd) ;;
   *) echo 'SYNTHETIC-CYCLE: invalid mode' >&2; exit 1 ;;
 esac
 [ "$#" -le 1 ] || exit 1
@@ -68,11 +68,11 @@ create_fixture() {
         printf 'FAKE-OLD-%s\n' "$rel" > "$root/$rel"
         case "$rel" in
             usr/sbin/owrt-remote|etc/init.d/*|etc/hotplug.d/*|www/cgi-bin/*)
-                mode=0755 ;;
-            *) mode=0644 ;;
+                file_mode=0755 ;;
+            *) file_mode=0644 ;;
         esac
         digest="$(sha256sum "$src/payload/$rel" | awk '{print $1}')"
-        printf '%s %s %s\n' "$digest" "$mode" "$rel" >> "$src/manifest.txt"
+        printf '%s %s %s\n' "$digest" "$cycle_mode" "$rel" >> "$src/manifest.txt"
         set -- "$@" "payload/$rel"
     done
     mkdir -p "$root/etc/config" "$root/etc/xray"
@@ -118,12 +118,12 @@ assert_new() {
 
 # Optional full transaction test: fake files + either detached test workers or
 # actual supervised procd instances (with explicit --run-procd).
-if [ "$mode" != legacy ]; then
+if [ "$cycle_mode" != legacy ]; then
   txn="$tool_dir/router_pilot_transaction.sh"
   coordinator="$tool_dir/router_pilot_procd_coordinator.sh"
   primary_pid=''
   secondary_pid=''
-  if [ "$mode" = --run-procd ]; then
+  if [ "$cycle_mode" = --run-procd ]; then
     command -v ubus >/dev/null 2>&1 || die 'ubus unavailable'
     command -v jq >/dev/null 2>&1 || die 'jq unavailable'
     ubus list | grep -Fxq service || die 'procd service API unavailable'
@@ -142,7 +142,7 @@ if [ "$mode" != legacy ]; then
       if [ -f "$state/armed" ] && [ ! -f "$state/pending" ]; then
         sh "$txn" abort-supervised >/dev/null 2>&1 || true
       fi
-      if [ "$mode" = --run-procd ] &&
+      if [ "$cycle_mode" = --run-procd ] &&
          [ -s "$state/procd-service-name" ]; then
         sh "$coordinator" stop >/dev/null 2>&1 || true
       fi
@@ -172,7 +172,7 @@ if [ "$mode" != legacy ]; then
   assert_orig
   ok 'ten original FAKE files intact after arming'
 
-  if [ "$mode" = --run-procd ]; then
+  if [ "$cycle_mode" = --run-procd ]; then
     sh "$coordinator" start ||
       die 'real procd did not start both watchdogs'
     ok "both real procd workers ready: $(cat "$state/procd-service-name")"
@@ -223,7 +223,7 @@ if [ "$mode" != legacy ]; then
   done
   ok 'real transaction watchdog restored all ten FAKE client files'
 
-  if [ "$mode" = --run-procd ]; then
+  if [ "$cycle_mode" = --run-procd ]; then
     sh "$coordinator" stop || die 'procd temporary service deletion failed'
     remaining="$(ubus call service list '{}' |
       jq -r 'keys[]' | grep '^ro-pilot-supervised-' || true)"
