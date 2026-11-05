@@ -57,6 +57,18 @@ class GuardedBundleTests(unittest.TestCase):
         self.assertEqual(self.digest, builder.build(other, self.source))
         self.assertEqual(self.bundle.read_bytes(), other.read_bytes())
 
+    def test_nested_symlink_escape_blocks_stage_before_state_creation(self):
+        # The top-level router fixture is regular, but a nested client
+        # directory could accidentally link outside it.
+        nested = self.router / "usr/lib/owrt-remote"
+        saved = self.root / "old-private-client-dir"
+        nested.rename(saved)
+        nested.symlink_to(self.root, target_is_directory=True)
+        r = self.guard('stage', self.bundle, self.digest)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("symlink in router path", r.stderr)
+        self.assertFalse((self.state()/'stage').exists())
+
     def test_verified_stage_and_snapshot_leave_originals_untouched(self):
         original = {name:(self.router/name).read_bytes() for name,_ in builder.FILES}
         p = self.guard('stage', self.bundle, self.digest)
