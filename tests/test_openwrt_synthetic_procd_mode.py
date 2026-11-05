@@ -17,6 +17,7 @@ class CycleProcdModeTests(unittest.TestCase):
     def test_fixture_file_modes_do_not_override_execution_mode(self):
         s=SCRIPT.read_text()
         self.assertIn('cycle_mode="${1:-legacy}"',s)
+        self.assertIn('readonly cycle_mode',s)
         self.assertIn('if [ "$cycle_mode" = --run-procd ]; then',s)
         self.assertIn('file_mode=0755',s)
         self.assertIn('file_mode=0644',s)
