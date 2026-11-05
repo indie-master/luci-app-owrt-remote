@@ -23,6 +23,8 @@ jobs:
           sh -n tools/router_pilot_transaction.sh
           sh -n tools/router_pilot_secondary_guard.sh
           sh -n tools/openwrt_synthetic_update_cycle.sh
+          sh -n tools/openwrt_procd_dual_worker.sh
+          sh -n tools/openwrt_procd_dual_isolated_probe.sh
           sh -n tools/router_pilot_procd_recovery.init
           sh -n tools/openwrt_hardware_compat_probe.sh
           python3 -m py_compile tools/build_router_bundle.py
@@ -41,6 +43,10 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_blueprint.py' -v
       - name: Exercise complete fake OpenWrt update cycle, no procd or live files
         run: sh tools/openwrt_synthetic_update_cycle.sh
+      - name: Offline-check standalone dual procd marker-only probe
+        run: |
+          sh tools/openwrt_procd_dual_isolated_probe.sh --self-test
+          python3 -m unittest discover -s tests -p 'test_procd_dual_isolation_contract.py' -v
       - name: Test procd blueprint to real transaction wiring in disposable root
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_integration.py' -v
       - name: Test opt-in router apply, timeout rollback and boot recovery
