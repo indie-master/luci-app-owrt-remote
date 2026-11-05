@@ -47,13 +47,22 @@ cleanup() {
   if [ -n "$name" ]; then
     d="$(jq -nc --arg n "$name" '{name:$n}')" || d=''
     if [ -n "$d" ]; then
-      ubus call service delete "$d" >/dev/null 2>&1 ||
-        printf 'PROCD-DUAL: WARNING - service deletion not confirmed: %s\n' "$name" >&2
+      if ubus call service delete "$d" >/dev/null 2>&1; then
+        name=''
+      else
+        printf 'PROCD-DUAL: WARNING - service deletion failed: %s (leave fixture until service is gone)\n' "$name" >&2
+        return 0
+      fi
+    else
+      printf 'PROCD-DUAL: WARNING - delete request could not be formed; fixture preserved\n' >&2
+      return 0
     fi
   fi
   if [ -n "$testpid" ]; then
     kill "$testpid" >/dev/null 2>&1 || true
   fi
+  # Preserve worker files if service deletion fails. The separate 45s
+  # safety-cleanup worker can still remove the registered service.
   # Remove only the exact directory created by mktemp, after service delete.
   case "$dir" in
     /tmp/ro-procd-dual.*)
@@ -144,14 +153,32 @@ done
   fail "$target was not restarted by procd"
 say "PASS - $target restarted: $original -> $new"
 
+# The fixture deadline was pinned BEFORE procd registration. Waiting only
+# N seconds after the respawn can end before that absolute deadline. Instead
+# poll until original deadline + bounded 8-second scheduling grace.
+deadline="$(cat "$dir/deadline")" || fail 'fake deadline missing'
+case "$deadline" in ''|*[!0-9]*) fail 'fake deadline invalid' ;; esac
+stop_at=$((deadline + 8))
+say "original fake deadline=$deadline (uptime seconds); observation until=$stop_at"
 i=0
-while [ "$i" -lt 13 ]; do
-  if [ -e "$dir/synthetic-rollback" ] && [ ! -e "$dir/pending" ]; then break; fi
+max_polls=35
+while [ "$i" -lt "$max_polls" ]; do
+  if [ -f "$dir/synthetic-rollback" ] && [ ! -e "$dir/pending" ]; then break; fi
+  check_now="$(awk 'NR==1{print int($1)}' /proc/uptime)" ||
+    fail 'cannot read uptime during observation'
+  case "$check_now" in ''|*[!0-9]*) fail 'invalid observed uptime' ;; esac
+  [ "$check_now" -lt "$stop_at" ] || break
   sleep 1
   i=$((i+1))
 done
-[ -f "$dir/synthetic-rollback" ] || fail 'independent secondary deadline did not fire'
-[ ! -e "$dir/pending" ] || fail 'synthetic pending was not cleared'
+if [ ! -f "$dir/synthetic-rollback" ] || [ -e "$dir/pending" ]; then
+  # Safe diagnostics only: no UUIDs, live file contents or service tokens.
+  check_now="$(awk 'NR==1{print int($1)}' /proc/uptime)" || check_now=unknown
+  say "diagnostic: uptime=$check_now deadline=$deadline stop_at=$stop_at polls=$i"
+  say "diagnostic: primary starts=$(wc -l < "$dir/primary-starts"), secondary starts=$(wc -l < "$dir/secondary-starts")"
+  [ ! -f "$dir/secondary-events" ] || cat "$dir/secondary-events"
+  fail 'independent secondary deadline did not fire within deadline + grace'
+fi
 if [ "$mode" = --run-secondary-crash ]; then
   [ "$(wc -l < "$dir/secondary-starts")" -eq 2 ] ||
     fail 'secondary did not show exactly one supervised restart'
