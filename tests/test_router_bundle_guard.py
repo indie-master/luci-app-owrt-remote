@@ -24,6 +24,7 @@ class GuardedBundleTests(unittest.TestCase):
         self.source = self.root / 'repo'
         self.router = self.root / 'router'
         self.router.mkdir()
+        (self.router / ".ro-pilot-synthetic-root").write_text("TEST ONLY\n")
         for name, _ in builder.FILES:
             p = self.source / 'files' / name
             p.parent.mkdir(parents=True, exist_ok=True)
