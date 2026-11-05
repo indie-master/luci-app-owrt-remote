@@ -312,6 +312,84 @@ restore() {
   say 'ROLLED BACK: on-disk original files restored; check existing LuCI/SSH and service state.'
 }
 
+# Separate, test-only arm/apply phases for a procd-managed rollout.
+# No file may change until TWO independently supervised processes have
+# acknowledged readiness. This closes the legacy apply/nohup gap without
+# enabling real-router mutations in this development branch.
+arm_supervised() {
+  [ "${RO_TEST_MODE:-0}" = 1 ] || fail 'supervised prototype is synthetic-only'
+  [ "$#" -eq 1 ] && hex64 "$1" || fail 'usage: arm-supervised EXACT_SHA256'
+  [ ! -e "$STATE/pending" ] && [ ! -e "$STATE/armed" ] ||
+    fail 'another transaction already exists'
+  [ ! -e "$STATE/transaction.sh" ] ||
+    fail 'transaction script already installed'
+  present "$STATE/secondary-guard.sh" ||
+    fail 'secondary guard missing before arm'
+  identity
+  check_router_tree
+  verify_resources
+  verify_backup
+  critical
+  verify_originals
+  verify_candidate "$1"
+  duration="${RO_PILOT_TIMEOUT:-12}"
+  case "$duration" in ''|*[!0-9]*) fail 'bad timeout' ;; esac
+  [ "$duration" -ge 10 ] && [ "$duration" -le 30 ] ||
+    fail 'supervised synthetic timeout must be 10..30 seconds'
+  lock
+  [ ! -e "$STATE/pending" ] && [ ! -e "$STATE/armed" ] ||
+    fail 'transaction started while waiting for lock'
+  nonce="$(secure_nonce)" || fail 'secure nonce unavailable'
+  now="$(clock_uptime)" || fail 'monotonic clock unavailable'
+  deadline=$((now + duration))
+  # Eliminate stale readiness from an aborted or rolled-back test.
+  rm -f "$STATE/watchdog-ready" "$STATE/secondary-ready"
+  install_boot_recovery
+  printf '%s\n' "$nonce" > "$STATE/confirm-nonce"
+  printf '%s\n' "$duration" > "$STATE/duration"
+  printf '%s\n' "$deadline" > "$STATE/deadline.uptime"
+  : > "$STATE/armed"
+  say "SUPERVISED ARM READY. No client file changed. Deadline=$deadline."
+  say 'Register primary and secondary procd services, then call apply-supervised.'
+  say "ONE-TIME CONFIRM NONCE: $nonce"
+}
+
+apply_supervised() {
+  [ "${RO_TEST_MODE:-0}" = 1 ] || fail 'supervised prototype is synthetic-only'
+  [ "$#" -eq 1 ] && hex64 "$1" ||
+    fail 'usage: apply-supervised EXACT_SHA256'
+  lock
+  [ -f "$STATE/armed" ] && [ ! -e "$STATE/pending" ] ||
+    fail 'supervised transaction not armed or already pending'
+  present "$STATE/watchdog-ready" &&
+  present "$STATE/secondary-ready" ||
+    fail 'both watchdogs must acknowledge readiness before mutation'
+  deadline="$(read_deadline)" || fail 'supervised deadline invalid'
+  now="$(clock_uptime)" || fail 'monotonic clock unavailable'
+  [ "$now" -lt "$deadline" ] || fail 'supervised deadline already expired'
+  identity
+  check_router_tree
+  verify_backup
+  critical
+  verify_originals
+  verify_candidate "$1"
+  # The boot recovery hook and BOTH workers are ready before pending.
+  # Never take down Xray, the reverse tunnel, rpcd, uhttpd or WAN here.
+  : > "$STATE/pending"
+  for rel in $FILES; do
+    src="$STATE/stage/unpacked/payload/$rel"
+    dst="$(at "$rel")"
+    mode="$(awk -v n="$rel" '$3==n{print $2}' "$STATE/stage/unpacked/manifest.txt")"
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst.ro-new-$" || { restore; fail "copy failed $rel"; }
+    chmod "$mode" "$dst.ro-new-$" || { restore; fail "chmod failed $rel"; }
+    mv -f "$dst.ro-new-$" "$dst" || { restore; fail "rename failed $rel"; }
+  done
+  critical || { restore; fail 'critical config changed during supervised apply'; }
+  say 'SUPERVISED APPLIED ON DISK: old runtime still running, Xray never restarted.'
+  say 'Confirm only after independent acceptance probes; timeout restores disk.'
+}
+
 apply() {
   [ "$#" -eq 1 ] || fail 'usage: apply EXACT_SHA256'
   hex64 "$1" || fail 'expected SHA-256 required'
@@ -487,6 +565,8 @@ boot_recover() {
 }
 
 case "${1:-}" in
+  arm-supervised) shift; arm_supervised "$@" ;;
+  apply-supervised) shift; apply_supervised "$@" ;;
   apply) shift; apply "$@" ;;
   confirm) shift; confirm "$@" ;;
   rollback) shift; [ "$#" -eq 0 ] || fail 'rollback accepts no args'; lock; restore ;;
