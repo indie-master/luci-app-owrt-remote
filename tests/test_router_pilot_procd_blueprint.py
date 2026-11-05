@@ -19,6 +19,8 @@ class ProcdRecoveryBlueprintTests(unittest.TestCase):
         self.root = Path(tmp.name) / "synthetic-router"
         self.state = self.root / "etc/router-orchestrator/upgrade"
         self.state.mkdir(parents=True)
+        (self.root / ".ro-pilot-synthetic-root").write_text("TEST ONLY\n")
+        (self.state / "secondary-guard.sh").write_text("#!/bin/sh\nexit 0\n")
         self.log = Path(tmp.name) / "calls.log"
         self.transaction = self.state / "transaction.sh"
         self.transaction.write_text(
@@ -72,7 +74,7 @@ fi
         self.assertIn("open rollback-watchdog", calls)
         self.assertIn(
             f"set command /bin/sh {self.transaction} watchdog", calls)
-        self.assertIn("set respawn 3600 2 3", calls)
+        self.assertIn("set respawn 3600 2 0", calls)
         self.assertIn("close", calls)
         self.assertNotIn("owrt-remote", calls)
 
@@ -83,6 +85,24 @@ fi
         result, calls = self.run_blueprint(boot=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, "transaction boot-recover\n")
+
+    def test_two_independent_supervised_instances_and_unlimited_retry(self):
+        (self.state / "armed").touch()
+        (self.state / "deadline.uptime").write_text("12345\n")
+        result, calls = self.run_blueprint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls.count("open rollback-watchdog"), 1)
+        self.assertEqual(calls.count("open independent-deadline-guard"), 1)
+        self.assertIn(f"set command /bin/sh {self.state / 'secondary-guard.sh'}",calls)
+        self.assertEqual(calls.count("set respawn 3600 2 0"), 2)
+
+    def test_missing_secondary_guard_fails_closed_before_registering(self):
+        (self.state / "armed").touch()
+        (self.state / "deadline.uptime").write_text("12345\n")
+        (self.state / "secondary-guard.sh").unlink()
+        result, calls = self.run_blueprint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, "")
 
     def test_same_boot_pending_registers_watchdog_without_rollback(self):
         (self.state / "pending").touch()
@@ -128,7 +148,7 @@ fi
         (self.state / "confirmed").touch()
         result, calls = self.run_blueprint(cleanup=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, "kill ro-pilot-recovery rollback-watchdog\n")
+        self.assertEqual(calls, "kill ro-pilot-recovery rollback-watchdog\nkill ro-pilot-recovery independent-deadline-guard\n")
 
     def test_cleanup_live_registration_is_disabled(self):
         (self.state / "confirmed").touch()
