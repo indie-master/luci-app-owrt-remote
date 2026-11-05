@@ -104,14 +104,25 @@ usr/share/luci/menu.d/luci-app-owrt-remote.json
 usr/share/rpcd/acl.d/luci-app-owrt-remote.json
 www/luci-static/resources/view/owrt_remote.js'
 for rel in install.sh $files; do
-    mkdir -p "$stage/$(dirname "$rel")"
-    dst="$stage/$rel"
+    case "$rel" in
+        install.sh) dst="$stage/install.sh" ;;
+        *) dst="$stage/files/$rel" ;;
+    esac
+    mkdir -p "$(dirname "$dst")"
     if [ "$test_mode" = 1 ]; then
         source_dir="${RO_FRESH_TEST_SOURCE:-}"
         [ -d "$source_dir" ] || fatal 'test source unavailable'
-        cp "$source_dir/$rel" "$dst" || fatal "missing test payload: $rel"
+        case "$rel" in
+            install.sh) input="$source_dir/install.sh" ;;
+            *) input="$source_dir/files/$rel" ;;
+        esac
+        cp "$input" "$dst" || fatal "missing test payload: $rel"
     else
-        wget -T 15 -O "$dst" "$src_base/$rel" >/dev/null 2>&1 ||
+        case "$rel" in
+            install.sh) url="$src_base/install.sh" ;;
+            *) url="$src_base/files/$rel" ;;
+        esac
+        wget -T 15 -O "$dst" "$url" >/dev/null 2>&1 ||
             fatal "download failed before installation: $rel"
     fi
     [ -s "$dst" ] && [ ! -L "$dst" ] ||
