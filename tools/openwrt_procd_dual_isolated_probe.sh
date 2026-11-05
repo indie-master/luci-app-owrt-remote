@@ -9,7 +9,7 @@ fail() { printf 'PROCD-DUAL: FAIL - %s\n' "$*" >&2; exit 1; }
 say() { printf 'PROCD-DUAL: %s\n' "$*"; }
 
 mode="${1:-}"
-case "$mode" in --run|--self-test) ;; *) fail 'usage: sh probe.sh --self-test | --run' ;; esac
+case "$mode" in --run|--run-secondary-crash|--self-test) ;; *) fail 'usage: sh probe.sh --self-test | --run | --run-secondary-crash' ;; esac
 tool_dir="$(cd -P "$(dirname "$0")" && pwd -P)" || fail 'invalid script directory'
 worker="$tool_dir/openwrt_procd_dual_worker.sh"
 [ -f "$worker" ] && [ ! -L "$worker" ] || fail 'paired worker missing'
@@ -18,7 +18,7 @@ sh -n "$worker" || fail 'worker syntax error'
 for app in mktemp mkdir rm cat awk grep sed wc sleep sh jq; do
   command -v "$app" >/dev/null 2>&1 || fail "missing applet $app"
 done
-if [ "$mode" = --run ]; then
+if [ "$mode" = --run ] || [ "$mode" = --run-secondary-crash ]; then
   for app in ubus dd hexdump; do
     command -v "$app" >/dev/null 2>&1 || fail "missing $app"
   done
@@ -37,7 +37,7 @@ case "$now" in ''|*[!0-9]*) fail 'invalid monotonic uptime' ;; esac
 if [ "$mode" = --self-test ]; then
   timeout_seconds=2
 else
-  timeout_seconds=8
+  timeout_seconds=16
 fi
 printf '%s\n' "$((now + timeout_seconds))" > "$dir/deadline"
 
@@ -118,20 +118,31 @@ secondary="$(sed -n '1p' "$dir/secondary-starts")"
 case "$old:$secondary" in *[!0-9:]*|'') fail 'bad worker PIDs' ;; esac
 say "initial primary pid=$old; independent secondary pid=$secondary"
 
-signal="$(jq -nc --arg n "$name" '{name:$n,instance:"primary",signal:9}')"
+if [ "$mode" = --run-secondary-crash ]; then
+  target=secondary
+  starts="$dir/secondary-starts"
+  original="$secondary"
+else
+  target=primary
+  starts="$dir/primary-starts"
+  original="$old"
+fi
+signal="$(jq -nc --arg n "$name" --arg target "$target" \
+  '{name:$n,instance:$target,signal:9}')"
 ubus call service signal "$signal" >/dev/null ||
-  fail 'could not signal primary test instance'
+  fail "could not signal $target test instance"
 
 i=0
+new=''
 while [ "$i" -lt 9 ]; do
-  new="$(sed -n '2p' "$dir/primary-starts" 2>/dev/null || true)"
+  new="$(sed -n '2p' "$starts" 2>/dev/null || true)"
   [ -n "$new" ] && break
   sleep 1
   i=$((i+1))
 done
-[ -n "${new:-}" ] && [ "$old" != "$new" ] ||
-  fail 'primary was not restarted by procd'
-say "PASS - primary restarted: $old -> $new"
+[ -n "$new" ] && [ "$original" != "$new" ] ||
+  fail "$target was not restarted by procd"
+say "PASS - $target restarted: $original -> $new"
 
 i=0
 while [ "$i" -lt 13 ]; do
@@ -141,8 +152,15 @@ while [ "$i" -lt 13 ]; do
 done
 [ -f "$dir/synthetic-rollback" ] || fail 'independent secondary deadline did not fire'
 [ ! -e "$dir/pending" ] || fail 'synthetic pending was not cleared'
-[ "$(wc -l < "$dir/secondary-starts")" -eq 1 ] ||
-  fail 'secondary unexpectedly restarted'
+if [ "$mode" = --run-secondary-crash ]; then
+  [ "$(wc -l < "$dir/secondary-starts")" -eq 2 ] ||
+    fail 'secondary did not show exactly one supervised restart'
+  [ "$(wc -l < "$dir/primary-starts")" -eq 1 ] ||
+    fail 'primary unexpectedly restarted'
+else
+  [ "$(wc -l < "$dir/secondary-starts")" -eq 1 ] ||
+    fail 'secondary unexpectedly restarted'
+fi
 say 'PASS - secondary independently expired original deadline and cleared fake pending'
 say 'PASS - no Remote HUB, UCI, Xray, TCP/18443 or live configuration modified'
 say 'deleting isolated procd service and temporary marker files'
