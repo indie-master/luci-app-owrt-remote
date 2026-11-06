@@ -479,6 +479,40 @@ external Belt SSH/LuCI acceptance. Only after the first live `main`
 canary succeeds may the fleet be updated sequentially, stopping on
 the first failure.
 
+## Isolated real-procd heartbeat lifecycle — one final targeted hardware gate
+
+Added `tools/openwrt_runtime_heartbeat_probe.sh`. It creates a
+random, uniquely named temporary `ro-runtime-test-XXXXXXXX` service
+containing two **fake** long-running workers labelled `xray` and
+`heartbeat`. The test uses the actual OpenWrt `procd` `service add`,
+`service signal` and `service list` APIs to exercise
+`tools/router_heartbeat_activation.sh` in synthetic-only
+`--activate` and `--restore` modes. The fixture contains a fake
+transaction `pending` marker, then a `rolled-back` marker.
+
+The test must prove the heartbeat PID changes at each step and the
+fake Xray PID **never changes**. Service cleanup must be verified from
+`ubus`, including bounded polling; failed cleanup preserves the
+temporary root for diagnosis. It never signals the production
+`owrt-remote` service.
+
+The previously successful ten-file fake-root rollback **does not need
+another hardware run**. `tools/openwrt_release_hardware_gate.sh`
+now accepts `--runtime-only FULL_SHA`, which exercises only the
+new heartbeat lifecycle and compares the *real* `owrt-remote` Xray
+and heartbeat PIDs before and after. The full `--run FULL_SHA`
+mode remains available for fresh environments, but is unnecessary on
+the already validated Cudy.
+
+The real `heartbeat` activation path still rejects execution:
+the remaining production code must wire persistent boot recovery,
+use a truly independent Belt acceptance signal, activate only the
+live `heartbeat`, and restore the previous runtime version
+automatically on timeout, never restarting the Xray reverse instance.
+A one-router canary with local recovery is required before fleet
+rollout. The experimental `apply` is deliberately hard-disabled
+on real router roots.
+
 ## Rollout sequence when production updater is ready
 
 1. Freeze one full source commit and record archive digest; verify no
