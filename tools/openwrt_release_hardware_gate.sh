@@ -8,8 +8,12 @@ export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 fail() { printf 'RELEASE-GATE: BLOCKED - %s\n' "$*" >&2; exit 1; }
 say() { printf 'RELEASE-GATE: %s\n' "$*"; }
 
-[ "${1:-}" = --run ] && [ "$#" -eq 2 ] ||
-  fail 'usage: --run EXACT_40_HEX_COMMIT'
+mode="${1:-}"
+case "$mode" in --run|--runtime-only) ;;
+    *) fail 'usage: --run|--runtime-only EXACT_40_HEX_COMMIT' ;;
+esac
+[ "$#" -eq 2 ] ||
+  fail 'usage: --run|--runtime-only EXACT_40_HEX_COMMIT'
 rev="$2"
 case "$rev" in ''|*[!0-9a-f]*) fail 'invalid commit' ;; esac
 [ "${#rev}" -eq 40 ] || fail 'full immutable commit required'
@@ -21,7 +25,7 @@ ubus list | grep -Fxq service || fail 'procd service ubus API unavailable'
 # Do not reuse names or auto-delete old test processes. A leftover service
 # might still rely on its associated fake-root recovery files.
 leftover="$(ubus call service list '{}' | jq -r 'keys[]' |
-  awk '/^ro-(pilot-supervised|procd-(probe|dual))-/')"
+  awk '/^ro-(pilot-supervised|runtime-test|procd-(probe|dual))-/')"
 [ -z "$leftover" ] || fail "old isolated procd service remains: $leftover"
 
 main_before="$(ubus call service list '{"name":"owrt-remote"}')"
@@ -49,7 +53,7 @@ cleanup() {
   set +e
   surviving="$(ubus call service list '{}' 2>/dev/null |
     jq -r 'keys[]' 2>/dev/null |
-    grep '^ro-pilot-supervised-' || true)"
+    grep -E '^ro-(pilot-supervised|runtime-test)-' || true)"
   if [ -n "$surviving" ]; then
     directory_safe=0
     printf 'RELEASE-GATE: WARNING - test procd still registered: %s\n' "$surviving" >&2
@@ -68,7 +72,8 @@ trap 'exit 130' HUP INT TERM
 base="https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/$rev/tools"
 for f in router_bundle_guard.sh router_pilot_transaction.sh \
          router_pilot_secondary_guard.sh router_pilot_procd_coordinator.sh \
-         openwrt_synthetic_update_cycle.sh router_heartbeat_activation.sh; do
+         openwrt_synthetic_update_cycle.sh router_heartbeat_activation.sh \
+         openwrt_runtime_heartbeat_probe.sh; do
   wget -O "$work/$f" "$base/$f" >/dev/null ||
     fail "failed to fetch pinned $f"
   [ -s "$work/$f" ] && [ ! -L "$work/$f" ] ||
@@ -81,9 +86,25 @@ grep -Fq 'readonly cycle_mode' "$work/openwrt_synthetic_update_cycle.sh" ||
 grep -Fq 'wait_deleted "$name"' "$work/router_pilot_procd_coordinator.sh" ||
   fail 'coordinator has no asynchronous teardown verification'
 
-say "start: pinned commit $rev"
+say "start: pinned commit $rev, mode=$mode"
 say "pre-test Xray PID=$xray_before, heartbeat PID=$heartbeat_before"
 log="$work/procd-acceptance.log"
+if [ "$mode" = --runtime-only ]; then
+  if sh "$work/openwrt_runtime_heartbeat_probe.sh" --run \
+      "$work/router_heartbeat_activation.sh" > "$log" 2>&1; then
+    cat "$log"
+  else
+    cat "$log"
+    fail 'isolated heartbeat procd activation/restore failed'
+  fi
+  for phrase in \
+    'PASS - targeted fake heartbeat activation, fake Xray PID unchanged' \
+    'PASS - targeted fake heartbeat rollback activation, fake Xray PID unchanged' \
+    'PASS - isolated real-procd heartbeat lifecycle'; do
+    grep -Fq "$phrase" "$log" ||
+      fail "runtime proof missing: $phrase"
+  done
+else
 if sh "$work/openwrt_synthetic_update_cycle.sh" --run-procd > "$log" 2>&1; then
   cat "$log"
 else
@@ -100,6 +121,7 @@ for phrase in \
   grep -Fq "$phrase" "$log" ||
     fail "required acceptance evidence missing: $phrase"
 done
+fi
 after="$(ubus call service list '{"name":"owrt-remote"}')" ||
   fail 'cannot inspect original remote hub'
 xray_after="$(getpid "$after" xray)" ||
@@ -112,9 +134,13 @@ heartbeat_after="$(getpid "$after" heartbeat)" ||
   fail "heartbeat PID changed ($heartbeat_before -> $heartbeat_after)"
 
 remaining="$(ubus call service list '{}' |
-  jq -r 'keys[]' | grep '^ro-pilot-supervised-' || true)"
+  jq -r 'keys[]' | grep -E '^ro-(pilot-supervised|runtime-test)-' || true)"
 [ -z "$remaining" ] || fail "test procd still listed: $remaining"
 say 'PASS - working Xray and heartbeat PIDs unchanged'
 say 'PASS - temporary procd service absent'
-say 'PASS - combined hardware fake-root rollout/rollback gate'
+if [ "$mode" = --runtime-only ]; then
+  say 'PASS - real isolated procd heartbeat activation + rollback, no working process signaled'
+else
+  say 'PASS - combined hardware fake-root rollout/rollback gate'
+fi
 say 'NOTE - production deployment remains disabled; this is NOT a live client upgrade'
