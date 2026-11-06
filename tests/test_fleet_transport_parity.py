@@ -112,7 +112,7 @@ class FleetReleaseContracts(unittest.TestCase):
         self.assertIn('existing" = ws',s)
         self.assertIn('existing" = tcp',s)
         self.assertIn('install_config()',s)
-        self.assertIn('transport_preflight\\n',s)
+        self.assertRegex(s,r'(?m)^transport_preflight$')
     def test_non_pilot_fleet_checker_never_changes_real_services(self):
         s=CHECK.read_text()
         for operation in ("uci set","uci commit","service restart","service stop",
