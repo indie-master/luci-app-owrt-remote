@@ -61,6 +61,32 @@ def build_candidate(source, *, host, sni, path, port):
             "tlsSettings": {"serverName": sni, "allowInsecure": False, "alpn": ["http/1.1"]},
             "wsSettings": {"path": path, "host": sni},
         }
+    # Xray releases that enforce outbound access policies require narrow
+    # per-service allow rules for reverse-originated Freedom redirects.
+    # Do not add a blanket allow rule or relax a preexisting restrictive rule.
+    for tag in ("router-admin", "router-ssh"):
+        matches = [x for x in outbounds if isinstance(x, dict) and x.get("tag") == tag]
+        if len(matches) != 1 or matches[0].get("protocol") != "freedom":
+            raise CandidateError("missing or invalid local management outbound")
+        settings = matches[0].get("settings")
+        if not isinstance(settings, dict):
+            raise CandidateError("missing management settings")
+        redirect = settings.get("redirect")
+        if not isinstance(redirect, str) or redirect.count(":") != 1:
+            raise CandidateError("unsupported management redirect")
+        address, target_port = redirect.rsplit(":", 1)
+        if address not in ("127.0.0.1", "localhost", "::1") or not target_port.isdecimal():
+            # Fail closed instead of granting remote network access.
+            raise CandidateError("management redirect must be loopback")
+        target_port = int(target_port)
+        if not 1 <= target_port <= 65535:
+            raise CandidateError("invalid management redirect port")
+        expected = {"action": "allow", "network": "tcp", "port": target_port}
+        existing = settings.get("finalRules")
+        if existing is None:
+            settings["finalRules"] = [expected]
+        elif not isinstance(existing, list) or len(existing) != 1 or existing[0] != expected:
+            raise CandidateError("existing management access rules require manual review")
     return candidate
 
 
