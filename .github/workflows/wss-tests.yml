@@ -26,6 +26,7 @@ jobs:
           sh -n tools/router_heartbeat_activation.sh
           sh -n tools/openwrt_release_hardware_gate.sh
           sh -n tools/openwrt_runtime_heartbeat_probe.sh
+          sh -n tools/router_live_pilot_inventory.sh
           sh -n tools/router_pilot_secondary_guard.sh
           sh -n tools/openwrt_synthetic_update_cycle.sh
           sh -n tools/openwrt_procd_dual_worker.sh
@@ -62,6 +63,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_integration.py' -v
       - name: Contract-check one-shot OpenWrt hardware acceptance runner
         run: python3 -m unittest discover -s tests -p 'test_openwrt_release_hardware_gate.py' -v
+      - name: Guard live Cudy read-only release inventory contract
+        run: python3 -m unittest discover -s tests -p 'test_router_live_pilot_inventory.py' -v
       - name: Contract-check isolated real procd heartbeat runtime probe
         run: python3 -m unittest discover -s tests -p 'test_openwrt_runtime_heartbeat_probe.py' -v
       - name: Test heartbeat-only runtime activation with Xray PID invariance
