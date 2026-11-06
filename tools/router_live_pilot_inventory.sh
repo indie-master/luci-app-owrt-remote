@@ -61,6 +61,11 @@ leftovers="$(printf '%s\n' "$all" | jq -r 'keys[]' |
   awk '/^ro-(pilot-supervised|runtime-test|procd-(probe|dual))-/')"
 [ -z "$leftovers" ] || die "stale test service: $leftovers"
 say 'PASS - no transaction/recovery collisions or temporary procd instances'
+say '===== CRITICAL CONFIG DIGESTS (HASH ONLY, NEVER FILE CONTENT) ====='
+[ -f /etc/config/owrtremote ] && [ ! -L /etc/config/owrtremote ] ||
+  die 'UCI configuration must be a regular file'
+sha256sum /etc/config/owrtremote /etc/xray/owrt-remote-client.json ||
+  die 'cannot calculate critical config digests'
 
 [ -f /etc/init.d/owrt-remote ] &&
 [ ! -L /etc/init.d/owrt-remote ] || die 'main init script not regular'
