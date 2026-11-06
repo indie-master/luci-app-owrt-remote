@@ -28,7 +28,6 @@ class LivePilotInventoryTests(unittest.TestCase):
         self.assertIn('START',s)
         self.assertIn('sha256sum "/$rel"',s)
         self.assertIn('READ-ONLY BASELINE PASS',s)
-        self.assertIn('two', "two") # purposeful positive control of test setup
     def test_explicit_main_only_and_state_conflict(self):
         s=SCRIPT.read_text()
         self.assertIn('[ "$router_id" = main ]',s)
