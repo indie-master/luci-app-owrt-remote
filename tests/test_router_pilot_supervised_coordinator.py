@@ -141,17 +141,14 @@ else:
         self.assertEqual(applied.returncode,0,applied.stdout+applied.stderr)
         rolled=self.fx.run_cmd(TXN,"rollback",env=self.env)
         self.assertEqual(rolled.returncode,0,rolled.stdout+rolled.stderr)
-        # Force a persistent entry; bound the test runtime by overriding
-        # 'sleep' in PATH to a no-op. The coordinator still polls exactly
-        # 25 times and must fail without removing the service identifier.
-        fastsleep=self.mockdir/"sleep"
-        fastsleep.write_text("#!/bin/sh\\nexit 0\\n")
-        fastsleep.chmod(0o700)
-        env={**self.env,"RO_COORD_MOCK_DELETE_POLLS":"999"}
+        # Force a persistent entry and shorten only this synthetic
+        # test's retry window to 3 polls, never touching live OpenWrt.
+        env={**self.env,"RO_COORD_MOCK_DELETE_POLLS":"999",
+             "RO_TEST_MAX_DELETE_POLLS":"3"}
         result=subprocess.run(["sh",str(COORD),"stop"],
             env=env,text=True,capture_output=True,timeout=12)
         self.assertNotEqual(result.returncode,0)
-        self.assertIn("still listed after 25s",result.stderr)
+        self.assertIn("still listed after polling limit",result.stderr)
         self.assertTrue((self.fx.state/"procd-service-name").exists())
         self.assertTrue((self.fx.state/"mock-ubus-registered").exists())
 
