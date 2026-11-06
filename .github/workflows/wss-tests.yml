@@ -24,6 +24,7 @@ jobs:
           sh -n tools/router_fresh_install.sh
           sh -n tools/router_pilot_procd_coordinator.sh
           sh -n tools/router_heartbeat_activation.sh
+          sh -n tools/openwrt_release_hardware_gate.sh
           sh -n tools/router_pilot_secondary_guard.sh
           sh -n tools/openwrt_synthetic_update_cycle.sh
           sh -n tools/openwrt_procd_dual_worker.sh
@@ -58,6 +59,8 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_procd_dual_isolation_contract.py' -v
       - name: Test procd blueprint to real transaction wiring in disposable root
         run: python3 -m unittest discover -s tests -p 'test_router_pilot_procd_integration.py' -v
+      - name: Contract-check one-shot OpenWrt hardware acceptance runner
+        run: python3 -m unittest discover -s tests -p 'test_openwrt_release_hardware_gate.py' -v
       - name: Test heartbeat-only runtime activation with Xray PID invariance
         run: python3 -m unittest discover -s tests -p 'test_router_heartbeat_activation.py' -v
       - name: Test two-phase supervised procd coordinator with fake ubus
