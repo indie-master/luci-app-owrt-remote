@@ -513,6 +513,55 @@ A one-router canary with local recovery is required before fleet
 rollout. The experimental `apply` is deliberately hard-disabled
 on real router roots.
 
+## Preparing the first live canary without changing the router
+
+The Cudy real-procd synthetic rollback and heartbeat-only activation
+hardware gates have **both passed**. The second gate reported:
+`ro-runtime-test-283191ea`, fake heartbeat
+`2770 -> 2816 -> 2848`, fake Xray PID unchanged at `2769`;
+the real managed launcher PIDs `5945` (Xray instance) and
+`5946` (heartbeat) remained stable, and all temporary procd
+services were removed.
+
+**The next step is a read-only production inventory, not another
+synthetic worker test.** Run `tools/router_live_pilot_inventory.sh
+--inspect` on the explicitly chosen Cudy `main`. It validates:
+
+- Existing UCI main identity, TCP/18443 reverse contract and only the
+  approved Xray JSON path without displaying credentials.
+- Both real procd instances running, their PIDs, and main boot
+  priority later than the proposed early recovery priority 08.
+- No persistent unfinished upgrade or recovery hook/name collision.
+- Checksums of the exact ten installed client files and the two
+  secret-bearing UCI/Xray JSON files (prints **hashes only**).
+- Adequate RAM and persistent overlay reserve, and no symlink escapes.
+
+Any unexpected result is a blocker. Do not immediately use
+`router_bundle_guard.sh stage` or `snapshot` on the live router:
+those create persistent filesystem state and require a reviewed release
+bundle and exact approved digest. Keep the existing source paths
+and snapshot result for analysis before staging.
+
+The read-only **Belt-side** verifier `tools/belt_router_acceptance.py`
+accepts explicit `--ssh-host`, `--ssh-port`, and `--luci-url`
+arguments. It checks a valid SSH-2.0 banner without authentication and
+LuCI HTTP 200 (no redirects). This script does not confirm the
+upgrade or change Belt. No endpoint is guessed from the Cudy's client
+`vps_port=18443`: the reverse router SSH and LuCI listener ports
+must be selected from actual Belt configuration. After the real
+heartbeat canary is activated, the external acceptance output,
+unchanged Xray PID/config, and explicit nonce confirmation all must
+agree **before** watchdogs are disarmed.
+
+**Still release-blocking:** a reviewed production transaction supporting
+persistent boot rollback, a backup of all ten files, dedicated
+supervised watchdogs, targeted heartbeat cutover/rollback on the
+*actual* service, recovery without SSH, and externally verified
+Belt acceptance. None of the current test tools has enabled
+live `apply` or mass fleet deployment. A full green CI and a
+read-only inventory are necessary, not sufficient, for a production
+release.
+
 ## Rollout sequence when production updater is ready
 
 1. Freeze one full source commit and record archive digest; verify no
