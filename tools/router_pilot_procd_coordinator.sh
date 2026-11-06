@@ -60,6 +60,14 @@ service_absent() {
 wait_deleted() {
     expected="$1"
     max_checks="${2:-25}"
+    # Tests can shorten the polling bound without changing the normal
+    # OpenWrt limit. Valid only for this marked fake-root coordinator.
+    if [ -n "${RO_TEST_MAX_DELETE_POLLS:-}" ]; then
+        max_checks="$RO_TEST_MAX_DELETE_POLLS"
+        case "$max_checks" in ''|*[!0-9]*) die 'invalid test delete poll limit' ;; esac
+        [ "$max_checks" -ge 1 ] && [ "$max_checks" -le 25 ] ||
+            die 'test delete poll limit outside 1..25'
+    fi
     checks=0
     while [ "$checks" -lt "$max_checks" ]; do
         if service_absent "$expected"; then
@@ -116,7 +124,7 @@ if [ "$action" = stop ]; then
     if ! service_absent "$name"; then
         delete_service "$name" || die 'supervised service deletion request failed'
         wait_deleted "$name" 25 ||
-            die "service delete acknowledged but still listed after 25s: $name; identity preserved"
+            die "service delete acknowledged but still listed after polling limit: $name; identity preserved"
     fi
     # Only now is it safe for the caller to remove the fake router tree.
     rm -f "$state/procd-service-name" ||
