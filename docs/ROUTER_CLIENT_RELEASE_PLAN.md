@@ -450,6 +450,35 @@ the rollback path each preserve the existing reverse Xray PID.
 Only then can the rollout progress from `main` to the other
 routers one at a time.
 
+## 2026-11-06 Cudy full real-procd hardware acceptance: PASS
+
+The operator executed the immutable `1a25a6a3002eb565efc589c697927affed91c49f`
+`openwrt_release_hardware_gate.sh --run` on Cudy. Full actual stdout
+confirmed the entire temporary real-procd + ten-file synthetic-root
+transaction, including cleanup. Key evidence:
+
+- Working procd processes before/after remained **Xray PID 5945** and
+  **heartbeat PID 5946**; the real live agent/UCI/Xray hashes stayed intact.
+- Temporary service `ro-pilot-supervised-1202adb6` registered **two
+  independent real procd watchdogs** and acknowledged readiness.
+- All ten **FAKE** client files were replaced only after both watchers
+  were ready, then automatically restored after the original deadline.
+- Coordinator reported `PASS - supervised fake-router service removed
+  and absence verified`. An independent subsequent check reported
+  `PASS - temporary procd service absent`, with all acceptance phrases
+  present. Thus the previously failing async-teardown gate is **closed**.
+- The test explicitly ended with `production deployment remains disabled`.
+  No live client upgrade or running heartbeat activation was performed.
+
+**Decision:** Do not repeat the already-passed ten-file fake-root
+exercise on Cudy. Focus only on the two remaining release blockers:
+(1) real-procd verification of targeted `heartbeat`-only activation
+and rollback while keeping Xray PID constant and (2) the separately
+reviewed production transaction with *persistent* boot recovery and
+external Belt SSH/LuCI acceptance. Only after the first live `main`
+canary succeeds may the fleet be updated sequentially, stopping on
+the first failure.
+
 ## Rollout sequence when production updater is ready
 
 1. Freeze one full source commit and record archive digest; verify no
