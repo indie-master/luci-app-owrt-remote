@@ -98,8 +98,8 @@ class RouterPilotTransactionTests(unittest.TestCase):
     def test_supervised_temp_filename_uses_process_id_not_literal_dollar(self):
         script=TRANSACTION.read_text()
         self.assertNotIn('"$dst.ro-new-$"',script)
-        self.assertIn('ro-new-$"',script)
-        self.assertIn('ro-restore-$"',script)
+        self.assertIn('"$dst.ro-new-$$"',script)
+        self.assertIn('"$dst.ro-restore-$$"',script)
 
     def test_supervised_two_phase_blocks_changes_until_both_workers_ready(self):
         self.prepared()
