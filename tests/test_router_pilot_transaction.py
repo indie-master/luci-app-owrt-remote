@@ -438,6 +438,30 @@ class RouterPilotTransactionTests(unittest.TestCase):
         finally:
             self.cleanup_watchdog()
 
+    def test_cudy_six_existing_four_missing_files_restore_exact_inventory(self):
+        # Mirror the actual read-only Cudy inventory: 6 present / 4 absent.
+        # Deployment must add all new files, then restore the six old files
+        # and REMOVE exactly the four that did not exist before the update.
+        missing=(
+            'usr/lib/owrt-remote/wan.sh',
+            'usr/lib/owrt-remote/logs.sh',
+            'etc/init.d/owrt-remote-logs',
+            'etc/hotplug.d/iface/99-owrt-remote'
+        )
+        for rel in missing:
+            (self.router/rel).unlink()
+            del self.old[rel]
+        self.prepared()
+        self.apply()
+        for rel in missing:
+            self.assertTrue((self.router/rel).is_file(),rel)
+        recovered=self.run_cmd(TRANSACTION,'rollback')
+        self.assertEqual(recovered.returncode,0,recovered.stdout+recovered.stderr)
+        for rel in missing:
+            self.assertFalse((self.router/rel).exists(),rel)
+        self.restore_assertions()
+        self.assertFalse((self.state/'pending').exists())
+
     def test_new_files_remain_restorable_when_originals_were_absent(self):
         n='usr/lib/owrt-remote/wan.sh'
         (self.router/n).unlink()
