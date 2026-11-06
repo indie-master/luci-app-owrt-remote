@@ -87,7 +87,7 @@ case "$1" in
     xray|heartbeat) exec sleep 180 ;;
     safety)
         sleep 110
-        /usr/bin/ubus call service delete "{\"name\":\"$2\"}" >/dev/null 2>&1 || true ;;
+        ubus call service delete "{\"name\":\"$2\"}" >/dev/null 2>&1 || true ;;
     *) exit 2 ;;
 esac
 EOF
