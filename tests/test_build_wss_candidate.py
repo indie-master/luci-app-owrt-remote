@@ -21,7 +21,7 @@ def fixture():
         for tag in ("vps-interconn", "vps-ssh-interconn")
     ]
     return {"routing": {"rules": [{"outboundTag": "direct"}]},
-            "outbounds": links + [{"tag": "direct", "protocol": "freedom"}]}
+            "outbounds": links + [{"tag": "router-admin", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:80"}}, {"tag": "router-ssh", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:22"}}, {"tag": "direct", "protocol": "freedom"}]}
 
 
 class WssCandidateTests(unittest.TestCase):
@@ -31,7 +31,11 @@ class WssCandidateTests(unittest.TestCase):
                                         sni="swiftlessvpn.ru", path="/owrt-ws/", port=443)
         self.assertEqual(source["outbounds"][0]["streamSettings"]["network"], "tcp")
         self.assertEqual(result["routing"], source["routing"])
-        self.assertEqual(result["outbounds"][2], source["outbounds"][2])
+        self.assertEqual(result["outbounds"][4], source["outbounds"][4])
+        self.assertEqual(result["outbounds"][2]["settings"]["finalRules"],
+                         [{"action": "allow", "network": "tcp", "port": 80}])
+        self.assertEqual(result["outbounds"][3]["settings"]["finalRules"],
+                         [{"action": "allow", "network": "tcp", "port": 22}])
         for link in result["outbounds"][:2]:
             self.assertEqual(link["settings"]["id"], "PRIVATE-UUID")
             self.assertEqual(link["settings"]["port"], 443)
@@ -55,6 +59,20 @@ class WssCandidateTests(unittest.TestCase):
                 with self.assertRaises(module.CandidateError):
                     module.build_candidate(candidate, host="swiftlessvpn.ru",
                                            sni="swiftlessvpn.ru", path="/owrt-ws/", port=443)
+
+    def test_fail_closed_on_remote_redirect_or_broad_rules(self):
+        for redirect in ("0.0.0.0:80", "192.168.1.1:80", "127.0.0.1:0", "127.0.0.1:100000"):
+            with self.subTest(redirect=redirect):
+                data = fixture()
+                data["outbounds"][2]["settings"]["redirect"] = redirect
+                with self.assertRaises(module.CandidateError):
+                    module.build_candidate(data, host="swiftlessvpn.ru",
+                                           sni="swiftlessvpn.ru", path="/owrt-ws/", port=443)
+        data = fixture()
+        data["outbounds"][2]["settings"]["finalRules"] = [{"action": "allow", "network": "tcp"}]
+        with self.assertRaises(module.CandidateError):
+            module.build_candidate(data, host="swiftlessvpn.ru",
+                                   sni="swiftlessvpn.ru", path="/owrt-ws/", port=443)
 
     def test_output_is_private_exclusive_and_never_logs_credentials(self):
         with tempfile.TemporaryDirectory() as folder:
