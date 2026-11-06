@@ -47,6 +47,29 @@ delete_service() {
         die 'cannot encode service deletion'
     ubus call service delete "$request"
 }
+# ubus service/delete acknowledges a deletion request, not necessarily
+# the full asynchronous shutdown of every procd-managed instance. Never
+# remove our recovery identity or call the test PASS until service/list no
+# longer exposes the exact name. Fail closed on ubus or JSON errors.
+service_absent() {
+    seen="$(service_present "$1")" || return 1
+    [ -n "$seen" ] || return 1
+    printf '%s\n' "$seen" |
+        jq -e --arg n "$1" 'type == "object" and (has($n) | not)' >/dev/null 2>&1
+}
+wait_deleted() {
+    expected="$1"
+    max_checks="${2:-25}"
+    checks=0
+    while [ "$checks" -lt "$max_checks" ]; do
+        if service_absent "$expected"; then
+            return 0
+        fi
+        sleep 1
+        checks=$((checks+1))
+    done
+    return 1
+}
 name_ok() {
     case "$1" in
       ro-pilot-supervised-????????)
@@ -90,9 +113,15 @@ if [ "$action" = stop ]; then
         die 'armed transaction: must not stop rollback supervision'
     [ -f "$state/confirmed" ] || [ -f "$state/rolled-back" ] ||
         die 'no terminal transaction state'
-    delete_service "$name" || die 'supervised service deletion failed'
-    rm -f "$state/procd-service-name"
-    say 'PASS - supervised fake-router service removed after terminal state'
+    if ! service_absent "$name"; then
+        delete_service "$name" || die 'supervised service deletion request failed'
+        wait_deleted "$name" 25 ||
+            die "service delete acknowledged but still listed after 25s: $name; identity preserved"
+    fi
+    # Only now is it safe for the caller to remove the fake router tree.
+    rm -f "$state/procd-service-name" ||
+        die 'temporary supervisor identity could not be cleared'
+    say 'PASS - supervised fake-router service removed and absence verified'
     exit 0
 fi
 
