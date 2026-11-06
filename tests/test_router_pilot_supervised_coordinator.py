@@ -53,6 +53,14 @@ if cmd=="add":
     print("{}")
 elif cmd=="list":
     name=args["name"]
+    remaining=state/"mock-deletion-polls"
+    if remaining.exists():
+        polls=int(remaining.read_text())
+        if polls <= 0:
+            remaining.unlink()
+            (state/"mock-ubus-registered").unlink(missing_ok=True)
+        else:
+            remaining.write_text(str(polls-1))
     if (state/"mock-ubus-registered").exists():
         print(json.dumps({name:{"instances":{
             "watchdog":{"running":True},"secondary":{"running":True}
@@ -60,7 +68,11 @@ elif cmd=="list":
     else:
         print("{}")
 elif cmd=="delete":
-    (state/"mock-ubus-registered").unlink(missing_ok=True)
+    delay=int(os.environ.get("RO_COORD_MOCK_DELETE_POLLS","0"))
+    if delay:
+        (state/"mock-deletion-polls").write_text(str(delay))
+    else:
+        (state/"mock-ubus-registered").unlink(missing_ok=True)
     print("{}")
 else:
     sys.exit(1)
@@ -105,6 +117,43 @@ else:
         self.fx.restore_assertions()
         events=[json.loads(line) for line in self.calls.read_text().splitlines()]
         self.assertEqual(sum(x["action"]=="delete" for x in events),1)
+
+    def test_delete_ack_is_not_taken_as_procd_removal_until_service_disappears(self):
+        self.assertEqual(self.coordinator("start").returncode,0)
+        applied=self.fx.run_cmd(TXN,"apply-supervised",self.fx.digest,env=self.env)
+        self.assertEqual(applied.returncode,0,applied.stdout+applied.stderr)
+        rolled=self.fx.run_cmd(TXN,"rollback",env=self.env)
+        self.assertEqual(rolled.returncode,0,rolled.stdout+rolled.stderr)
+        env={**self.env, "RO_COORD_MOCK_DELETE_POLLS":"2"}
+        result=subprocess.run(["sh",str(COORD),"stop"],
+            env=env,text=True,capture_output=True,timeout=15)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn("absence verified",result.stdout)
+        self.assertFalse((self.fx.state/"mock-ubus-registered").exists())
+        self.assertFalse((self.fx.state/"procd-service-name").exists())
+        events=[json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(sum(e["action"]=="delete" for e in events),1)
+        self.assertGreaterEqual(sum(e["action"]=="list" for e in events),4)
+
+    def test_delete_timeout_preserves_identity_and_fake_router(self):
+        self.assertEqual(self.coordinator("start").returncode,0)
+        applied=self.fx.run_cmd(TXN,"apply-supervised",self.fx.digest,env=self.env)
+        self.assertEqual(applied.returncode,0,applied.stdout+applied.stderr)
+        rolled=self.fx.run_cmd(TXN,"rollback",env=self.env)
+        self.assertEqual(rolled.returncode,0,rolled.stdout+rolled.stderr)
+        # Force a persistent entry; bound the test runtime by overriding
+        # 'sleep' in PATH to a no-op. The coordinator still polls exactly
+        # 25 times and must fail without removing the service identifier.
+        fastsleep=self.mockdir/"sleep"
+        fastsleep.write_text("#!/bin/sh\\nexit 0\\n")
+        fastsleep.chmod(0o700)
+        env={**self.env,"RO_COORD_MOCK_DELETE_POLLS":"999"}
+        result=subprocess.run(["sh",str(COORD),"stop"],
+            env=env,text=True,capture_output=True,timeout=12)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("still listed after 25s",result.stderr)
+        self.assertTrue((self.fx.state/"procd-service-name").exists())
+        self.assertTrue((self.fx.state/"mock-ubus-registered").exists())
 
     def test_coordinator_cannot_register_before_arm_or_without_second_guard(self):
         (self.fx.state/"armed").unlink()
