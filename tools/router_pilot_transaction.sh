@@ -402,9 +402,9 @@ apply_supervised() {
     dst="$(at "$rel")"
     mode="$(awk -v n="$rel" '$3==n{print $2}' "$STATE/stage/unpacked/manifest.txt")"
     mkdir -p "$(dirname "$dst")"
-    cp "$src" "$dst.ro-new-$" || { restore; fail "copy failed $rel"; }
-    chmod "$mode" "$dst.ro-new-$" || { restore; fail "chmod failed $rel"; }
-    mv -f "$dst.ro-new-$" "$dst" || { restore; fail "rename failed $rel"; }
+    cp "$src" "$dst.ro-new-$$" || { restore; fail "copy failed $rel"; }
+    chmod "$mode" "$dst.ro-new-$$" || { restore; fail "chmod failed $rel"; }
+    mv -f "$dst.ro-new-$$" "$dst" || { restore; fail "rename failed $rel"; }
   done
   critical || { restore; fail 'critical config changed during supervised apply'; }
   say 'SUPERVISED APPLIED ON DISK: old runtime still running, Xray never restarted.'
