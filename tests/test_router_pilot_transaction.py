@@ -95,6 +95,12 @@ class RouterPilotTransactionTests(unittest.TestCase):
             expected = self.old["usr/lib/owrt-remote/" + name]
             self.assertEqual((saved / name).read_bytes(), expected)
 
+    def test_supervised_temp_filename_uses_process_id_not_literal_dollar(self):
+        script=TRANSACTION.read_text()
+        self.assertNotIn('ro-new-$"',script)
+        self.assertIn('ro-new-$"',script)
+        self.assertIn('ro-restore-$"',script)
+
     def test_supervised_two_phase_blocks_changes_until_both_workers_ready(self):
         self.prepared()
         secondary=(BASE/"tools/router_pilot_secondary_guard.sh")
