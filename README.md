@@ -10,6 +10,7 @@
 - [Обязательная сохранность функций оригинального проекта и критерии приёмки](docs/UPSTREAM_FEATURE_PARITY.md)
 - [Первый безопасный пилот OpenWrt-клиента: роутер `main`](docs/MAIN_CLIENT_PILOT.md)
 - [Выпуск клиента: безопасное обновление действующих роутеров и установка на чистые](docs/ROUTER_CLIENT_RELEASE_PLAN.md)
+- [Единый релиз на смешанный парк OpenWrt: TCP / WSS, индивидуальные конфигурации и откат](docs/FLEET_TCP_WSS_RELEASE_MATRIX.md)
 - [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
 - [Оригинальный проект](https://github.com/kzolotarev95/luci-app-owrt-remote) — автор kzolotarev95. Сохраняются оригинальные copyright и [MIT LICENSE](LICENSE).
 - Текущий рабочий форк: [indie-master/luci-app-owrt-remote](https://github.com/indie-master/luci-app-owrt-remote). Будущее имя репозитория **router-orchestrator** пока не активировано; URL обновлений не менять до проверки миграции.
