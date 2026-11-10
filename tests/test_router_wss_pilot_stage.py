@@ -40,7 +40,7 @@ class WssPilotStageContract(unittest.TestCase):
         self.assertIn('candidate agent missing explicit shadow-UCI support', data)
         self.assertIn('CANDIDATE_AGENT_PATH', data)
         self.assertIn('mode 700', data)
-        self.assertIn('installed agent does not support WSS', data)
+        self.assertIn('candidate agent does not support WSS', data)
         self.assertIn('previous stage exists', data)
         self.assertIn('STAGED ONLY', data)
         self.assertNotIn('OWRT_REMOTE_UCI_CONFIG_DIR="$work/uci" /usr/sbin/owrt-remote', data)
