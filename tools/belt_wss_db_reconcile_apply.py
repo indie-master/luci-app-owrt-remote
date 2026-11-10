@@ -152,27 +152,26 @@ def backup(db: Path, dest: Path) -> None:
     dest.chmod(0o600)
 
 
-def update_transport(db: Path, before: dict, targets: set[str],
-                     forward: bool) -> None:
-    # Preserve heartbeats, last_seen and any unrelated router records.
+def update_transport(db: Path, before: dict, after: dict,
+                     targets: set[str]) -> None:
+    # Preserve heartbeats, last_seen and all unrelated configuration.
     with sqlite3.connect(db, timeout=10, isolation_level=None) as conn:
         conn.execute("begin immediate")
         try:
             baseline_matches(config_rows_in_tx(conn), before)
             for rid in sorted(targets):
-                row = before[rid]
-                if forward:
-                    now = ("ws", 443, 1)
-                    old = ("tcp", 18443, row["vps_allow_legacy"])
-                else:
-                    now = ("tcp", 18443, row["vps_allow_legacy"])
-                    old = ("ws", 443, 1)
+                old_row = before[rid]
+                next_row = after[rid]
+                old = (old_row["vps_transport"], old_row["vless_port"],
+                       old_row["vps_allow_legacy"])
+                new = (next_row["vps_transport"], next_row["vless_port"],
+                       next_row["vps_allow_legacy"])
                 cur = conn.execute(
                     """update routers set vps_transport=?, vless_port=?,
                        vps_allow_legacy=? where id=?
                        and vps_transport=? and vless_port=?
                        and vps_allow_legacy=? and coalesce(deleted_at,0)=0""",
-                    (*now, rid, *old),
+                    (*new, rid, *old),
                 )
                 require(cur.rowcount == 1, "concurrent router change detected")
             conn.commit()
@@ -269,9 +268,9 @@ def run(args: argparse.Namespace) -> int:
 
         committed = False
         try:
-            update_transport(args.db, baseline, targets, forward=True)
-            committed = True
             expected = config_rows(args.stage / "scenario-legacy-1.sqlite")
+            update_transport(args.db, baseline, expected, targets)
+            committed = True
             baseline_matches(config_rows(args.db), expected)
             render(args.hub_source, args.db, args.live, args.stage, args.xray_bin)
             require(file_sha(args.live) == live_hash and
@@ -288,7 +287,7 @@ def run(args: argparse.Namespace) -> int:
                     now = config_rows(args.db)
                     expected = config_rows(args.stage / "scenario-legacy-1.sqlite")
                     baseline_matches(now, expected)
-                    update_transport(args.db, expected, targets, forward=False)
+                    update_transport(args.db, expected, baseline, targets)
                     print("ROLLBACK: restored previous transport fields; hold retained")
                 except Exception:
                     print("CRITICAL: automatic targeted rollback blocked; inspect private backup",
