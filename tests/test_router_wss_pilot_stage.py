@@ -33,7 +33,9 @@ class WssPilotStageContract(unittest.TestCase):
     def test_blocks_live_execution_without_correct_target(self):
         data = SCRIPT.read_text()
         self.assertIn('= "$expected_id" ] || fail', data)
-        self.assertIn('[ "$expected_id" != main ] || fail', data)
+        self.assertNotIn('[ "$expected_id" != main ] || fail', data)
+        self.assertIn('"$stage/router-id"', data)
+        self.assertIn('"$stage/original-port"', data)
         self.assertIn('original_port=', data)
         self.assertIn('candidate agent missing explicit shadow-UCI support', data)
         self.assertIn('CANDIDATE_AGENT_PATH', data)
