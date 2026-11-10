@@ -232,6 +232,51 @@ class WssHubTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual(live.read_bytes(), before)
 
+    def test_reordered_independent_reverse_rules_skip_xray_restart(self):
+        self.add("old", "tcp", 18443)
+        self.add("new")
+        with hub.connect(self.db) as conn:
+            config = hub.make_server_xray_config(hub.list_router_rows(conn),
+                                                 listen_port=18443)
+        # The live server was assembled manually: same clients/rules,
+        # but different ordering of independent reverse entries.
+        permuted = json.loads(json.dumps(config))
+        permuted["routing"]["rules"].reverse()
+        permuted["inbounds"].reverse()
+        for inbound in permuted["inbounds"]:
+            clients = inbound.get("settings", {}).get("clients")
+            if clients:
+                clients.reverse()
+        self.assertTrue(hub.xray_configs_equivalent_for_reload(permuted, config))
+        live = Path(self.temp.name) / "live-reordered.json"
+        live.write_text(json.dumps(permuted, ensure_ascii=False, indent=1))
+        before = live.read_bytes()
+        with mock.patch.dict(os.environ, {"OWRT_REMOTE_XRAY_CONFIG": str(live)}), \
+             mock.patch.object(hub.subprocess, "run") as called:
+            result = hub.reload_vps_xray(self.db)
+        self.assertTrue(result["unchanged"])
+        called.assert_not_called()
+        self.assertEqual(live.read_bytes(), before)
+
+    def test_changed_reverse_target_never_skips_xray_restart(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            config = hub.make_server_xray_config(hub.list_router_rows(conn),
+                                                 listen_port=18443)
+        altered = json.loads(json.dumps(config))
+        altered["routing"]["rules"][0]["outboundTag"] = "different-reverse-tag"
+        self.assertFalse(hub.xray_configs_equivalent_for_reload(altered, config))
+
+    def test_overlapping_routing_rules_refuse_permutation_equivalence(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            config = hub.make_server_xray_config(hub.list_router_rows(conn),
+                                                 listen_port=18443)
+        altered = json.loads(json.dumps(config))
+        altered["routing"]["rules"].append(
+            dict(altered["routing"]["rules"][0]))
+        self.assertFalse(hub.xray_configs_equivalent_for_reload(altered, config))
+
     def test_failed_candidate_validation_does_not_overwrite_live_xray(self):
         self.add("old", "tcp", 18443)
         live = Path(self.temp.name) / "current.json"
