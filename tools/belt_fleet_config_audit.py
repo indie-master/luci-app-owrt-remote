@@ -87,8 +87,11 @@ def audit(db: Path, xray: Path, expected_wss: set[str],
     for item in config.get("inbounds", []):
         if isinstance(item, dict):
             inbound_by_tag.setdefault(item.get("tag"), []).append(item)
-    rules = [r for r in config.get("routing", {}).get("rules", [])
-             if isinstance(r, dict)]
+    routing = config.get("routing") or {}
+    if not isinstance(routing, dict):
+        report("ERROR", "preflight", "invalid Xray routing object")
+        return 2
+    rules = [r for r in (routing.get("rules") or []) if isinstance(r, dict)]
     inventory_ids = set()
     for row in rows:
         rid = str(row["id"])
@@ -140,7 +143,7 @@ def audit(db: Path, xray: Path, expected_wss: set[str],
             except (ValueError, TypeError):
                 problems.append(f"{kind} reverse port invalid")
             expected_route = "reverse-" + rid + ("-ssh" if kind == "SSH" else "")
-            if not any(tag in r.get("inboundTag", []) and
+            if not any(tag in (r.get("inboundTag") or []) and
                        r.get("outboundTag") == expected_route for r in rules):
                 problems.append(f"{kind} reverse routing rule missing")
         if problems:
