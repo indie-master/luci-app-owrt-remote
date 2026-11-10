@@ -180,12 +180,18 @@ def main() -> int:
                         raise ValueError("staged router update did not match old state")
                 conn.commit()
             candidate = directory / f"render-legacy-{legacy}.json"
+            isolated_state = directory / f"state-legacy-{legacy}"
+            isolated_state.mkdir(mode=0o700)
+            render_env = dict(os.environ)
+            render_env["OWRT_REMOTE_STATE_DIR"] = str(isolated_state)
+            render_env["OWRT_REMOTE_DB"] = str(scenario)
             result = subprocess.run(
                 [sys.executable, str(args.hub_source), "--db", str(scenario),
                  "render-xray", "--listen-host",
                  tags["owrt-remote-vless"].get("listen", "0.0.0.0"),
                  "--listen-port", "18443", "--out", str(candidate)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=render_env, cwd=str(directory),
                 timeout=45, check=False)
             if result.returncode or not candidate.is_file():
                 print(f"LEGACY={legacy}: renderer failed on isolated snapshot (details suppressed)")
