@@ -35,7 +35,7 @@ jq -e '[.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn
     .streamSettings.security=="tls" and .streamSettings.tlsSettings.allowInsecure==false)' "$OUT/new-xray.json" >/dev/null ||
   die 'invalid WSS candidate'
 jq -e '[.outbounds[]? | select(.tag=="router-admin" or .tag=="router-ssh")] |
-    all(.settings; has("finalRules")|not)' "$OUT/new-xray.json" >/dev/null ||
+    length==2 and all(.[]; (.settings | has("finalRules") | not))' "$OUT/new-xray.json" >/dev/null ||
   die 'old core candidate still has finalRules'
 jq -n --slurpfile old "$ST/original-xray.json" --slurpfile new "$OUT/new-xray.json" '
   def links($x): [$x.outbounds[] | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn") |
