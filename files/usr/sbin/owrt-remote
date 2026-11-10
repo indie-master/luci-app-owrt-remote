@@ -1160,6 +1160,14 @@ heartbeat_set_url_if_changed() {
 
 heartbeat_apply_hub_update() {
 	local response_file fallback_base next_hub_url next_public_url next_vps_host changed old_vps_host mode ignored_file ignored
+	# A WSS pilot uses byte-exact UCI snapshots for guarded confirmation and
+	# automatic rollback. Updating hub_url/public_url while the transaction
+	# is pending invalidates a healthy WSS cutover. Defer heartbeat-driven
+	# UCI edits until it is explicitly confirmed or rolled back.
+	if [ -e /etc/router-orchestrator/wss-pilot/pending ]; then
+		log 'heartbeat: hub settings update deferred during pending WSS migration'
+		return 0
+	fi
 	response_file="$1"
 	fallback_base="$2"
 	next_hub_url="$(json_extract_object_string "$response_file" hub_update hub_url)"
