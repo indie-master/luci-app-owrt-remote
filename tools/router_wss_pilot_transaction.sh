@@ -228,6 +228,7 @@ confirm() {
   : > "$ST/confirmed"
   rm -f "$ST/pending" "$ST/armed" "$ST/ready"
   unlock
+  /etc/init.d/ro-wss-recovery stop >/dev/null 2>&1 || true
   log 'CONFIRMED: WSS kept on 443; rollback disarmed'
 }
 [ "$#" -ge 1 ] || die 'prepare AGENT | apply | confirm ID | rollback | watchdog | boot-recover | status'
