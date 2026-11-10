@@ -11,8 +11,13 @@ expected_id="$2"
 agent="$3"
 case "$agent" in /tmp/ro-wss-agent-*) ;; *) fail 'candidate agent must be under /tmp/ro-wss-agent-*' ;; esac
 [ -f "$agent" ] && [ ! -L "$agent" ] && [ -x "$agent" ] || fail 'candidate agent must be an executable regular file'
-[ "$(stat -c %u "$agent")" = 0 ] || fail 'candidate agent must be root-owned'
-[ "$(stat -c %a "$agent")" = 700 ] || fail 'candidate agent must have mode 700'
+# BusyBox builds may not include stat(1). ls -ldn is standard on OpenWrt.
+# Parse only fixed metadata fields; never print candidate contents.
+agent_meta="$(LC_ALL=C ls -ldn "$agent" 2>/dev/null)" || fail 'cannot inspect candidate agent'
+agent_permissions="$(printf '%s\n' "$agent_meta" | awk '{print $1}')"
+agent_owner="$(printf '%s\n' "$agent_meta" | awk '{print $3}')"
+[ "$agent_owner" = 0 ] || fail 'candidate agent must be root-owned'
+[ "$agent_permissions" = '-rwx------' ] || fail 'candidate agent must have mode 700'
 case "$expected_id" in ''|*[!a-zA-Z0-9_.-]*) fail 'invalid expected router ID' ;; esac
 [ "$expected_id" != main ] || fail 'main is unavailable and excluded from this pilot'
 [ -f /etc/openwrt_release ] || fail 'OpenWrt required'
