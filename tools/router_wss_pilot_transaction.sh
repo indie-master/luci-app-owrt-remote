@@ -46,6 +46,20 @@ check_stage() {
     file "$ST/$name" || die "stage missing $name"
   done
   (cd "$ST" && sha256sum -c SHA256SUMS >/dev/null) || die 'staged backup/candidate checksum mismatch'
+  command -v jq >/dev/null 2>&1 || die 'jq required for credential parity'
+  # Preserve BOTH VLESS identities and reverse tags. Only their transport is migrated.
+  original_links="$(jq -c '[.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn") |
+    {tag, id:.settings.id, encryption:.settings.encryption, flow:.settings.flow, reverse:.settings.reverse}] |
+    sort_by(.tag)' "$ST/original-xray.json")" || die 'invalid original JSON'
+  candidate_links="$(jq -c '[.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn") |
+    {tag, id:.settings.id, encryption:.settings.encryption, flow:.settings.flow, reverse:.settings.reverse}] |
+    sort_by(.tag)' "$ST/candidate-xray.json")" || die 'invalid candidate JSON'
+  [ "$original_links" = "$candidate_links" ] || die 'reverse credentials or tags changed'
+  jq -e '[.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn")] as $v |
+    ($v | length)==2 and
+    all($v[]; .streamSettings.network=="ws" and .streamSettings.security=="tls" and
+      .streamSettings.tlsSettings.allowInsecure==false and .settings.port==443)' \
+      "$ST/candidate-xray.json" >/dev/null || die 'WSS transport candidate invalid'
 }
 check_identity() {
   file "$ST/router-id" || die 'staged router-id missing'
