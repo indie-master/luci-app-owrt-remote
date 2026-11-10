@@ -1,0 +1,29 @@
+name: Remote HUB fleet audit tests
+
+on:
+  push:
+    branches: [feature/indie-branding]
+    paths:
+      - "tools/belt_fleet_config_audit.py"
+      - "tests/test_belt_fleet_config_audit.py"
+      - ".github/workflows/fleet-audit-ci.yml"
+  pull_request:
+    paths:
+      - "tools/belt_fleet_config_audit.py"
+      - "tests/test_belt_fleet_config_audit.py"
+      - ".github/workflows/fleet-audit-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: SQLite / Xray parity regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile audit
+        run: python3 -m py_compile tools/belt_fleet_config_audit.py
+      - name: Test synthetic inventory
+        run: python3 -m unittest discover -s tests -p 'test_belt_fleet_config_audit.py' -v
