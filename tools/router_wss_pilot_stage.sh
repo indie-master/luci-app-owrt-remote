@@ -14,7 +14,9 @@ for c in uci jq mktemp sha256sum cmp; do command -v "$c" >/dev/null 2>&1 || fail
 transport="$(uci -q get owrtremote.main.vps_transport || true)"
 [ -z "$transport" ] || [ "$transport" = tcp ] || fail 'expected original TCP UCI'
 [ "$(uci -q get owrtremote.main.vps_port || true)" = 18443 ] || fail 'expected original TCP 18443'
-[ "$(uci -q get owrtremote.main.wan_direct || echo 0)" != 1 ] || fail 'WAN-direct config needs separate staged review'
+case "$(uci -q get owrtremote.main.wan_direct || echo 0)" in
+  1|yes|true|on|enabled) fail 'WAN-direct config needs separate staged review' ;;
+esac
 [ -x /usr/sbin/owrt-remote ] || fail 'installed agent missing'
 grep -Fq 'if [ "$vps_transport" = ws ]; then' /usr/sbin/owrt-remote || fail 'installed agent does not support WSS'
 xray_config="$(uci -q get owrtremote.main.xray_config || true)"
@@ -22,6 +24,12 @@ xray_config="$(uci -q get owrtremote.main.xray_config || true)"
 [ "$xray_config" = /etc/xray/owrt-remote-client.json ] || fail 'custom Xray config needs review'
 [ -f "$xray_config" ] && [ ! -L "$xray_config" ] || fail 'unsafe Xray config'
 [ -f /etc/config/owrtremote ] && [ ! -L /etc/config/owrtremote ] || fail 'unsafe UCI config'
+jq -e '
+ [.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn")] as $l |
+ ($l|length)==2 and ([$l[].tag]|unique|length)==2 and
+ all($l[]; (.streamSettings.network // "tcp")=="tcp" and
+           (.streamSettings.security // "none")=="none")
+' "$xray_config" >/dev/null || fail 'live reverse JSON is not both TCP/none'
 [ ! -e /etc/router-orchestrator/wss-pilot ] || fail 'previous stage exists: manual review required'
 work="$(mktemp -d /tmp/ro-wss-stage.XXXXXX)" || fail 'mktemp failed'
 trap 'rm -rf "$work"' EXIT HUP INT TERM
