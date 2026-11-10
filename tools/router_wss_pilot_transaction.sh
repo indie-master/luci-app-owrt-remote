@@ -1,6 +1,7 @@
 #!/bin/sh
-# OpenWrt guarded TCP -> WSS pilot; explicitly targeted WR3000S_2.
+# Generic OpenWrt TCP -> WSS migration transaction prototype.
 # Independent procd watchdog and early boot recovery; NO fleet rollout.
+# LIVE MUTATIONS DISABLED until crash/reboot tests validate this prototype.
 set -eu
 umask 077
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
@@ -17,7 +18,11 @@ regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
 digest() { sha256sum "$1" | awk '{print $1}'; }
 uptime_sec() { awk 'NR==1 {print int($1)}' /proc/uptime; }
 require_id() {
-  [ "$(uci -q get owrtremote.main.router_id 2>/dev/null || true)" = WR3000S_2 ] || fail 'wrong router; only WR3000S_2'
+  regular "$ST/router-id" || fail 'staged router identity missing'
+  expected="$(cat "$ST/router-id")"
+  case "$expected" in ''|*[!a-zA-Z0-9_.-]*) fail 'invalid staged router id' ;; esac
+  [ "$(uci -q get owrtremote.main.router_id 2>/dev/null || true)" = "$expected" ] ||
+    fail 'router identity changed since staging'
 }
 lock() {
   mkdir "$LOCK" 2>/dev/null || fail 'transaction already running or stale lock'
@@ -30,7 +35,7 @@ verify_stage() {
     regular "$ST/$name" || fail "stage missing $name"
   done
   (cd "$ST" && sha256sum -c SHA256SUMS >/dev/null) || fail 'stage checksum mismatch'
-  [ "$(uci -q get owrtremote.main.router_id 2>/dev/null || true)" = WR3000S_2 ] || fail 'router identity mismatch'
+  require_id
 }
 verify_assets() {
   verify_stage
@@ -44,7 +49,12 @@ verify_baseline() {
   verify_stage
   cmp -s "$UCI" "$ST/original-uci" || fail 'live UCI differs from TCP backup'
   cmp -s "$JSON" "$ST/original-xray.json" || fail 'live Xray JSON differs from TCP backup'
-  [ "$(uci -q get owrtremote.main.vps_port 2>/dev/null || true)" = 18443 ] || fail 'unexpected original port'
+  regular "$ST/original-port" || fail 'missing original reverse port'
+  original_port="$(cat "$ST/original-port")"
+  case "$original_port" in ''|*[!0-9]*) fail 'invalid original port' ;; esac
+  [ "$original_port" -ge 1 ] && [ "$original_port" -le 65535 ] || fail 'invalid original port'
+  [ "$(uci -q get owrtremote.main.vps_port 2>/dev/null || true)" = "$original_port" ] ||
+    fail 'original port differs from staging'
   [ "$(digest "$AGENT")" = "$(cat "$ST/original-agent.sha256")" ] || fail 'installed agent changed'
 }
 atomic_copy() {
@@ -188,6 +198,12 @@ confirm() {
 }
 [ "$#" -ge 1 ] || fail 'usage: prepare AGENT | apply | confirm NONCE | rollback | watchdog | boot-recover'
 action="$1"; shift
+case "$action" in
+  prepare|apply|confirm|rollback|boot-recover|watchdog)
+    # Fail closed: current prototype is not yet production verified.
+    # An explicitly reviewed implementation must replace this gate.
+    fail 'development prototype: live transactions are disabled' ;;
+esac
 case "$action" in
   prepare) prepare "$@" ;;
   apply) [ "$#" -eq 0 ] || fail 'apply takes no arguments'; apply ;;
