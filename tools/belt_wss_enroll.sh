@@ -33,8 +33,10 @@ if ((DRY_RUN == 0)); then
 fi
 source_digest=$(sha256sum "$CONFIG" | awk '{print $1}')
 directory=$(dirname -- "$CONFIG")
-tmp=$(mktemp "$directory/.owrt-wss-enroll.XXXXXXXX") || die 'cannot create temporary file'
-normalized=$(mktemp "$directory/.owrt-wss-normalized.XXXXXXXX") || die 'cannot create temporary file'
+workdir="$directory"
+if ((DRY_RUN)); then workdir="${TMPDIR:-/tmp}"; fi
+tmp=$(mktemp "$workdir/.owrt-wss-enroll.XXXXXXXX") || die 'cannot create temporary file'
+normalized=$(mktemp "$workdir/.owrt-wss-normalized.XXXXXXXX") || die 'cannot create temporary file'
 cleanup() { rm -f -- "$tmp" "$normalized"; }
 trap cleanup EXIT
 # Pass router ID via jq --arg; do not interpolate it into jq source.
@@ -67,7 +69,7 @@ jq -e --arg router "$router" '
     .inbounds |= map(
       if .tag == "owrt-remote-wss" then
         .settings.clients +=
-          [$selected[] as $s | select(all($wss[]; .id != $s.id))]
+          [$selected[] as $s | $s | select(all($wss[]; .id != $s.id))]
       else . end)
   end
 ' "$CONFIG" > "$tmp" || die 'credential parity check failed'
