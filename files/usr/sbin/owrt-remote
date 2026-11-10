@@ -47,7 +47,13 @@ uci_get() {
 	local key default value
 	key="$1"
 	default="$2"
-	value="$(uci -q get "$CONFIG.$SECTION.$key" 2>/dev/null || true)"
+	# Explicit staging override: never used by the normal procd service.
+	# This avoids relying on undocumented UCI_CONFIG_DIR environment behavior.
+	if [ -n "${OWRT_REMOTE_UCI_CONFIG_DIR:-}" ]; then
+		value="$(uci -c "$OWRT_REMOTE_UCI_CONFIG_DIR" -q get "$CONFIG.$SECTION.$key" 2>/dev/null || true)"
+	else
+		value="$(uci -q get "$CONFIG.$SECTION.$key" 2>/dev/null || true)"
+	fi
 	[ -n "$value" ] && {
 		printf '%s' "$value"
 		return
