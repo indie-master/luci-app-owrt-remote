@@ -6,19 +6,25 @@ umask 077
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 log() { printf 'WSS-STAGE: %s\n' "$*"; }
 fail() { log "BLOCKED - $*"; exit 1; }
-[ "$#" -eq 1 ] && [ "$1" = --stage ] || fail 'usage: sh script --stage'
+[ "$#" -eq 2 ] && [ "$1" = --stage ] || fail 'usage: sh script --stage EXPECTED_ROUTER_ID'
+expected_id="$2"
+case "$expected_id" in ''|*[!a-zA-Z0-9_.-]*) fail 'invalid expected router ID' ;; esac
+[ "$expected_id" != main ] || fail 'main is unavailable and excluded from this pilot'
 [ -f /etc/openwrt_release ] || fail 'OpenWrt required'
 [ "$(id -u)" -eq 0 ] || fail 'root required'
 for c in uci jq mktemp sha256sum cmp; do command -v "$c" >/dev/null 2>&1 || fail "missing $c"; done
-[ "$(uci -q get owrtremote.main.router_id || true)" = main ] || fail 'only named Cudy main is eligible'
+[ "$(uci -q get owrtremote.main.router_id || true)" = "$expected_id" ] || fail 'router identity differs from the selected pilot'
 transport="$(uci -q get owrtremote.main.vps_transport || true)"
 [ -z "$transport" ] || [ "$transport" = tcp ] || fail 'expected original TCP UCI'
-[ "$(uci -q get owrtremote.main.vps_port || true)" = 18443 ] || fail 'expected original TCP 18443'
+original_port="$(uci -q get owrtremote.main.vps_port || true)"
+case "$original_port" in ''|*[!0-9]*) fail 'original port missing/invalid' ;; esac
+[ "$original_port" -ge 1 ] && [ "$original_port" -le 65535 ] || fail 'original port out of range'
 case "$(uci -q get owrtremote.main.wan_direct || echo 0)" in
   1|yes|true|on|enabled) fail 'WAN-direct config needs separate staged review' ;;
 esac
 [ -x /usr/sbin/owrt-remote ] || fail 'installed agent missing'
 grep -Fq 'if [ "$vps_transport" = ws ]; then' /usr/sbin/owrt-remote || fail 'installed agent does not support WSS'
+grep -Fq 'OWRT_REMOTE_UCI_CONFIG_DIR' /usr/sbin/owrt-remote || fail 'agent missing safe shadow-UCI support: upgrade agent first'
 xray_config="$(uci -q get owrtremote.main.xray_config || true)"
 [ -n "$xray_config" ] || xray_config=/etc/xray/owrt-remote-client.json
 [ "$xray_config" = /etc/xray/owrt-remote-client.json ] || fail 'custom Xray config needs review'
@@ -42,7 +48,7 @@ uci -c "$work/uci" set owrtremote.main.vps_port=443
 uci -c "$work/uci" set owrtremote.main.vps_sni=swiftlessvpn.ru
 uci -c "$work/uci" set owrtremote.main.vps_ws_path=/owrt-ws/
 uci -c "$work/uci" commit owrtremote
-UCI_CONFIG_DIR="$work/uci" /usr/sbin/owrt-remote render-client --stdout > "$work/candidate.json" 2>"$work/render.err" ||
+OWRT_REMOTE_UCI_CONFIG_DIR="$work/uci" /usr/sbin/owrt-remote render-client --stdout > "$work/candidate.json" 2>"$work/render.err" ||
     fail 'installed agent could not render WSS candidate'
 jq -e --arg sni swiftlessvpn.ru '
   [.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn")] as $l |
@@ -74,6 +80,7 @@ cp -p "$work/candidate.json" "$stage/candidate-xray.json"
 )
 chmod 700 "$stage"
 chmod 600 "$stage"/*
+log "PILOT: $expected_id; original TCP port: $original_port"
 log 'STAGED ONLY — no running process, live UCI or Xray config changed'
 log 'No apply/confirm is implemented by this staging script'
 log "Stored protected originals and candidate in $stage"
