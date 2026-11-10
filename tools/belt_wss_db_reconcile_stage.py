@@ -29,7 +29,7 @@ def canonical(config: dict) -> dict:
         if isinstance(clients, list):
             clients.sort(key=lambda x: x.get("email", ""))
     inbounds.sort(key=lambda x: x["tag"])
-    result["outbounds"].sort(key=lambda x: x["tag"])
+    # Preserve outbound ordering: the first outbound can be the default.
     rules = result["routing"]["rules"]
     selected = []
     for r in rules:
