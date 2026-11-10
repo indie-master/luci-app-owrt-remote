@@ -5,7 +5,9 @@ on:
     branches: [feature/indie-branding]
     paths:
       - "tools/belt_fleet_config_audit.py"
+      - "tools/belt_wss_db_reconcile_stage.py"
       - "tests/test_belt_fleet_config_audit.py"
+      - "tests/test_belt_wss_db_reconcile_stage.py"
       - ".github/workflows/fleet-audit-ci.yml"
   pull_request:
     paths:
@@ -24,6 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Compile audit
-        run: python3 -m py_compile tools/belt_fleet_config_audit.py
+        run: python3 -m py_compile tools/belt_fleet_config_audit.py tools/belt_wss_db_reconcile_stage.py
       - name: Test synthetic inventory
-        run: python3 -m unittest discover -s tests -p 'test_belt_fleet_config_audit.py' -v
+        run: |
+          python3 -m unittest discover -s tests -p 'test_belt_fleet_config_audit.py' -v
+          python3 -m unittest discover -s tests -p 'test_belt_wss_db_reconcile_stage.py' -v
