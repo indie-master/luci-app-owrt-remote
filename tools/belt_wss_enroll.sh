@@ -31,6 +31,7 @@ command -v cmp >/dev/null || die 'cmp required'
 if ((DRY_RUN == 0)); then
   [[ $(id -u) -eq 0 ]] || die 'install requires root'
 fi
+source_digest=$(sha256sum "$CONFIG" | awk '{print $1}')
 directory=$(dirname -- "$CONFIG")
 tmp=$(mktemp "$directory/.owrt-wss-enroll.XXXXXXXX") || die 'cannot create temporary file'
 normalized=$(mktemp "$directory/.owrt-wss-normalized.XXXXXXXX") || die 'cannot create temporary file'
@@ -87,13 +88,13 @@ exec 9>"$directory/.owrt-wss-enroll.lock"
 flock -n 9 || die 'another enrollment is running'
 # The prepared candidate must still match the current source config, except
 # for adding these two identities. Regenerate under the lock if config drifted.
-current_digest=$(sha256sum "$CONFIG" | awk '{print $1}')
+[[ "$(sha256sum "$CONFIG" | awk '{print $1}')" == "$source_digest" ]] || die 'config changed since preflight; retry'
 # Backup cannot contain secrets in its filename; preserve original permissions.
 backup="$CONFIG.bak.wss-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 cp -p -- "$CONFIG" "$backup" || die 'backup failed'
 chmod 600 "$backup"
 # Fail closed if a different process changes config before install.
-[[ "$(sha256sum "$CONFIG" | awk '{print $1}')" == "$current_digest" ]] || die 'config changed during install'
+[[ "$(sha256sum "$CONFIG" | awk '{print $1}')" == "$source_digest" ]] || die 'config changed during install'
 chown --reference="$CONFIG" "$tmp"
 chmod --reference="$CONFIG" "$tmp"
 mv -f -- "$tmp" "$CONFIG"
