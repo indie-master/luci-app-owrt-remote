@@ -12,6 +12,7 @@
 - [Выпуск клиента: безопасное обновление действующих роутеров и установка на чистые](docs/ROUTER_CLIENT_RELEASE_PLAN.md)
 - [Единый релиз на смешанный парк OpenWrt: TCP / WSS, индивидуальные конфигурации и откат](docs/FLEET_TCP_WSS_RELEASE_MATRIX.md)
 - [Аудит конфигурации HUB/SQLite и Xray после миграции четырёх WSS-роутеров](docs/WSS_FLEET_HUB_PARITY_GATE.md)
+- [Симуляция согласования HUB DB и генератора Xray без изменения Belt](docs/BELT_MULTI_WSS_DB_PARITY.md)
 - [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
 - [Оригинальный проект](https://github.com/kzolotarev95/luci-app-owrt-remote) — автор kzolotarev95. Сохраняются оригинальные copyright и [MIT LICENSE](LICENSE).
 - Текущий рабочий форк: [indie-master/luci-app-owrt-remote](https://github.com/indie-master/luci-app-owrt-remote). Будущее имя репозитория **router-orchestrator** пока не активировано; URL обновлений не менять до проверки миграции.
