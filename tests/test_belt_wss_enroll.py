@@ -16,7 +16,7 @@ class EnrollmentTests(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.cfg = self.root / "owrt-remote.json"
         self.xray = self.root / "fake-xray"
-        self.xray.write_text("#!/bin/sh\nexit 0\n")
+        self.xray.write_text("#!/bin/sh\ncase \"$4\" in *.json) exit 0 ;; *) echo invalid-config-format >&2; exit 1 ;; esac\n")
         self.xray.chmod(0o700)
         self.data = {"inbounds": [
             {"tag": "owrt-remote-vless", "protocol": "vless",
