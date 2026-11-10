@@ -7,9 +7,11 @@ umask 077
 export PATH="/bin:/sbin:/usr/bin:/usr/sbin:${PATH:-}"
 log() { printf 'WSS-STAGE: %s\n' "$*"; }
 fail() { log "BLOCKED - $*"; exit 1; }
-[ "$#" -eq 3 ] && [ "$1" = --stage ] || fail 'usage: sh script --stage EXPECTED_ROUTER_ID CANDIDATE_AGENT_PATH'
+[ "$#" -eq 4 ] && [ "$1" = --stage ] || fail 'usage: sh script --stage EXPECTED_ROUTER_ID CANDIDATE_AGENT_PATH WSS_HOST'
 expected_id="$2"
 agent="$3"
+wss_host="$4"
+case "$wss_host" in ''|*[!a-zA-Z0-9.-]*|.*|*..*|*.) fail 'invalid WSS hostname' ;; esac
 case "$agent" in /tmp/ro-wss-agent-*) ;; *) fail 'candidate agent must be under /tmp/ro-wss-agent-*' ;; esac
 [ -f "$agent" ] && [ ! -L "$agent" ] && [ -x "$agent" ] || fail 'candidate agent must be an executable regular file'
 # BusyBox builds may not include stat(1). ls -ldn is standard on OpenWrt.
@@ -53,19 +55,20 @@ mkdir -p "$work/config" "$work/uci"
 cp -p /etc/config/owrtremote "$work/config/owrtremote"
 cp -p /etc/config/owrtremote "$work/uci/owrtremote"
 uci -c "$work/uci" set owrtremote.main.vps_transport=ws
-uci -c "$work/uci" set owrtremote.main.vps_host=swiftlessvpn.ru
+uci -c "$work/uci" set owrtremote.main.vps_host="$wss_host"
 uci -c "$work/uci" set owrtremote.main.vps_port=443
-uci -c "$work/uci" set owrtremote.main.vps_sni=swiftlessvpn.ru
+uci -c "$work/uci" set owrtremote.main.vps_sni="$wss_host"
 uci -c "$work/uci" set owrtremote.main.vps_ws_path=/owrt-ws/
 uci -c "$work/uci" commit owrtremote
 OWRT_REMOTE_UCI_CONFIG_DIR="$work/uci" "$agent" render-client --stdout > "$work/candidate.json" 2>"$work/render.err" ||
     fail 'installed agent could not render WSS candidate'
-jq -e --arg sni swiftlessvpn.ru '
+jq -e --arg sni "$wss_host" '
   [.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn")] as $l |
   ($l|length)==2 and ([$l[].tag]|unique|length)==2 and
   all($l[]; .streamSettings.network=="ws" and
        .streamSettings.security=="tls" and
        .streamSettings.tlsSettings.serverName==$sni and
+       .settings.address==$sni and .streamSettings.wsSettings.host==$sni and
        .streamSettings.tlsSettings.allowInsecure==false and
        (.streamSettings.tlsSettings.alpn | index("http/1.1") != null) and
        .streamSettings.wsSettings.path=="/owrt-ws/" and
