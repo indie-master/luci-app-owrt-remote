@@ -667,7 +667,7 @@ render_client_config() (
 		case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
 		stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
 	fi
-	if [ "$vps_transport" = ws ] || xray_reverse_finalrules_required; then
+	if xray_reverse_finalrules_required; then
 		# Modern Xray blocks reverse-originated Freedom requests by default.
 		# Scope access to the exact LuCI/SSH redirect ports, on both transports.
 		admin_rules=", \"finalRules\": [{\"action\":\"allow\",\"network\":\"tcp\",\"port\":\"$admin_port\"}]"
