@@ -23,14 +23,21 @@ class FleetMigrationPrototypeTests(unittest.TestCase):
         self.assertIn('"$ST/router-id"', code)
         self.assertIn('"$ST/original-port"', code)
 
-    def test_fail_closed_until_real_recovery_is_validated(self):
+    def test_recovery_is_generic_and_persistent(self):
         code = TX.read_text()
-        self.assertIn("development prototype: live transactions are disabled", code)
-        for cmd in ("prepare", "apply", "confirm", "rollback", "boot-recover", "watchdog"):
-            with self.subTest(command=cmd):
-                result = subprocess.run(["sh", str(TX), cmd], capture_output=True, text=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("live transactions are disabled", result.stdout + result.stderr)
+        self.assertIn('"$ST/original-uci"', code)
+        self.assertIn('"$ST/original-xray.json"', code)
+        self.assertIn('"$ST/original-agent"', code)
+        self.assertIn('"$ST/pending"', code)
+        self.assertIn('"$ST/armed"', code)
+        self.assertIn('boot_recover()', code)
+        self.assertIn('watchdog()', code)
+        self.assertIn('confirm()', code)
+        self.assertNotIn('development prototype: live transactions are disabled', code)
+        init = INIT.read_text()
+        self.assertIn('START=08', init)
+        self.assertIn('boot-recover', init)
+        self.assertIn('procd_set_param command', init)
 
     def test_stage_explicit_identity_is_not_hardware_specific(self):
         code = STAGE.read_text()
