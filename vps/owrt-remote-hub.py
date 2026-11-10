@@ -4606,6 +4606,73 @@ def make_router_xray_config(row):
     }
 
 
+def _canonical_reverse_xray_config(config):
+    """Canonicalize only known disjoint reverse rules; fail closed otherwise.
+
+    Xray routing rules are normally order-sensitive. This HUB generator uses
+    exactly one unique inboundTag per field rule, so their order is irrelevant.
+    Other rules must retain their original order and trigger an ordinary diff.
+    """
+    if not isinstance(config, dict):
+        return None
+    try:
+        data = json.loads(json.dumps(config))
+        inbounds = data["inbounds"]
+        seen_inbounds = set()
+        for inbound in inbounds:
+            tag = inbound["tag"]
+            if not isinstance(tag, str) or tag in seen_inbounds:
+                return None
+            seen_inbounds.add(tag)
+            clients = inbound.get("settings", {}).get("clients")
+            if clients is not None:
+                seen_clients = set()
+                for client in clients:
+                    key = client["reverse"]["tag"]
+                    if not isinstance(key, str) or key in seen_clients:
+                        return None
+                    seen_clients.add(key)
+                clients.sort(key=lambda x: x["reverse"]["tag"])
+        inbounds.sort(key=lambda x: x["tag"])
+
+        seen_outbounds = set()
+        for outbound in data["outbounds"]:
+            tag = outbound["tag"]
+            if not isinstance(tag, str) or tag in seen_outbounds:
+                return None
+            seen_outbounds.add(tag)
+        data["outbounds"].sort(key=lambda x: x["tag"])
+
+        rules = data["routing"]["rules"]
+        seen_rules = set()
+        for rule in rules:
+            tags = rule.get("inboundTag")
+            if (rule.get("type") != "field"
+                    or not isinstance(tags, list)
+                    or len(tags) != 1
+                    or not isinstance(tags[0], str)
+                    or not isinstance(rule.get("outboundTag"), str)
+                    or any(key not in ("type", "inboundTag", "outboundTag") for key in rule)):
+                return None
+            if tags[0] in seen_rules:
+                return None
+            seen_rules.add(tags[0])
+        rules.sort(key=lambda x: x["inboundTag"][0])
+        return data
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def xray_configs_equivalent_for_reload(existing, generated):
+    """Skip Xray restart only when matching either exactly or under safe
+    permutation of disjoint reverse rules, inbounds and client lists."""
+    if existing == generated:
+        return True
+    left = _canonical_reverse_xray_config(existing)
+    right = _canonical_reverse_xray_config(generated)
+    return left is not None and right is not None and left == right
+
+
 _XRAY_RELOAD_LOCK = threading.RLock()
 _XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"
 
@@ -4647,7 +4714,7 @@ def reload_vps_xray(db_path=DB_PATH):
         # Semantically identical JSON must not force a disconnect merely
         # because the existing file uses different whitespace/key ordering.
         # Keep all list ordering intact (Xray routing rules are ordered).
-        if out.exists() and json.loads(out.read_text(encoding="utf-8")) == config:
+        if out.exists() and xray_configs_equivalent_for_reload(existing, config):
             return {"config": str(out), "service": service, "routers": len(rows), "unchanged": True}
         out.parent.mkdir(parents=True, exist_ok=True)
         fd, candidate_name = tempfile.mkstemp(prefix=".owrt-xray-", suffix=".json", dir=str(out.parent))
