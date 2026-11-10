@@ -35,9 +35,9 @@ source_digest=$(sha256sum "$CONFIG" | awk '{print $1}')
 directory=$(dirname -- "$CONFIG")
 workdir="$directory"
 if ((DRY_RUN)); then workdir="${TMPDIR:-/tmp}"; fi
-tmp=$(mktemp "$workdir/.owrt-wss-enroll.XXXXXXXX") || die 'cannot create temporary file'
+tmp=$(mktemp "$workdir/.owrt-wss-enroll.XXXXXXXX.json") || die 'cannot create temporary file'
 normalized=$(mktemp "$workdir/.owrt-wss-normalized.XXXXXXXX") || die 'cannot create temporary file'
-cleanup() { rm -f -- "$tmp" "$normalized"; }
+cleanup() { rm -f -- "$tmp" "$normalized" "$tmp.stderr"; }
 trap cleanup EXIT
 # Pass router ID via jq --arg; do not interpolate it into jq source.
 jq -e --arg router "$router" '
@@ -73,7 +73,12 @@ jq -e --arg router "$router" '
       else . end)
   end
 ' "$CONFIG" > "$tmp" || die 'credential parity check failed'
-"$XRAY" run -test -config "$tmp" >/dev/null 2>&1 || die 'candidate rejected by Xray'
+if ! "$XRAY" run -test -config "$tmp" >/dev/null 2>"$tmp.stderr"; then
+  printf 'WSS-ENROLL: XRAY CHECK FAILED — diagnostic follows (no config contents):\n' >&2
+  sed -n '1,12p' "$tmp.stderr" >&2
+  die 'candidate rejected by Xray'
+fi
+rm -f "$tmp.stderr"
 jq -S . "$CONFIG" > "$normalized"
 if cmp -s "$normalized" <(jq -S . "$tmp"); then
   printf 'WSS-ENROLL: ALREADY PRESENT — %s, no changes needed\n' "$router"
