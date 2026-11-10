@@ -32,5 +32,5 @@ jobs:
       - name: Test synthetic inventory
         run: |
           python3 -m unittest discover -s tests -p 'test_belt_fleet_config_audit.py' -v
-          python3 -m unittest discover -s tests -p 'test_belt_wss_db_reconcile_stage.py' -v
+          sudo python3 -m unittest discover -s tests -p 'test_belt_wss_db_reconcile_stage.py' -v
           python3 -m unittest discover -s tests -p 'test_belt_wss_db_reconcile_apply.py' -v
