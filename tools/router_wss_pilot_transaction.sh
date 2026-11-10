@@ -190,6 +190,7 @@ prepare() {
   chmod 700 "$TX" "$INIT"
   "$INIT" enable || die 'could not enable early-boot recovery'
   [ -L /etc/rc.d/S08ro-wss-recovery ] || die 'boot recovery link missing'
+  sync
   log "PREPARED $id TCP:$port; no live connection changed"
 }
 apply() {
@@ -222,9 +223,12 @@ apply() {
   fi
   # Persistent marker BEFORE any live mutation: reboot recovers partial installs.
   : > "$ST/pending"
+  # Ensure boot recovery sees the pending transaction if power fails mid-update.
+  sync
   copy_atomic "$ST/candidate-agent" "$AGENT"
   copy_atomic "$ST/candidate-uci" "$UCI"
   copy_atomic "$ST/candidate-xray.json" "$JSON"
+  sync
   unlock
   log 'WSS installed; restarting owrt-remote only. Automatic rollback in <= 300 seconds.'
   /etc/init.d/owrt-remote restart || {
