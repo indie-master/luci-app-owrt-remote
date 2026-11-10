@@ -16,6 +16,12 @@ class FleetMigrationPrototypeTests(unittest.TestCase):
                 result = subprocess.run(["sh", "-n", str(script)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_single_dispatch_no_trailing_shell_source(self):
+        code = TX.read_text()
+        self.assertEqual(code.count('action="$1"; shift'), 1)
+        self.assertEqual(code.count("  *) die 'unknown action' ;;"), 1)
+        self.assertTrue(code.rstrip().endswith("esac"))
+
     def test_no_pilot_router_or_original_port_baked_into_transaction(self):
         code = TX.read_text()
         self.assertNotIn("WR3000S_2", code)
