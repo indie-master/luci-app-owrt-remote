@@ -23,6 +23,9 @@ class LegacyXrayWssRegression(unittest.TestCase):
     def test_refresh_never_restarts_service_or_commits_live_uci(self):
         source = REFRESH.read_text()
         self.assertIn('OWRT_REMOTE_UCI_CONFIG_DIR="$OUT/uci"', source)
+        self.assertIn('WSS_HOST', source)
+        self.assertIn('uci -c "$OUT/uci" set owrtremote.main.vps_sni="$HOST"', source)
+        self.assertIn('cp -p "$OUT/uci/owrtremote" "$ST/candidate-uci.next"', source)
         self.assertIn("UPDATED CANDIDATE ONLY", source)
         for forbidden in ('/etc/init.d/owrt-remote restart',
                           'uci commit owrtremote', 'uci -q set owrtremote.main',
