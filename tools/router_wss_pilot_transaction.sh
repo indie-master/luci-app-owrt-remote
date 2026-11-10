@@ -91,7 +91,15 @@ recover_locked() {
   file "$ST/original-uci" && file "$ST/original-xray.json" &&
     file "$ST/original-agent" || die 'recovery originals missing'
   # Recovery must not depend on candidate files still being intact.
-  (cd "$ST" && grep -E ' (original-uci|original-xray.json)
+  (cd "$ST" && sha256sum original-uci original-xray.json | awk '{print $1 "  " $2}' > "$ST/recovery-observed") ||
+    die 'cannot hash recovery originals'
+  for name in original-uci original-xray.json; do
+    expected="$(awk -v n="$name" '$2==n {print $1}' "$ST/SHA256SUMS")"
+    observed="$(awk -v n="$name" '$2==n {print $1}' "$ST/recovery-observed")"
+    [ -n "$expected" ] && [ "$expected" = "$observed" ] ||
+      die "recovery original checksum mismatch: $name"
+  done
+  rm -f "$ST/recovery-observed"
   [ "$(hash "$ST/original-agent")" = "$(cat "$ST/original-agent.sha256")" ] ||
     die 'recovery agent checksum failed'
   copy_atomic "$ST/original-agent" "$AGENT"
