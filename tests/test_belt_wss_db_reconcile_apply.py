@@ -60,7 +60,7 @@ class ReconcileApplyTests(unittest.TestCase):
     def test_out_of_scope_stage_mutation_rejected(self):
         mutated = {k: dict(v) for k, v in self.migrated.items()}
         mutated["Netis_N6_router5"]["entry_port"] = 8081
-        with self.assertRaises(ValueError):
+        with self.assertRaises(apply.Blocked):
             apply.changed_rows(self.original, mutated, self.targets)
 
     def test_original_legacy_flag_restored_when_not_zero(self):
