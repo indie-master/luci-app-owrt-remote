@@ -118,7 +118,17 @@ class CodeOnlyTests(unittest.TestCase):
             with self.assertRaises(up.GuardError):
                 up.apply(self.args)
         self.assertEqual(self.installed.read_text(), "print('old hub')\n")
-        self.assertEqual(self.db_sha, up.digest(self.args.db))
+        # SQLite backup restores logical content, not necessarily identical
+        # page layout / file SHA-256.
+        with sqlite3.connect(self.args.db) as conn:
+            rows = conn.execute(
+                "select id, vps_transport, vless_port, vless_uuid, ssh_vless_uuid "
+                "from routers order by id"
+            ).fetchall()
+            self.assertEqual(len(rows), 5)
+            self.assertEqual(sum(row[1] == "ws" and row[2] == 443 for row in rows), 1)
+            self.assertEqual(sum(row[1] == "tcp" and row[2] == 18443 for row in rows), 4)
+            self.assertEqual(conn.execute("pragma integrity_check").fetchone()[0], "ok")
         self.assertEqual(self.json_sha, up.digest(self.args.xray_config))
         self.assertTrue(self.hold.exists())
 
