@@ -249,6 +249,31 @@ def run(args: argparse.Namespace) -> int:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         hp, xp, live_hash, hub_hash = guard_services(
             args.db, args.live, args.hub_source)
+        if args.rollback:
+            backup_file = args.stage / "apply-before.sqlite"
+            require(backup_file.is_file() and not backup_file.is_symlink(),
+                    "reconciliation backup is missing")
+            baseline = config_rows(args.stage / "db-before.sqlite")
+            expected = config_rows(args.stage / "scenario-legacy-1.sqlite")
+            changed_rows(baseline, expected, targets)
+            baseline_matches(config_rows(backup_file), baseline)
+            baseline_matches(config_rows(args.db), expected)
+            live_data = json.loads(args.live.read_bytes())
+            candidate = json.loads((args.stage / "render-legacy-1.json").read_bytes())
+            require(stage.canonical(candidate) == stage.canonical(live_data),
+                    "active Xray differs from original WSS staging")
+            make_hold(args.db.parent / ".xray-maintenance-hold")
+            update_transport(args.db, expected, baseline, targets)
+            baseline_matches(config_rows(args.db), baseline)
+            require(service_pid(HUB_SERVICE) == hp and
+                    service_pid(XRAY_SERVICE) == xp and
+                    file_sha(args.live) == live_hash and
+                    file_sha(args.hub_source) == hub_hash,
+                    "HUB/Xray process or configuration changed during rollback")
+            print("MANUAL ROLLBACK: original DB transport fields restored")
+            print("HOLD: retained; HUB DB is intentionally no longer WSS-aligned")
+            return 0
+
         baseline = validate_stage(
             args.stage, args.db, args.live, targets, ws, tcp, args.xray_bin)
         print("PREFLIGHT: PASS — live SQLite and Xray agree with staged baseline")
@@ -310,7 +335,9 @@ def main() -> int:
     ap.add_argument("--migrate", nargs="+", required=True)
     ap.add_argument("--existing-wss", nargs="+", required=True)
     ap.add_argument("--leave-tcp", nargs="+", required=True)
-    ap.add_argument("--apply", action="store_true", help="explicitly commit guarded DB changes")
+    action = ap.add_mutually_exclusive_group()
+    action.add_argument("--apply", action="store_true", help="explicitly commit guarded DB changes")
+    action.add_argument("--rollback", action="store_true", help="restore only original DB fields after apply")
     args = ap.parse_args()
     try:
         return run(args)
