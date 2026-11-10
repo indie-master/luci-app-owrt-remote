@@ -1,0 +1,42 @@
+name: WSS transaction integration
+
+on:
+  push:
+    branches:
+      - feature/indie-branding
+    paths:
+      - tools/router_wss_pilot_transaction.sh
+      - tools/router_wss_recovery.init
+      - tools/router_wss_pilot_stage.sh
+      - tests/test_wss_transaction_integration.py
+      - tests/test_fleet_wss_migration_contract.py
+      - .github/workflows/wss-transaction-integration.yml
+  pull_request:
+    paths:
+      - tools/router_wss_pilot_transaction.sh
+      - tools/router_wss_recovery.init
+      - tools/router_wss_pilot_stage.sh
+      - tests/test_wss_transaction_integration.py
+      - tests/test_fleet_wss_migration_contract.py
+      - .github/workflows/wss-transaction-integration.yml
+  workflow_dispatch:
+
+jobs:
+  transaction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox jq
+      - name: POSIX and BusyBox ash parsing
+        run: |
+          set -e
+          for file in tools/router_wss_pilot_transaction.sh tools/router_wss_recovery.init tools/router_wss_pilot_stage.sh; do
+            sh -n "$file"
+            busybox ash -n "$file"
+          done
+      - name: Generic migration state tests
+        run: |
+          python3 -m unittest -v tests/test_wss_transaction_integration.py tests/test_fleet_wss_migration_contract.py
