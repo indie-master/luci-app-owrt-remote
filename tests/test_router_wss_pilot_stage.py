@@ -20,7 +20,7 @@ class WssPilotStageContract(unittest.TestCase):
         data = SCRIPT.read_text()
         self.assertIn('uci -c "$work/uci" set', data)
         self.assertIn('OWRT_REMOTE_UCI_CONFIG_DIR="$work/uci"', data)
-        self.assertIn('render-client --stdout', data)
+        self.assertIn('"$agent" render-client --stdout', data)
         self.assertIn('cp -p "$xray_config" "$stage/original-xray.json"', data)
         self.assertIn('cp -p "$work/config/owrtremote" "$stage/original-uci"', data)
         self.assertIn('sha256sum original-uci original-xray.json', data)
@@ -35,10 +35,13 @@ class WssPilotStageContract(unittest.TestCase):
         self.assertIn('= "$expected_id" ] || fail', data)
         self.assertIn('[ "$expected_id" != main ] || fail', data)
         self.assertIn('original_port=', data)
-        self.assertIn('agent missing safe shadow-UCI support', data)
+        self.assertIn('candidate agent missing explicit shadow-UCI support', data)
+        self.assertIn('CANDIDATE_AGENT_PATH', data)
+        self.assertIn('mode 700', data)
         self.assertIn('installed agent does not support WSS', data)
         self.assertIn('previous stage exists', data)
         self.assertIn('STAGED ONLY', data)
+        self.assertNotIn('OWRT_REMOTE_UCI_CONFIG_DIR="$work/uci" /usr/sbin/owrt-remote', data)
 
 
 if __name__ == "__main__":
