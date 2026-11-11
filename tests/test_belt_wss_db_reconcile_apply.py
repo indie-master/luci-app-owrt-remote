@@ -65,17 +65,17 @@ class ReconcileApplyTests(unittest.TestCase):
         live.write_text(json.dumps(config))
         hub = folder / "hub.py"
         hub.write_text(
-            "import argparse, json, sqlite3\\n"
-            "p = argparse.ArgumentParser()\\n"
-            "p.add_argument('--db'); p.add_argument('action')\\n"
-            "p.add_argument('--listen-host'); p.add_argument('--listen-port')\\n"
-            "p.add_argument('--out'); args = p.parse_args()\\n"
-            "with sqlite3.connect(args.db) as conn:\\n"
-            "    conn.execute(\\\"update routers set last_seen=987 where id='main'\\\")\\n"
-            + "with open(args.out, 'w') as dst: json.dump(" + repr(config) + ", dst)\\n"
+            "import argparse, json, sqlite3\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--db'); p.add_argument('action')\n"
+            "p.add_argument('--listen-host'); p.add_argument('--listen-port')\n"
+            "p.add_argument('--out'); args = p.parse_args()\n"
+            "with sqlite3.connect(args.db) as conn:\n"
+            '    conn.execute("update routers set last_seen=987 where id=?", ("main",))\n'
+            + "with open(args.out, 'w') as dst: json.dump(" + repr(config) + ", dst)\n"
         )
         xray = folder / "fake-xray.sh"
-        xray.write_text("#!/bin/sh\\nexit 0\\n")
+        xray.write_text("#!/bin/sh\nexit 0\n")
         xray.chmod(0o700)
         apply.render(hub, self.db, live, folder, xray)
         with sqlite3.connect(self.db) as conn:
