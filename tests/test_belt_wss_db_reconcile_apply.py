@@ -1,4 +1,5 @@
 """Synthetic tests of guarded, targeted SQLite reconciliation and rollback."""
+import json
 import sqlite3
 import sys
 import tempfile
@@ -48,6 +49,41 @@ class ReconcileApplyTests(unittest.TestCase):
         with sqlite3.connect(self.db) as c:
             found = c.execute("select distinct last_seen,status_json from routers").fetchall()
         self.assertEqual(found, [(567, '{"online":true}')])
+
+    def test_post_apply_render_uses_private_db_even_if_renderer_writes(self):
+        folder = self.db.parent / "stage"
+        folder.mkdir()
+        live = folder / "live.json"
+        config = {
+            "inbounds": [
+                {"tag": "owrt-remote-vless", "listen": "0.0.0.0", "port": 18443},
+                {"tag": "owrt-remote-wss", "listen": "127.0.0.1", "port": 18444},
+            ],
+            "outbounds": [],
+            "routing": {"rules": []},
+        }
+        live.write_text(json.dumps(config))
+        hub = folder / "hub.py"
+        hub.write_text(
+            "import argparse, json, sqlite3\\n"
+            "p = argparse.ArgumentParser()\\n"
+            "p.add_argument('--db'); p.add_argument('action')\\n"
+            "p.add_argument('--listen-host'); p.add_argument('--listen-port')\\n"
+            "p.add_argument('--out'); args = p.parse_args()\\n"
+            "with sqlite3.connect(args.db) as conn:\\n"
+            "    conn.execute(\\\"update routers set last_seen=987 where id='main'\\\")\\n"
+            + "with open(args.out, 'w') as dst: json.dump(" + repr(config) + ", dst)\\n"
+        )
+        xray = folder / "fake-xray.sh"
+        xray.write_text("#!/bin/sh\\nexit 0\\n")
+        xray.chmod(0o700)
+        apply.render(hub, self.db, live, folder, xray)
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(
+                conn.execute("select last_seen from routers where id='main'").fetchone()[0], 1)
+        with sqlite3.connect(folder / "render-post-apply.sqlite") as conn:
+            self.assertEqual(
+                conn.execute("select last_seen from routers where id='main'").fetchone()[0], 987)
 
     def test_stale_preflight_is_blocked_without_partial_changes(self):
         with sqlite3.connect(self.db) as c:
