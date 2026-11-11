@@ -18,15 +18,16 @@ class ReconcileApplyTests(unittest.TestCase):
             c.execute("""create table routers (
               id text primary key, vps_transport text, vless_port integer,
               vps_allow_legacy integer, entry_port integer,
+              ssh_entry_port integer, vless_uuid text, ssh_vless_uuid text,
               last_seen integer, status_json text, deleted_at integer default 0
             )""")
             c.executemany(
-                "insert into routers values (?,?,?,?,?,?,?,0)",
-                [("main", "tcp", 18443, 0, 18080, 1, "{}"),
-                 ("PaxoBs", "tcp", 18443, 0, 18110, 1, "{}"),
-                 ("WR3000S_2", "tcp", 18443, 0, 18100, 1, "{}"),
-                 ("Netis_N6_router5", "ws", 443, 0, 18120, 1, "{}"),
-                 ("AX3000T-Shteinberg", "tcp", 18443, 0, 18090, 1, "{}")])
+                "insert into routers values (?,?,?,?,?,?,?,?,?,?,0)",
+                [("main", "tcp", 18443, 0, 18080, 19080, "main-luci", "main-ssh", 1, "{}"),
+                 ("PaxoBs", "tcp", 18443, 0, 18110, 19110, "PaxoBs-luci", "PaxoBs-ssh", 1, "{}"),
+                 ("WR3000S_2", "tcp", 18443, 0, 18100, 19100, "WR3000S_2-luci", "WR3000S_2-ssh", 1, "{}"),
+                 ("Netis_N6_router5", "ws", 443, 0, 18120, 19120, "Netis_N6_router5-luci", "Netis_N6_router5-ssh", 1, "{}"),
+                 ("AX3000T-Shteinberg", "tcp", 18443, 0, 18090, 19090, "AX3000T-Shteinberg-luci", "AX3000T-Shteinberg-ssh", 1, "{}")])
         self.targets = {"main", "PaxoBs", "WR3000S_2"}
         self.original = apply.config_rows(self.db)
         self.migrated = {k: dict(v) for k, v in self.original.items()}
