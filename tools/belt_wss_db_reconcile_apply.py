@@ -193,11 +193,16 @@ def render(hub: Path, db: Path, live: Path, folder: Path,
     output = folder / "render-post-apply.json"
     state_dir = folder / "isolated-post-apply"
     state_dir.mkdir(mode=0o700, exist_ok=True)
+    # Even the installed HUB renderer might initialize/migrate SQLite.
+    # Never point its subprocess at the production DB: make a consistent
+    # read snapshot and generate output from that private copy only.
+    render_db = folder / "render-post-apply.sqlite"
+    backup(db, render_db)
     env = dict(os.environ)
     env["OWRT_REMOTE_STATE_DIR"] = str(state_dir)
-    env["OWRT_REMOTE_DB"] = str(db)
+    env["OWRT_REMOTE_DB"] = str(render_db)
     p = subprocess.run(
-        [sys.executable, str(hub), "--db", str(db), "render-xray",
+        [sys.executable, str(hub), "--db", str(render_db), "render-xray",
          "--listen-host", str(next(
              i["listen"] for i in live_config["inbounds"]
              if i.get("tag") == "owrt-remote-vless")),
