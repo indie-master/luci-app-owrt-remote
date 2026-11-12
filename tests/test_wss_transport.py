@@ -328,7 +328,10 @@ render_client_config --stdout
         return json.loads(result.stdout)
 
     def test_wss_protects_two_reverse_links_with_tls_and_final_rules(self):
-        config = self.render("ws")
+        # finalRules is emitted only for Xray 26.5+; the fake empty core
+        # previously caused this test to fail even when the implementation
+        # was correct. Declare the version explicitly like the TCP test.
+        config = self.render("ws", core_version="26.10.21")
         for tag in ("vps-interconn", "vps-ssh-interconn"):
             outbound = next(o for o in config["outbounds"] if o["tag"] == tag)
             stream = outbound["streamSettings"]
