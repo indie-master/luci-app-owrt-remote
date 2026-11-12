@@ -40,6 +40,7 @@ def new_edge_plan(domain: str, *, mode: str = "external_nginx",
                   https_port: int = 443, hub_port: int = 18088,
                   wss_port: int = 28444, wss_path: str = "/owrt-ws/",
                   cert_path: str = "", key_path: str = "",
+                  cert_name: str = "",
                   acme_email: str = "", dns_provider: str = "") -> dict:
     host = host_only(domain)
     https_port = port(https_port, "HTTPS")
@@ -58,6 +59,7 @@ def new_edge_plan(domain: str, *, mode: str = "external_nginx",
         "wss_path": wss_path,
         "cert_path": cert_path,
         "key_path": key_path,
+        "cert_name": cert_name or (host if (tls_mode or "") == "existing_letsencrypt" else ""),
         "acme_email": acme_email,
         "dns_provider": dns_provider,
         "automatic_nginx_overwrite": False,
@@ -103,6 +105,7 @@ def validate(plan: dict) -> dict:
           WSS_PATH.fullmatch(plan["wss_path"]) is not None,
           "WSS path has unsafe characters; must start/end with /")
     if tls == "existing_pem":
+        check(not plan.get("cert_name"), "cert_name applies only to certbot directory")
         _safe_path(plan.get("cert_path"), "TLS certificate")
         _safe_path(plan.get("key_path"), "TLS private key")
         check(plan["cert_path"] != plan["key_path"],
@@ -111,10 +114,15 @@ def validate(plan: dict) -> dict:
         # Mount the complete tree, including live/ and archive/ symlinks.
         # Mounting individual certbot-renewed PEM files can pin stale inodes.
         _safe_path(plan.get("cert_path"), "existing Let's Encrypt directory")
+        name = plan.get("cert_name")
+        check(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) is not None
+              and ".." not in name and name not in (".", ".."),
+              "invalid certificate name")
         check(not plan.get("key_path"),
               "existing_letsencrypt uses the whole certificate tree")
     else:
-        check(not plan.get("cert_path") and not plan.get("key_path"),
+        check(not plan.get("cert_path") and not plan.get("key_path")
+              and not plan.get("cert_name"),
               "certificate paths are not applicable")
     if tls in ("acme_http01", "acme_dns01"):
         email = str(plan.get("acme_email") or "")
@@ -186,8 +194,9 @@ def render_bundled_nginx(plan: dict) -> str:
     if plan["tls_mode"] == "existing_pem":
         cert, key = "/run/ro-tls/fullchain.pem", "/run/ro-tls/privkey.pem"
     else:
-        cert = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
-        key = f"/etc/letsencrypt/live/{domain}/privkey.pem"
+        cert_name = plan["cert_name"] if plan["tls_mode"] == "existing_letsencrypt" else domain
+        cert = f"/etc/letsencrypt/live/{cert_name}/fullchain.pem"
+        key = f"/etc/letsencrypt/live/{cert_name}/privkey.pem"
     https = int(plan["public_https_port"])
     suffix = "" if https == 443 else ":" + str(https)
     return (
@@ -260,8 +269,13 @@ def render_compose_plan(plan: dict) -> str:
                 f"      - {plan['key_path']}:/run/ro-tls/privkey.pem:ro\n"
             )
         elif plan["tls_mode"] == "existing_letsencrypt":
+            # Selective live+archive mounts preserve the relative certbot
+            # symlinks while restricting the container to ONE cert lineage.
+            cert_root = plan["cert_path"].rstrip("/")
+            cert_name = plan["cert_name"]
             base += (
-                f"      - {plan['cert_path']}:/etc/letsencrypt:ro\n"
+                f"      - {cert_root}/live/{cert_name}:/etc/letsencrypt/live/{cert_name}:ro\n"
+                f"      - {cert_root}/archive/{cert_name}:/etc/letsencrypt/archive/{cert_name}:ro\n"
                 "      - ./acme/webroot:/var/www/acme:ro\n"
             )
         else:
@@ -307,6 +321,8 @@ def main() -> int:
     init.add_argument("--dns-provider", default="")
     init.add_argument("--cert", default="")
     init.add_argument("--key", default="")
+    init.add_argument("--cert-name", default="",
+                      help="certbot lineage name, e.g. cdnvc.xyz or example.org-001")
     init.add_argument("--output", type=Path, required=True)
     stage = sub.add_parser("stage")
     stage.add_argument("plan", type=Path)
@@ -319,7 +335,8 @@ def main() -> int:
             plan = new_edge_plan(
                 args.domain, mode=args.mode, tls_mode=args.tls,
                 acme_email=args.email, dns_provider=args.dns_provider,
-                cert_path=args.cert, key_path=args.key)
+                cert_path=args.cert, key_path=args.key,
+                cert_name=args.cert_name)
             safe_write(args.output, json.dumps(plan, indent=2) + "\n")
             print("STAGED: " + str(args.output))
             print("NO changes to Docker/Nginx/Xray/HUB")
