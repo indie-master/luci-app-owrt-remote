@@ -65,6 +65,31 @@ class WssHubTests(unittest.TestCase):
         self.assertEqual(old2["vps_transport"], "tcp")
         self.assertEqual(old2["vless_port"], 18443)
 
+    def test_docker_hub_only_blocks_xray_restart_and_regeneration(self):
+        # Docker HUB migration keeps existing reverse Xray on systemd.
+        # No container-side fallback to systemctl is permitted.
+        with mock.patch.dict(os.environ, {
+            "OWRT_REMOTE_XRAY_CONTROL_BACKEND": "external_readonly",
+        }), mock.patch.object(hub.subprocess, "run") as proc:
+            with self.assertRaisesRegex(RuntimeError, "Xray mutation disabled"):
+                hub.restart_vps_xray()
+            with self.assertRaisesRegex(RuntimeError, "Xray mutation disabled"):
+                hub.reload_vps_xray(self.db)
+            proc.assert_not_called()
+
+    def test_systemd_backend_keeps_existing_maintenance_hold(self):
+        with mock.patch.dict(os.environ, {
+            "OWRT_REMOTE_XRAY_CONTROL_BACKEND": "systemd",
+        }), mock.patch.object(hub, "_XRAY_MAINTENANCE_HOLD",
+                              Path(self.temp.name) / ".xray-maintenance-hold") as hold:
+            with mock.patch.object(hub.subprocess, "run") as proc:
+                # Unlocked normal systemd behavior still exists.
+                hub.assert_xray_mutation_allowed()
+                (Path(self.temp.name) / ".xray-maintenance-hold").write_text("hold")
+                with self.assertRaisesRegex(RuntimeError, "locked"):
+                    hub.assert_xray_mutation_allowed()
+                proc.assert_not_called()
+
     def test_server_separates_clients_preserves_luci_ssh_routes(self):
         self.add("old", "tcp", 18443)
         self.add("new")
