@@ -11,8 +11,6 @@ on:
       - "tools/belt_fleet_config_audit.py"
       - "tools/belt_wss_db_reconcile_stage.py"
       - "tools/belt_wss_db_reconcile_apply.py"
-      - "tools/belt_new_wss_enroll.py"
-      - "tests/test_belt_new_wss_enroll.py"
       - "tests/test_belt_fleet_config_audit.py"
       - "tests/test_belt_wss_db_reconcile_stage.py"
       - "tests/test_belt_wss_db_reconcile_apply.py"
@@ -21,6 +19,8 @@ on:
     paths:
       - "vps/owrt-remote-hub.py"
       - "tests/test_wss_transport.py"
+      - "tools/belt_new_wss_enroll.py"
+      - "tests/test_belt_new_wss_enroll.py"
       - "tools/belt_fleet_config_audit.py"
       - "tests/test_belt_fleet_config_audit.py"
       - ".github/workflows/fleet-audit-ci.yml"
