@@ -4776,9 +4776,17 @@ def build_openwrt_config_payload(row, hub_url, vps_host_override="", public_url_
     ssh_host = row_str_value(row, "ssh_host", "127.0.0.1")
     admin_host = row_str_value(row, "admin_host", "127.0.0.1")
     effective_public_url = str(public_url_override or row_str_value(row, "public_url", "")).strip()
-    effective_vps_host = str(vps_host_override or row_str_value(row, "vps_host", "")).strip()
-    if not effective_vps_host:
-        effective_vps_host = vps_host_name(effective_public_url) or vps_host_name(hub_url) or "127.0.0.1"
+    # Xray expects a hostname/IP in vps_host, never a URL with https://,
+    # a scheme, port or path. Historical HUB rows and UI overrides may
+    # contain a full HTTPS URL. Normalize *only the exported router config*:
+    # leave the existing DB, heartbeat host policy and HTTPS hub/public URLs
+    # unchanged so connected routers retain their settings.
+    effective_vps_host = (
+        vps_host_name(vps_host_override or row_str_value(row, "vps_host", ""))
+        or vps_host_name(effective_public_url)
+        or vps_host_name(hub_url)
+        or "127.0.0.1"
+    )
     payload = {
         "id": row_str_value(row, "id"),
         "name": row_str_value(row, "name"),

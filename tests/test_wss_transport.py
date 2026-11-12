@@ -172,6 +172,51 @@ class WssHubTests(unittest.TestCase):
         self.assertEqual(legacy["outbounds"][2]["streamSettings"]["security"], "none")
         self.assertNotIn("finalRules", legacy["outbounds"][0]["settings"])
 
+    def test_export_strips_url_from_vps_host_in_manual_ssh_and_cli(self):
+        router = self.add("new")
+        raw_url = "https://sprt-wrt.cdnvc.xyz:443/owrt-ws/"
+        hub_url = "https://sprt-wrt.cdnvc.xyz"
+        with hub.connect(self.db) as conn:
+            router = dict(hub.upsert_router(conn, {
+                "id": router["id"],
+                "vps_host": raw_url,
+                "public_url": hub_url,
+            }))
+        with mock.patch.object(hub, "agent_token", return_value="test-agent-token"):
+            manual = hub.make_openwrt_config(router, hub_url)
+            ssh = hub.make_openwrt_ssh_apply_script(
+                router, hub_url, vps_host_override=raw_url)
+            from argparse import Namespace
+            import io
+            from contextlib import redirect_stdout
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                hub.cmd_print_openwrt(Namespace(
+                    db=self.db, id=router["id"], hub_url=hub_url,
+                    vps_host="127.0.0.1", port=8088))
+            cli = captured.getvalue()
+        for label, script in (("manual", manual), ("ssh", ssh), ("cli", cli)):
+            with self.subTest(output=label):
+                self.assertIn("uci set owrtremote.main.vps_host='sprt-wrt.cdnvc.xyz'", script)
+                self.assertNotIn("vps_host='https://", script)
+                self.assertIn("uci set owrtremote.main.hub_url='https://sprt-wrt.cdnvc.xyz'", script)
+                self.assertIn("uci set owrtremote.main.public_url='https://sprt-wrt.cdnvc.xyz'", script)
+                self.assertIn("uci set owrtremote.main.vps_sni='sprt-wrt.cdnvc.xyz'", script)
+                self.assertIn("uci set owrtremote.main.vps_transport='ws'", script)
+        with hub.connect(self.db) as conn:
+            # Export must NOT mutate records of already connected routers.
+            self.assertEqual(hub.get_router(conn, router["id"])["vps_host"], raw_url)
+
+    def test_export_normalizes_ip_and_falls_back_to_hub_url(self):
+        row = {"id": "s1", "vps_host": "https://198.51.100.12:443/test", "vps_transport": "ws"}
+        payload = hub.build_openwrt_config_payload(row, "https://sprt-wrt.cdnvc.xyz")
+        self.assertEqual(payload["vps_host"], "198.51.100.12")
+        self.assertEqual(payload["vps_sni"], "sprt-wrt.cdnvc.xyz")
+        row["vps_host"] = ""
+        payload = hub.build_openwrt_config_payload(row, "https://sprt-wrt.cdnvc.xyz")
+        self.assertEqual(payload["vps_host"], "sprt-wrt.cdnvc.xyz")
+        self.assertEqual(payload["hub_url"], "https://sprt-wrt.cdnvc.xyz")
+
     def test_invalid_transport_cannot_replace_existing(self):
         self.add("old", "tcp", 18443)
         with hub.connect(self.db) as conn:
