@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 from orchestrator_setup_profiles import host_only, port, check, InvalidPlan, safe_write
 
 NGINX_MODES = ("external_nginx", "bundled_nginx")
-TLS_MODES = ("external_tls", "existing_pem", "acme_http01", "acme_dns01")
+TLS_MODES = ("external_tls", "existing_pem", "existing_letsencrypt", "acme_http01", "acme_dns01")
 ABS_PATH = re.compile(r"^/[a-zA-Z0-9._/-]+$")
 WSS_PATH = re.compile(r"^/[a-zA-Z0-9/_-]*/$")
 FQDN_LABEL = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$")
@@ -77,7 +77,7 @@ def validate(plan: dict) -> dict:
     mode = plan["nginx_mode"]
     tls = plan["tls_mode"]
     check((mode == "external_nginx" and tls == "external_tls") or
-          (mode == "bundled_nginx" and tls in ("existing_pem", "acme_http01", "acme_dns01")),
+          (mode == "bundled_nginx" and tls in ("existing_pem", "existing_letsencrypt", "acme_http01", "acme_dns01")),
           "TLS strategy incompatible with Nginx mode")
     check(plan.get("automatic_nginx_overwrite") is False
           and plan.get("automatic_xray_restart") is False,
@@ -102,17 +102,17 @@ def validate(plan: dict) -> dict:
     check(isinstance(plan.get("wss_path"), str) and
           WSS_PATH.fullmatch(plan["wss_path"]) is not None,
           "WSS path has unsafe characters; must start/end with /")
-    check(plan.get("cert_path", "") == "" or
-          (tls == "existing_pem" and bool(plan.get("key_path"))),
-          "certificate path allowed only with existing_pem")
-    check(plan.get("key_path", "") == "" or
-          (tls == "existing_pem" and bool(plan.get("cert_path"))),
-          "private key path allowed only with existing_pem")
     if tls == "existing_pem":
         _safe_path(plan.get("cert_path"), "TLS certificate")
         _safe_path(plan.get("key_path"), "TLS private key")
         check(plan["cert_path"] != plan["key_path"],
               "certificate and private key cannot be identical")
+    elif tls == "existing_letsencrypt":
+        # Mount the complete tree, including live/ and archive/ symlinks.
+        # Mounting individual certbot-renewed PEM files can pin stale inodes.
+        _safe_path(plan.get("cert_path"), "existing Let's Encrypt directory")
+        check(not plan.get("key_path"),
+              "existing_letsencrypt uses the whole certificate tree")
     else:
         check(not plan.get("cert_path") and not plan.get("key_path"),
               "certificate paths are not applicable")
@@ -188,6 +188,8 @@ def render_bundled_nginx(plan: dict) -> str:
     else:
         cert = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
         key = f"/etc/letsencrypt/live/{domain}/privkey.pem"
+    https = int(plan["public_https_port"])
+    suffix = "" if https == 443 else ":" + str(https)
     return (
         "# REVIEW ONLY: Nginx HTTPS stage starts AFTER a valid certificate exists.\n"
         "server {\n"
@@ -197,10 +199,10 @@ def render_bundled_nginx(plan: dict) -> str:
         "        root /var/www/acme;\n"
         "        try_files $uri =404;\n"
         "    }\n"
-        "    location / { return 301 https://$host$request_uri; }\n"
+        f"    location / {{ return 301 https://$host{suffix}$request_uri; }}\n"
         "}\n"
         "server {\n"
-        "    listen 443 ssl;\n"
+        f"    listen {https} ssl;\n"
         f"    server_name {domain};\n"
         f"    ssl_certificate {cert};\n"
         f"    ssl_certificate_key {key};\n"
@@ -248,7 +250,7 @@ def render_compose_plan(plan: dict) -> str:
             "    networks: [ro-internal]\n"
             "    ports:\n"
             '      - "80:80"\n'
-            '      - "443:443"\n'
+            f'      - "{plan["public_https_port"]}:{plan["public_https_port"]}"\n'
             "    volumes:\n"
             "      - ./nginx/orchestrator.conf:/etc/nginx/conf.d/default.conf:ro\n"
         )
@@ -256,6 +258,11 @@ def render_compose_plan(plan: dict) -> str:
             base += (
                 f"      - {plan['cert_path']}:/run/ro-tls/fullchain.pem:ro\n"
                 f"      - {plan['key_path']}:/run/ro-tls/privkey.pem:ro\n"
+            )
+        elif plan["tls_mode"] == "existing_letsencrypt":
+            base += (
+                f"      - {plan['cert_path']}:/etc/letsencrypt:ro\n"
+                "      - ./acme/webroot:/var/www/acme:ro\n"
             )
         else:
             base += (
