@@ -55,6 +55,29 @@ class DockerEdgePlanTests(unittest.TestCase):
         self.assertIn("ssl_certificate /run/ro-tls/fullchain.pem;", conf)
         self.assertNotIn("BEGIN PRIVATE KEY", compose)
 
+    def test_certbot_tree_is_mounted_as_directory_to_preserve_renewed_symlinks(self):
+        plan = edge.new_edge_plan("hub.example.org", mode="bundled_nginx",
+                                  tls_mode="existing_letsencrypt",
+                                  cert_path="/etc/letsencrypt")
+        compose = edge.render_compose_plan(plan)
+        self.assertIn("/etc/letsencrypt:/etc/letsencrypt:ro", compose)
+        conf = edge.render_bundled_nginx(plan)
+        self.assertIn("/etc/letsencrypt/live/hub.example.org/fullchain.pem", conf)
+        self.assertNotIn("/run/ro-tls/fullchain.pem", conf)
+
+    def test_custom_https_public_port_is_consistent_with_nginx_and_redirect(self):
+        plan = edge.new_edge_plan("hub.example.org", mode="bundled_nginx",
+                                  tls_mode="acme_dns01",
+                                  acme_email="admin@example.org",
+                                  dns_provider="cloudflare",
+                                  https_port=8443)
+        compose = edge.render_compose_plan(plan)
+        conf = edge.render_bundled_nginx(plan)
+        self.assertIn('      - "8443:8443"', compose)
+        self.assertIn("listen 8443 ssl;", conf)
+        self.assertIn("https://$host:8443$request_uri", conf)
+        self.assertEqual(plan["public_url"], "https://hub.example.org:8443")
+
     def test_dns01_needs_explicit_provider_and_safe_domain(self):
         good = edge.new_edge_plan("*.example.org".replace("*.", "wildcard."),
                                   mode="bundled_nginx", tls_mode="acme_dns01",
