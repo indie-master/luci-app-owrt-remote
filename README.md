@@ -19,6 +19,7 @@
 - [Безопасная регистрация одного нового WSS-роутера в Xray](docs/NEW_ROUTER_WSS_ENROLLMENT.md)
 - [Планирование собственной установки: домен, WSS/REALITY, версии Xray и откат](docs/ORCHESTRATOR_SETUP_XRAY_PROFILES.md)
 - [Два режима Nginx/Docker и безопасный выбор резервных профилей](docs/ORCHESTRATOR_DOCKER_TLS_FAILOVER.md)
+- [Belt → Docker: сохранность всех данных, история, аудит и двухэтапный перенос](docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md)
 - [Черновик первого веб-мастера настройки](vps/static/orchestrator-setup-preview.html)
 - [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
 - [Оригинальный проект](https://github.com/kzolotarev95/luci-app-owrt-remote) — автор kzolotarev95. Сохраняются оригинальные copyright и [MIT LICENSE](LICENSE).
