@@ -60,10 +60,24 @@ class DockerEdgePlanTests(unittest.TestCase):
                                   tls_mode="existing_letsencrypt",
                                   cert_path="/etc/letsencrypt")
         compose = edge.render_compose_plan(plan)
-        self.assertIn("/etc/letsencrypt:/etc/letsencrypt:ro", compose)
+        self.assertIn("/etc/letsencrypt/live/hub.example.org:/etc/letsencrypt/live/hub.example.org:ro", compose)
+        self.assertIn("/etc/letsencrypt/archive/hub.example.org:/etc/letsencrypt/archive/hub.example.org:ro", compose)
+        self.assertNotIn("/etc/letsencrypt:/etc/letsencrypt:ro", compose)
         conf = edge.render_bundled_nginx(plan)
         self.assertIn("/etc/letsencrypt/live/hub.example.org/fullchain.pem", conf)
         self.assertNotIn("/run/ro-tls/fullchain.pem", conf)
+
+    def test_existing_wildcard_cert_can_use_different_certbot_lineage(self):
+        plan = edge.new_edge_plan("hub.cdnvc.xyz", mode="bundled_nginx",
+                                  tls_mode="existing_letsencrypt",
+                                  cert_path="/etc/letsencrypt",
+                                  cert_name="cdnvc.xyz")
+        compose = edge.render_compose_plan(plan)
+        nginx = edge.render_bundled_nginx(plan)
+        self.assertIn("/etc/letsencrypt/live/cdnvc.xyz:/etc/letsencrypt/live/cdnvc.xyz:ro", compose)
+        self.assertIn("/etc/letsencrypt/archive/cdnvc.xyz:/etc/letsencrypt/archive/cdnvc.xyz:ro", compose)
+        self.assertIn("ssl_certificate /etc/letsencrypt/live/cdnvc.xyz/fullchain.pem;", nginx)
+        self.assertIn("server_name hub.cdnvc.xyz;", nginx)
 
     def test_custom_https_public_port_is_consistent_with_nginx_and_redirect(self):
         plan = edge.new_edge_plan("hub.example.org", mode="bundled_nginx",
