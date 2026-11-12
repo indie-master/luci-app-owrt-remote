@@ -6,9 +6,13 @@ on:
     paths:
       - "vps/owrt-remote-hub.py"
       - "tests/test_wss_transport.py"
+      - "tools/belt_new_wss_enroll.py"
+      - "tests/test_belt_new_wss_enroll.py"
       - "tools/belt_fleet_config_audit.py"
       - "tools/belt_wss_db_reconcile_stage.py"
       - "tools/belt_wss_db_reconcile_apply.py"
+      - "tools/belt_new_wss_enroll.py"
+      - "tests/test_belt_new_wss_enroll.py"
       - "tests/test_belt_fleet_config_audit.py"
       - "tests/test_belt_wss_db_reconcile_stage.py"
       - "tests/test_belt_wss_db_reconcile_apply.py"
@@ -35,6 +39,10 @@ jobs:
         run: |
           python3 -m py_compile vps/owrt-remote-hub.py
           python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
+      - name: Test safe new WSS router enrollment on synthetic fleet
+        run: |
+          python3 -m py_compile tools/belt_new_wss_enroll.py
+          python3 -m unittest discover -s tests -p 'test_belt_new_wss_enroll.py' -v
       - name: Compile audit
         run: python3 -m py_compile tools/belt_fleet_config_audit.py tools/belt_wss_db_reconcile_stage.py tools/belt_wss_db_reconcile_apply.py
       - name: Test synthetic inventory
