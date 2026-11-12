@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import os
 from pathlib import Path
 import re
@@ -76,9 +77,7 @@ def preview(candidate: Path, expected_sha: str, expected_version: str,
         require(candidate.resolve() != installed.resolve(),
                 "candidate must not replace or be the running binary")
     digest = sha256(candidate)
-    require(hashlib.compare_digest(digest.lower(), expected_sha.lower())
-            if hasattr(hashlib, "compare_digest")
-            else digest.lower() == expected_sha.lower(),
+    require(hmac.compare_digest(digest.lower(), expected_sha.lower()),
             "candidate SHA256 does not match the trusted release manifest")
     current = version_of(installed) if installed is not None else None
     proposed = version_of(candidate)
