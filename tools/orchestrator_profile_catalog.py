@@ -250,6 +250,14 @@ def main() -> int:
     init.add_argument("--out", type=Path, required=True)
     listing = sp.add_parser("profiles")
     listing.add_argument("file", type=Path)
+    generate = sp.add_parser("candidate", help="generate private separate server/router review fragments")
+    generate.add_argument("file", type=Path)
+    generate.add_argument("--profile", required=True)
+    generate.add_argument("--router-file", required=True, type=Path)
+    generate.add_argument("--secrets-file", type=Path,
+                          help="required for REALITY; local root-private JSON only")
+    generate.add_argument("--server-out", type=Path, required=True)
+    generate.add_argument("--client-out", type=Path, required=True)
     args = p.parse_args()
     try:
         if args.command == "init":
@@ -258,12 +266,48 @@ def main() -> int:
                 add_reality=args.add_reality)
             safe_write(args.out, json.dumps(catalog, indent=2) + "\n")
             print("PROFILE CATALOG STAGED: " + str(args.out))
-        else:
+        elif args.command == "profiles":
             catalog = validate(json.loads(args.file.read_text()))
             for profile in catalog["profiles"]:
                 print(profile["id"], ":", profile["type"],
                       "@", profile["endpoint_host"], ":", profile["public_port"],
                       "enabled=" + str(profile["enabled"]).lower())
+        else:
+            catalog = validate(json.loads(args.file.read_text()))
+            check(args.server_out.resolve() != args.client_out.resolve(),
+                  "server/client output cannot be the same file")
+            check(not args.server_out.exists() and not args.client_out.exists(),
+                  "candidate output already exists; refuse overwrite")
+            router = json.loads(args.router_file.read_text())
+            secrets = None
+            if args.secrets_file:
+                check(args.secrets_file.is_file() and
+                      not args.secrets_file.is_symlink() and
+                      args.secrets_file.stat().st_mode & 0o077 == 0,
+                      "REALITY keys file must be a private 0600 regular file")
+                secrets = json.loads(args.secrets_file.read_text())
+            pair = candidate_pair(catalog, args.profile, router, secrets)
+            # Intentionally split private server key/UUID and client config.
+            server = {
+                "profile_id": pair["profile_id"],
+                "server_inbound": pair["server_inbound"],
+                "deployable": False,
+                "status": "REVIEW_ONLY",
+            }
+            client = {
+                "profile_id": pair["profile_id"],
+                "router_outbounds": pair["router_outbounds"],
+                "deployable": False,
+                "status": "REVIEW_ONLY",
+            }
+            safe_write(args.server_out, json.dumps(server, indent=2) + "\n")
+            try:
+                safe_write(args.client_out, json.dumps(client, indent=2) + "\n")
+            except BaseException:
+                args.server_out.unlink(missing_ok=True)
+                raise
+            print("PRIVATE CANDIDATES CREATED — server/client isolated")
+            print("NO Xray service or router changed")
         print("READ ONLY: no router/server configuration changes")
         return 0
     except (InvalidPlan, KeyError, OSError, TypeError, ValueError) as e:
