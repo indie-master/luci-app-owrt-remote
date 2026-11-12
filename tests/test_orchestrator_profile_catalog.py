@@ -132,6 +132,65 @@ class CatalogTests(unittest.TestCase):
             with self.assertRaises(InvalidPlan):
                 catalog.validate(config)
 
+    def test_cli_generates_separate_private_server_and_client_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "profiles.json"
+            router = root / "router.json"
+            secrets = root / "reality.json"
+            server = root / "server.review.json"
+            client = root / "client.review.json"
+            config = self.mixed()
+            src.write_text(json.dumps(config))
+            router.write_text(json.dumps(ROUTER))
+            secrets.write_text(json.dumps(SECRETS))
+            secrets.chmod(0o600)
+            cmd = [
+                sys.executable, str(ROOT / "tools" / "orchestrator_profile_catalog.py"),
+                "candidate", str(src), "--profile", "reality-pilot",
+                "--router-file", str(router), "--secrets-file", str(secrets),
+                "--server-out", str(server), "--client-out", str(client),
+            ]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("PRIVATE CANDIDATES CREATED", p.stdout)
+            self.assertNotIn(SECRETS["private_key"], p.stdout)
+            self.assertNotIn(ROUTER["vless_uuid"], p.stdout)
+            self.assertEqual(server.stat().st_mode & 0o077, 0)
+            self.assertEqual(client.stat().st_mode & 0o077, 0)
+            full_server = json.loads(server.read_text())
+            full_client = json.loads(client.read_text())
+            self.assertFalse(full_server["deployable"])
+            self.assertFalse(full_client["deployable"])
+            self.assertIn(SECRETS["private_key"], server.read_text())
+            self.assertNotIn(SECRETS["private_key"], client.read_text())
+            self.assertNotIn("server_inbound", full_client)
+            again = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
+            self.assertNotEqual(again.returncode, 0)
+            self.assertIn("BLOCKED", again.stderr)
+
+    def test_reality_cli_rejects_world_readable_private_key_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "profiles.json"
+            router = root / "router.json"
+            secrets = root / "reality.json"
+            src.write_text(json.dumps(self.mixed()))
+            router.write_text(json.dumps(ROUTER))
+            secrets.write_text(json.dumps(SECRETS))
+            secrets.chmod(0o644)
+            cmd = [
+                sys.executable, str(ROOT / "tools" / "orchestrator_profile_catalog.py"),
+                "candidate", str(src), "--profile", "reality-pilot",
+                "--router-file", str(router), "--secrets-file", str(secrets),
+                "--server-out", str(root / "server.json"),
+                "--client-out", str(root / "client.json"),
+            ]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertFalse((root / "server.json").exists())
+            self.assertFalse((root / "client.json").exists())
+
     def test_cli_generates_private_non_deployable_catalog(self):
         with tempfile.TemporaryDirectory() as td:
             dest = Path(td) / "profiles.json"
