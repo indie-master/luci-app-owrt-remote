@@ -4,6 +4,8 @@ on:
   push:
     branches: [feature/indie-branding]
     paths:
+      - "vps/owrt-remote-hub.py"
+      - "tests/test_wss_transport.py"
       - "tools/belt_fleet_config_audit.py"
       - "tools/belt_wss_db_reconcile_stage.py"
       - "tools/belt_wss_db_reconcile_apply.py"
@@ -13,6 +15,8 @@ on:
       - ".github/workflows/fleet-audit-ci.yml"
   pull_request:
     paths:
+      - "vps/owrt-remote-hub.py"
+      - "tests/test_wss_transport.py"
       - "tools/belt_fleet_config_audit.py"
       - "tests/test_belt_fleet_config_audit.py"
       - ".github/workflows/fleet-audit-ci.yml"
@@ -27,6 +31,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Test OpenWrt WSS export hostname normalization
+        run: |
+          python3 -m py_compile vps/owrt-remote-hub.py
+          python3 -m unittest discover -s tests -p 'test_wss_transport.py' -v
       - name: Compile audit
         run: python3 -m py_compile tools/belt_fleet_config_audit.py tools/belt_wss_db_reconcile_stage.py tools/belt_wss_db_reconcile_apply.py
       - name: Test synthetic inventory
