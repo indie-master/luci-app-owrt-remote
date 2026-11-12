@@ -18,6 +18,8 @@
 - [Belt: изолированный hotfix генератора конфигурации без замены всего HUB](docs/BELT_HUB_HOST_EXPORT_HOTFIX.md)
 - [Безопасная регистрация одного нового WSS-роутера в Xray](docs/NEW_ROUTER_WSS_ENROLLMENT.md)
 - [Планирование собственной установки: домен, WSS/REALITY, версии Xray и откат](docs/ORCHESTRATOR_SETUP_XRAY_PROFILES.md)
+- [Два режима Nginx/Docker и безопасный выбор резервных профилей](docs/ORCHESTRATOR_DOCKER_TLS_FAILOVER.md)
+- [Черновик первого веб-мастера настройки](vps/static/orchestrator-setup-preview.html)
 - [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
 - [Оригинальный проект](https://github.com/kzolotarev95/luci-app-owrt-remote) — автор kzolotarev95. Сохраняются оригинальные copyright и [MIT LICENSE](LICENSE).
 - Текущий рабочий форк: [indie-master/luci-app-owrt-remote](https://github.com/indie-master/luci-app-owrt-remote). Будущее имя репозитория **router-orchestrator** пока не активировано; URL обновлений не менять до проверки миграции.
