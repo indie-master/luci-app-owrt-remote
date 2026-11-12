@@ -12,6 +12,7 @@ future state are preserved. SQLite is copied with the online backup API.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import io
 import json
@@ -30,9 +31,12 @@ SERVICE_FILES = {
     "hub_systemd": "/etc/systemd/system/owrt-remote.service",
     "xray_systemd": "/etc/systemd/system/owrt-remote-xray.service",
 }
-MUST_KEEP = ("hub-auth.json", "hub-sessions.json", "agent.token",
-             "hub-vapid-private.pem", "hub-notifications.json",
-             ".xray-maintenance-hold")
+MUST_KEEP = ("hub-auth.json", "agent.token", ".xray-maintenance-hold")
+OPTIONAL_STATE = ("hub-sessions.json", "hub-session.token", "hub-boot.id",
+                  "hub-vapid-private.pem", "hub-vapid-public.txt",
+                  "hub-notifications.json", "hub-push-subscriptions.json",
+                  "hub-push-delivery.json", "hub-traffic-counters.json",
+                  "xray-wan-reconnect-restart.json")
 MAX_MANIFEST = 4 * 1024 * 1024
 
 
@@ -63,7 +67,7 @@ def _ro_connection(path: Path) -> sqlite3.Connection:
 
 
 def db_inventory(path: Path) -> dict:
-    with _ro_connection(path) as conn:
+    with closing(_ro_connection(path)) as conn:
         require(conn.execute("pragma integrity_check").fetchone()[0] == "ok",
                 "SQLite integrity_check failed")
         tables = [r[0] for r in conn.execute(
@@ -218,8 +222,8 @@ def record_state_files(state: Path) -> list[tuple[Path, str]]:
 
 
 def online_db_backup(source: Path, output: Path) -> None:
-    with _ro_connection(source) as src:
-        with sqlite3.connect(str(output)) as dst:
+    with closing(_ro_connection(source)) as src:
+        with closing(sqlite3.connect(str(output))) as dst:
             src.backup(dst, pages=128, sleep=0.05)
     output.chmod(0o600)
     require(db_inventory(output)["active_count"] > 0,
@@ -271,6 +275,8 @@ def snapshot(state: Path, xray: Path, hub_source: Path,
                      "deleted": again["deleted_count"]},
         "required_files_present": {name: (state / name).is_file()
                                    for name in MUST_KEEP},
+        "optional_files_present": {name: (state / name).is_file()
+                                   for name in OPTIONAL_STATE},
         "files_sha256": {},
         "no_live_service_changes": True,
         "instructions": "Do not restore this archive over a live database after any new writes",
