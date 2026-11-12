@@ -126,6 +126,33 @@ class SetupProfileTests(unittest.TestCase):
                 planner.safe_write(path, "overwrite")
             self.assertEqual(json.loads(path.read_text()), plan)
 
+    def test_setup_cli_accepts_custom_reality_and_ws_values_without_activation(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "custom.json"
+            script = ROOT / "tools" / "orchestrator_setup_profiles.py"
+            cmd = [sys.executable, str(script), "init",
+                   "--domain", "own-domain.example.net",
+                   "--output", str(output),
+                   "--wss-path", "/hidden-ws/",
+                   "--enable-reality",
+                   "--reality-port", "24444",
+                   "--reality-target", "www.cloudflare.com:443",
+                   "--reality-sni", "www.cloudflare.com",
+                   "--default-profile", "reality_raw",
+                   "--hub-xray-version", "26.10.21",
+                   "--router-xray-version", "26.11.9"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(output.read_text())
+            self.assertTrue(plan["reality"]["enabled"])
+            self.assertEqual(plan["reality"]["server_names"], ["www.cloudflare.com"])
+            self.assertEqual(plan["reality"]["target"], "www.cloudflare.com:443")
+            self.assertEqual(plan["reality"]["port"], 24444)
+            self.assertEqual(plan["wss"]["path"], "/hidden-ws/")
+            self.assertEqual(plan["default_profile"], "reality_raw")
+            self.assertEqual(plan["xray"]["router_version"], "26.11.9")
+            self.assertEqual(plan["status"], "PREVIEW_ONLY")
+
     def test_cli_first_run_and_preview_never_write_server_configs(self):
         with tempfile.TemporaryDirectory() as td:
             plan = Path(td) / "hub-plan.json"
