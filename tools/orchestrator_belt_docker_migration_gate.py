@@ -74,9 +74,11 @@ def db_inventory(path: Path) -> dict:
         needed = {"id", "vless_uuid", "ssh_vless_uuid", "entry_port",
                   "ssh_entry_port", "vps_transport", "vless_port", "deleted_at"}
         require(needed <= columns, "HUB schema missing WSS/router identity columns")
+        fallback_expr = "vps_allow_legacy" if "vps_allow_legacy" in columns else "0"
         rows = [dict(row) for row in conn.execute(
             "select id, vless_uuid, ssh_vless_uuid, entry_port, ssh_entry_port, "
-            "vps_transport, vless_port, deleted_at from routers order by id")]
+            f"vps_transport, vless_port, deleted_at, {fallback_expr} as vps_allow_legacy "
+            "from routers order by id")]
         active = [row for row in rows if not row.get("deleted_at")]
         counts = {}
         for name in tables:
@@ -145,6 +147,41 @@ def xray_parity(inventory: dict, config: dict) -> None:
     require("owrt-remote-vless" in by_tag and
             "owrt-remote-wss" in by_tag,
             "original TCP and WSS inbounds must both be retained")
+    # Explicitly reject credentials and reverse endpoints that do not
+    # correspond to active SQLite rows. A re-generated Docker config
+    # would silently drop these, potentially cutting off old routers.
+    expected = {"owrt-remote-vless": {}, "owrt-remote-wss": {}}
+    expected_tunnel_tags = set()
+    all_uuids = set()
+    for row in inventory["routers"]:
+        rid = str(row["id"])
+        selected = "owrt-remote-wss" if row["vps_transport"] == "ws" else "owrt-remote-vless"
+        for suffix, uuid in (("", row["vless_uuid"]), ("-ssh", row["ssh_vless_uuid"])):
+            require(uuid not in all_uuids, "duplicate identity across active router fleet")
+            all_uuids.add(uuid)
+            email = rid + suffix + "@owrt-remote"
+            expected[selected][email] = uuid
+            if selected == "owrt-remote-wss" and row["vps_allow_legacy"]:
+                # A manually preserved transitional TCP fallback is allowed,
+                # but is NOT required to exist after the successful WSS switch.
+                expected["owrt-remote-vless"][email] = uuid
+        expected_tunnel_tags.update(("entry-" + rid, "ssh-" + rid))
+    for transport in expected:
+        client_rows = clients(transport)
+        identities = {}
+        for client in client_rows:
+            email = client.get("email")
+            require(isinstance(email, str) and email not in identities,
+                    "duplicate/nameless authentication in " + transport)
+            identities[email] = client.get("id")
+        for email, uuid in identities.items():
+            require(expected[transport].get(email) == uuid,
+                    "unexpected/old/changed identity in " + transport + ": " + email)
+        # All mandatory identities were checked per router earlier.
+    reverse_tags = {tag for tag in tags if tag.startswith("entry-") or tag.startswith("ssh-")}
+    require(reverse_tags == expected_tunnel_tags,
+            "unexpected or missing reverse tunnel listeners in live Xray")
+
 
 
 def analyze(state: Path, xray: Path) -> tuple[dict, dict]:
