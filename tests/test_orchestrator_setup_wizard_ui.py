@@ -41,6 +41,7 @@ class WizardPreviewTests(unittest.TestCase):
             "hubXray": "26.10.21", "routerXray": "26.10.21",
             "email": "admin@example.org", "provider": "cloudflare",
             "cert": "/etc/letsencrypt", "key": "/etc/ssl/private/site.key",
+            "certName": "cdnvc.xyz",
         }
         # The HTML wizard itself is executed inside an isolated fake DOM;
         # the output is parsed by both real server-side validators below.
@@ -120,8 +121,10 @@ process.stdout.write(JSON.stringify({
     def test_import_existing_certbot_directory(self):
         data = self.result(mode="bundled_nginx", tls="existing_letsencrypt")
         self.assertEqual(data["edge"]["cert_path"], "/etc/letsencrypt")
+        self.assertEqual(data["edge"]["cert_name"], "cdnvc.xyz")
         compose = edge.render_compose_plan(data["edge"])
-        self.assertIn("/etc/letsencrypt:/etc/letsencrypt:ro", compose)
+        self.assertIn("/etc/letsencrypt/live/cdnvc.xyz:/etc/letsencrypt/live/cdnvc.xyz:ro", compose)
+        self.assertIn("/etc/letsencrypt/archive/cdnvc.xyz:/etc/letsencrypt/archive/cdnvc.xyz:ro", compose)
 
 
 if __name__ == "__main__":
