@@ -7,6 +7,8 @@ on:
       - "vps/owrt-remote-hub.py"
       - "tests/test_wss_transport.py"
       - "tools/belt_new_wss_enroll.py"
+      - "tools/belt_hub_host_export_hotfix.py"
+      - "tests/test_belt_hub_host_export_hotfix.py"
       - "tests/test_belt_new_wss_enroll.py"
       - "tools/belt_fleet_config_audit.py"
       - "tools/belt_wss_db_reconcile_stage.py"
@@ -43,6 +45,10 @@ jobs:
         run: |
           python3 -m py_compile tools/belt_new_wss_enroll.py
           python3 -m unittest discover -s tests -p 'test_belt_new_wss_enroll.py' -v
+      - name: Test source-only Belt Hub host export hotfix
+        run: |
+          python3 -m py_compile tools/belt_hub_host_export_hotfix.py
+          python3 -m unittest discover -s tests -p 'test_belt_hub_host_export_hotfix.py' -v
       - name: Compile audit
         run: python3 -m py_compile tools/belt_fleet_config_audit.py tools/belt_wss_db_reconcile_stage.py tools/belt_wss_db_reconcile_apply.py
       - name: Test synthetic inventory
