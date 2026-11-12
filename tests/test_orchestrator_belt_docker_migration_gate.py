@@ -148,6 +148,36 @@ class MigrationGateTests(unittest.TestCase):
             with self.subTest(op=op), self.assertRaises(gate.GateError):
                 gate.xray_parity(gate.db_inventory(self.state / "hub.db"), data)
 
+    def test_orphan_wss_credential_and_ghost_reverse_port_block(self):
+        original = json.loads(self.xray.read_text())
+        for variant in ("orphan-client", "orphan-listener", "duplicate-client"):
+            cfg = json.loads(json.dumps(original))
+            if variant == "orphan-client":
+                cfg["inbounds"][1]["settings"]["clients"].append({
+                    "id": "forgotten-uuid", "email": "deleted-router@owrt-remote"})
+            elif variant == "orphan-listener":
+                cfg["inbounds"].append({
+                    "tag": "ssh-deleted-router", "listen": "127.0.0.1",
+                    "protocol": "tunnel", "port": 19999})
+            else:
+                cfg["inbounds"][1]["settings"]["clients"].append(
+                    cfg["inbounds"][1]["settings"]["clients"][0].copy())
+            with self.subTest(variant=variant), self.assertRaises(gate.GateError):
+                gate.xray_parity(gate.db_inventory(self.state / "hub.db"), cfg)
+
+    def test_legacy_wss_fallback_credential_is_preserved_if_present(self):
+        with sqlite3.connect(self.state / "hub.db") as c:
+            c.execute("alter table routers add column vps_allow_legacy integer default 0")
+            c.execute("update routers set vps_allow_legacy=1 where id='Movietonn'")
+            c.commit()
+        cfg = json.loads(self.xray.read_text())
+        wss = next(x for x in cfg["inbounds"] if x["tag"] == "owrt-remote-wss")
+        tcp = next(x for x in cfg["inbounds"] if x["tag"] == "owrt-remote-vless")
+        for row in wss["settings"]["clients"]:
+            if row["email"].startswith("Movietonn"):
+                tcp["settings"]["clients"].append(row.copy())
+        gate.xray_parity(gate.db_inventory(self.state / "hub.db"), cfg)
+
     def test_symlink_cannot_escape_state_archive(self):
         (self.state / "secret-link").symlink_to(self.xray)
         with self.assertRaises(gate.GateError):
