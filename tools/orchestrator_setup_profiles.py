@@ -138,6 +138,12 @@ def validate(plan: dict) -> dict:
 
 def new_plan(domain: str, *, https_port: int = 443,
              reality_port: int = 24443,
+             wss_path: str = "/owrt-ws/",
+             enable_reality: bool = False,
+             reality_target: str = "www.example.org:443",
+             reality_sni: str = "www.example.org",
+             reality_fingerprint: str = "chrome",
+             default_profile: str = "wss_tls",
              hub_version: str = "26.10.21",
              router_version: str = "26.10.21") -> dict:
     name = host_only(domain)
@@ -150,16 +156,16 @@ def new_plan(domain: str, *, https_port: int = 443,
         "public_url": "https://" + name + suffix,
         "hub": {"listen": "127.0.0.1", "port": 8088},
         "wss": {"enabled": True, "public_port": https_port,
-                "path": "/owrt-ws/", "xray_listen": "127.0.0.1",
+                "path": wss_path, "xray_listen": "127.0.0.1",
                 "xray_local_port": 18444},
-        "reality": {"enabled": False, "listen": "0.0.0.0",
-                    "port": reality_port, "target": "www.example.org:443",
-                    "server_names": ["www.example.org"],
-                    "server_name": "www.example.org",
-                    "fingerprint": "chrome"},
+        "reality": {"enabled": enable_reality, "listen": "0.0.0.0",
+                    "port": reality_port, "target": reality_target,
+                    "server_names": [reality_sni],
+                    "server_name": reality_sni,
+                    "fingerprint": reality_fingerprint},
         "xray": {"hub_version": hub_version, "router_version": router_version,
                  "auto_update": False},
-        "default_profile": "wss_tls",
+        "default_profile": default_profile,
         "status": "PREVIEW_ONLY",
     }
     return validate(plan)
@@ -297,6 +303,15 @@ def main() -> int:
     init.add_argument("--output", type=Path, required=True)
     init.add_argument("--https-port", type=int, default=443)
     init.add_argument("--reality-port", type=int, default=24443)
+    init.add_argument("--wss-path", default="/owrt-ws/")
+    init.add_argument("--enable-reality", action="store_true",
+                      help="plan experimental REALITY (no activation)")
+    init.add_argument("--reality-target", default="www.example.org:443")
+    init.add_argument("--reality-sni", default="www.example.org")
+    init.add_argument("--reality-fingerprint", default="chrome",
+                      choices=("chrome", "firefox", "safari"))
+    init.add_argument("--default-profile", default="wss_tls",
+                      choices=("wss_tls", "reality_raw"))
     init.add_argument("--hub-xray-version", default="26.10.21")
     init.add_argument("--router-xray-version", default="26.10.21")
     check_command = sub.add_parser("validate", help="read-only validation")
@@ -312,6 +327,12 @@ def main() -> int:
                 domain = input("Domain for HTTPS HUB & WSS (e.g. hub.example.com): ").strip()
             plan = new_plan(domain, https_port=args.https_port,
                             reality_port=args.reality_port,
+                            wss_path=args.wss_path,
+                            enable_reality=args.enable_reality,
+                            reality_target=args.reality_target,
+                            reality_sni=args.reality_sni,
+                            reality_fingerprint=args.reality_fingerprint,
+                            default_profile=args.default_profile,
                             hub_version=args.hub_xray_version,
                             router_version=args.router_xray_version)
             safe_write(args.output, json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
