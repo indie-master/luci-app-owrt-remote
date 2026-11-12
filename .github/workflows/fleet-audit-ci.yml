@@ -5,6 +5,9 @@ on:
     branches: [feature/indie-branding]
     paths:
       - "vps/owrt-remote-hub.py"
+      - "tests/test_orchestrator_setup_profiles.py"
+      - "tools/orchestrator_setup_profiles.py"
+
       - "tests/test_wss_transport.py"
       - "tools/belt_new_wss_enroll.py"
       - "tools/belt_hub_host_export_hotfix.py"
@@ -37,6 +40,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Offline first-run setup and dual-sided WSS/REALITY profile regression
+        run: |
+          python3 -m py_compile tools/orchestrator_setup_profiles.py
+          python3 -m unittest discover -s tests -p 'test_orchestrator_setup_profiles.py' -v
       - name: Test OpenWrt WSS export hostname normalization
         run: |
           python3 -m py_compile vps/owrt-remote-hub.py
