@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Router Orchestrator — мастер конфигурации (демо)</title>
+  <style>
+    :root { color-scheme: dark; font: 15px/1.5 system-ui, -apple-system, sans-serif;
+            --bg: #10161e; --panel: #17212c; --edge: #324253;
+            --fg: #eaf2f7; --muted: #a0b1c2; --accent: #58beeb; --danger: #ffa49a; }
+    * { box-sizing: border-box }
+    body { background: var(--bg); color: var(--fg); margin: 0; padding: 0 22px 50px; }
+    main { max-width: 940px; margin: 34px auto; }
+    h1 { font-size: 28px; margin: 0 0 5px; }
+    h2 { font-size: 19px; margin: 0 0 12px; }
+    small,.hint { color: var(--muted); }
+    header { margin-bottom: 24px; }
+    .pill { display: inline-block; color: #7ad6ff; border: 1px solid #326a89;
+            padding: 3px 10px; border-radius: 99px; font-size: 12px; margin: 0 0 10px; }
+    .card { border: 1px solid var(--edge); background: var(--panel);
+            border-radius: 12px; padding: 22px; margin: 14px 0; }
+    .grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
+    label { display: block; font-weight: 600; margin: 6px 0; }
+    input, select { color: var(--fg); background: #0f1821; border: 1px solid #405266;
+                    border-radius: 7px; font: inherit; width: 100%; padding: 10px; }
+    input[type=checkbox] { width: auto; margin: 0 9px 0 0; }
+    .check { display: flex; align-items: center; }
+    .info { font-size: 13px; color: var(--muted); margin: 5px 0 0; }
+    .warning { color: #ffca9a; }
+    .error { color: var(--danger); white-space: pre-wrap; }
+    button { background: #20658d; border: 1px solid #3893c3; color: white; cursor: pointer;
+             font: inherit; padding: 10px 14px; border-radius: 8px; margin-right: 8px; }
+    button.secondary { background: #233444; border-color: #53687e; }
+    button:disabled { cursor: not-allowed; opacity: 0.4; }
+    pre { background: #0e141b; color: #c2e3fa; padding: 16px; overflow: auto;
+          border-radius: 9px; font-size: 12px; max-height: 330px; border: 1px solid var(--edge); }
+    [hidden] { display: none !important }
+    @media (max-width:660px) { .grid { grid-template-columns:1fr; } h1 {font-size:22px} }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="pill">DEVELOPMENT PREVIEW — НЕ ПРИМЕНЯЕТ НАСТРОЙКИ</span>
+    <h1>Router Orchestrator</h1>
+    <p class="hint">Мастер планирования установки. Подбирает Nginx/TLS, адреса и альтернативные транспорты.
+      Ничего не меняет на сервере, не устанавливает Docker и не получает ваши ключи.</p>
+  </header>
+
+  <form id="wizard">
+    <section class="card">
+      <h2>1. Домен и публикация веб-панели</h2>
+      <div class="grid">
+        <div>
+          <label for="domain">Домен HUB</label>
+          <input id="domain" value="hub.example.org" required>
+          <p class="info">Только домен без https:// — URL будет создан автоматически.</p>
+        </div>
+        <div>
+          <label for="mode">Где размещён Nginx?</label>
+          <select id="mode">
+            <option value="external_nginx">Уже установлен (хост / другой контейнер)</option>
+            <option value="bundled_nginx">Установить в Docker с Orchestrator</option>
+          </select>
+        </div>
+        <div>
+          <label for="tls">Как получать TLS-сертификат?</label>
+          <select id="tls"></select>
+        </div>
+        <div>
+          <label for="httpsPort">HTTPS-порт</label>
+          <input id="httpsPort" type="number" value="443" min="1" max="65535" required>
+        </div>
+        <div id="emailBox" hidden>
+          <label for="email">Email для ACME</label>
+          <input id="email" type="email" placeholder="admin@example.org">
+        </div>
+        <div id="providerBox" hidden>
+          <label for="provider">DNS-01 провайдер</label>
+          <input id="provider" placeholder="cloudflare">
+        </div>
+        <div id="certBox" hidden>
+          <label for="cert">Путь к сертификату или каталогу certbot</label>
+          <input id="cert" placeholder="/etc/letsencrypt">
+        </div>
+        <div id="keyBox" hidden>
+          <label for="key">Путь к приватному ключу (только для PEM)</label>
+          <input id="key" placeholder="/etc/ssl/private/site.key">
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. Основной WSS и резервный домен</h2>
+      <div class="grid">
+        <div>
+          <label for="wsPath">Путь WebSocket</label>
+          <input id="wsPath" value="/owrt-ws/">
+          <p class="info">В конфигурациях сервера и клиента будет одинаковым.</p>
+        </div>
+        <div>
+          <label for="backupDomain">Резервный домен (необязательно)</label>
+          <input id="backupDomain" placeholder="backup.example.org">
+          <p class="info">Для отдельного WSS профиля и сертификата, покрывающего этот домен.</p>
+        </div>
+        <div>
+          <label for="hubPort">Порт публикации HUB в 127.0.0.1</label>
+          <input id="hubPort" type="number" value="18088">
+        </div>
+        <div>
+          <label for="wssPort">Порт публикации WSS в 127.0.0.1</label>
+          <input id="wssPort" type="number" value="28444">
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. Альтернативный REALITY и версия Xray</h2>
+      <label class="check"><input type="checkbox" id="reality"> Добавить экспериментальный REALITY/RAW профиль</label>
+      <p class="info warning">Это только предварительный профиль. REALITY нельзя совместить с WebSocket.
+        Он заработает после отдельной настройки серверного listener, ключей и проверки двух reverse-каналов.</p>
+      <div class="grid" id="realityFields" hidden>
+        <div><label for="realityPort">Порт REALITY</label><input type="number" id="realityPort" value="24443"></div>
+        <div><label for="sni">SNI маскировки</label><input id="sni" value="www.example.org"></div>
+        <div><label for="target">Целевой сервер:порт</label><input id="target" value="www.example.org:443"></div>
+        <div><label for="fingerprint">TLS fingerprint</label>
+          <select id="fingerprint"><option>chrome</option><option>firefox</option><option>safari</option></select></div>
+      </div>
+      <div class="grid">
+        <div><label for="hubXray">Xray на HUB (планируемая версия)</label>
+          <input id="hubXray" value="26.10.21"></div>
+        <div><label for="routerXray">Xray на роутере (планируемая версия)</label>
+          <input id="routerXray" value="26.10.21"></div>
+      </div>
+      <p class="info">В этом мастере не вводятся UUID, токены HUB, REALITY privateKey и Short ID.</p>
+    </section>
+    <section class="card">
+      <h2>4. Предварительная конфигурация</h2>
+      <button type="submit">Сгенерировать планы</button>
+      <button type="button" id="downloadEdge" class="secondary" disabled>Сохранить Nginx/TLS JSON</button>
+      <button type="button" id="downloadProfiles" class="secondary" disabled>Сохранить профили JSON</button>
+      <p id="message" class="hint" role="status">Пока ничего не сгенерировано.</p>
+      <div id="results" hidden>
+        <p><strong>Docker / Nginx</strong></p><pre id="edgePreview"></pre>
+        <p><strong>Профили WSS / REALITY</strong></p><pre id="profilePreview"></pre>
+        <p class="warning">Эти файлы предназначены для разработки и проверки. Они не являются готовыми
+           Docker Compose, сертификатами или разрешением менять рабочий Xray.</p>
+      </div>
+    </section>
+  </form>
+</main>
+<script>
+(function () {
+  "use strict";
+  const id = (name) => document.getElementById(name);
+  let generated = null;
+  const validHost = (name) => /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(name)
+    && !name.includes("..") && name.indexOf(".") > 0;
+  const validPort = (value) => Number.isInteger(value) && value > 0 && value <= 65535;
+  const tlsChoices = {
+    external_nginx: [
+      ["external_tls", "Использовать TLS существующего Nginx"]
+    ],
+    bundled_nginx: [
+      ["acme_http01", "Автовыпуск Let's Encrypt HTTP-01 (порты 80/443)"],
+      ["acme_dns01", "Автовыпуск через DNS-01 (требуется DNS-плагин)"],
+      ["existing_pem", "Мои PEM-файлы: сертификат + ключ"],
+      ["existing_letsencrypt", "Уже существующий каталог Let's Encrypt"]
+    ]
+  };
+  function refresh() {
+    const mode = id("mode").value;
+    const select = id("tls");
+    const previous = select.value;
+    select.replaceChildren();
+    tlsChoices[mode].forEach(function (pair) {
+      const opt = document.createElement("option");
+      opt.value = pair[0];
+      opt.textContent = pair[1];
+      select.appendChild(opt);
+    });
+    if (tlsChoices[mode].some(x => x[0] === previous)) select.value = previous;
+    const tls = select.value;
+    id("emailBox").hidden = !tls.startsWith("acme_");
+    id("providerBox").hidden = tls !== "acme_dns01";
+    id("certBox").hidden = !(tls === "existing_pem" || tls === "existing_letsencrypt");
+    id("keyBox").hidden = tls !== "existing_pem";
+    id("realityFields").hidden = !id("reality").checked;
+  }
+  function adaptTls() {
+    const tls = id("tls").value;
+    id("emailBox").hidden = !tls.startsWith("acme_");
+    id("providerBox").hidden = tls !== "acme_dns01";
+    id("certBox").hidden = !(tls === "existing_pem" || tls === "existing_letsencrypt");
+    id("keyBox").hidden = tls !== "existing_pem";
+  }
+  id("mode").addEventListener("change", refresh);
+  id("tls").addEventListener("change", adaptTls);
+  id("reality").addEventListener("change", function () {
+    id("realityFields").hidden = !id("reality").checked;
+  });
+  refresh();
+  function compile() {
+    const domain = id("domain").value.trim().toLowerCase();
+    const backup = id("backupDomain").value.trim().toLowerCase();
+    const tls = id("tls").value;
+    const mode = id("mode").value;
+    const https = Number(id("httpsPort").value);
+    const hub = Number(id("hubPort").value);
+    const wss = Number(id("wssPort").value);
+    const realityPort = Number(id("realityPort").value);
+    const path = id("wsPath").value.trim();
+    const version = /^[0-9]+\.[0-9]+\.[0-9]+$/;
+    const safePath = /^\/[a-z0-9/_-]*\/$/i;
+    if (!validHost(domain)) throw Error("Укажи домен без https:// и пути.");
+    if (backup && !validHost(backup)) throw Error("Резервный домен некорректен.");
+    if (!safePath.test(path)) throw Error("Путь WebSocket должен выглядеть как /owrt-ws/.");
+    if (![https, hub, wss, realityPort].every(validPort)) throw Error("Недопустимый порт.");
+    if (new Set([80, https, hub, wss, realityPort, 18443]).size !== 6) {
+      throw Error("Конфликт HTTP, HTTPS, HUB, WSS, REALITY или legacy TCP портов.");
+    }
+    if (!version.test(id("hubXray").value.trim()) ||
+        !version.test(id("routerXray").value.trim())) {
+      throw Error("Версии Xray должны иметь формат 26.10.21.");
+    }
+    const cert = id("cert").value.trim();
+    const key = id("key").value.trim();
+    const email = id("email").value.trim();
+    const provider = id("provider").value.trim();
+    if (tls.startsWith("acme_") && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw Error("Нужен адрес электронной почты для ACME.");
+    }
+    if (tls === "acme_dns01" && !/^[a-z0-9_-]{2,32}$/i.test(provider)) {
+      throw Error("Выбери DNS-провайдера (например, cloudflare).");
+    }
+    if (tls === "existing_pem" && (!cert.startsWith("/") || !key.startsWith("/") || cert === key)) {
+      throw Error("Укажи два разных абсолютных пути к PEM-файлам.");
+    }
+    if (tls === "existing_letsencrypt" && !cert.startsWith("/")) {
+      throw Error("Укажи каталог Let's Encrypt, например /etc/letsencrypt.");
+    }
+    const useReality = id("reality").checked;
+    const sni = id("sni").value.trim().toLowerCase();
+    const target = id("target").value.trim().toLowerCase();
+    if (useReality && (!validHost(sni) || !/^[a-z0-9.-]+:[0-9]{1,5}$/.test(target))) {
+      throw Error("REALITY SNI или адрес маскировки некорректен.");
+    }
+    const url = "https://" + domain + (https === 443 ? "" : ":" + https);
+    const edge = {
+      schema: "edge-plan/1", domain: domain, public_url: url,
+      nginx_mode: mode, tls_mode: tls, public_https_port: https,
+      public_http_port: 80, hub_host_port: hub, wss_host_port: wss,
+      hub_container_port: 8088, wss_container_port: 18444,
+      wss_path: path, cert_path: tls === "existing_pem" ||
+      tls === "existing_letsencrypt" ? cert : "",
+      key_path: tls === "existing_pem" ? key : "",
+      acme_email: tls.startsWith("acme_") ? email : "",
+      dns_provider: tls === "acme_dns01" ? provider : "",
+      automatic_nginx_overwrite: false,
+      automatic_xray_restart: false,
+      deployment_status: "REVIEW_ONLY"
+    };
+    const profiles = [{
+      id: "wss-primary", type: "wss_tls", enabled: true,
+      endpoint_host: domain, public_port: https, sni: domain,
+      ws_path: path, server_local_port: 18444
+    }];
+    if (backup) profiles.push({
+      id: "wss-backup", type: "wss_tls", enabled: true,
+      endpoint_host: backup, public_port: https, sni: backup,
+      ws_path: path, server_local_port: 18444
+    });
+    if (useReality) profiles.push({
+      id: "reality-pilot", type: "reality_raw", enabled: false,
+      endpoint_host: domain, public_port: realityPort,
+      reality_sni: sni, reality_target: target,
+      fingerprint: id("fingerprint").value,
+      secret_ref: "secrets/reality-pilot"
+    });
+    return {
+      edge: edge,
+      catalog: {
+        schema: "transport-catalog/1", profiles: profiles, routers: {},
+        automatic_restart: false, deployable: false, status: "REVIEW_ONLY"
+      }
+    };
+  }
+  id("wizard").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    id("results").hidden = true;
+    generated = null;
+    id("downloadEdge").disabled = true;
+    id("downloadProfiles").disabled = true;
+    try {
+      generated = compile();
+      id("edgePreview").textContent = JSON.stringify(generated.edge, null, 2);
+      id("profilePreview").textContent = JSON.stringify(generated.catalog, null, 2);
+      id("results").hidden = false;
+      id("downloadEdge").disabled = false;
+      id("downloadProfiles").disabled = false;
+      id("message").textContent = "Планы сгенерированы локально, ничего на сервере не изменено.";
+      id("message").className = "hint";
+    } catch (e) {
+      id("message").textContent = String(e.message || e);
+      id("message").className = "error";
+    }
+  });
+  function download(name, data) {
+    if (!generated) return;
+    const blob = new Blob([JSON.stringify(data, null, 2) + "\n"], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+  id("downloadEdge").addEventListener("click", function () {
+    download("orchestrator-edge.review.json", generated.edge);
+  });
+  id("downloadProfiles").addEventListener("click", function () {
+    download("orchestrator-profiles.review.json", generated.catalog);
+  });
+}());
+</script>
+</body>
+</html>
