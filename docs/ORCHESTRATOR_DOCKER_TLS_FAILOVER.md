@@ -48,10 +48,16 @@ the original HUB database.
   mounted as Docker secrets. It is never safe to put API credentials
   in compose.yml, environment logs or an exported client plan.
 - Existing PEM files may be mounted read-only. For an existing
-  certbot tree, mount the whole /etc/letsencrypt directory (including
-  live/ and archive/), not separate symlink leaf files, to preserve
-  renewal semantics. Certificate renewal remains owned by the
-  selected issuer and needs a reliable Nginx reload trigger.
+  certbot tree, mount ONLY the chosen certificate lineage's
+  live/CERTNAME and archive/CERTNAME directories at identical paths
+  inside the container. This preserves Certbot's ../../archive relative
+  symlinks across renewal without exposing keys for unrelated domains.
+  The certificate name may differ from the HUB hostname, for example
+  a wildcard cert for *.cdnvc.xyz can live under cdnvc.xyz.
+  The operator must verify the certificate SAN covers the chosen host.
+  Renewal remains owned by the selected issuer and requires a reliable
+  Nginx reload trigger. Do not bind-mount individual rotating PEM
+  symlinks, which can become stale.
 - The HUB must never have the host Docker socket mounted.
 
 ### Container networking and lifecycle
