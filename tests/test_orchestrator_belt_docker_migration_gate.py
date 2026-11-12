@@ -188,6 +188,17 @@ class MigrationGateTests(unittest.TestCase):
         with self.assertRaises(gate.GateError):
             gate.record_state_files(self.state)
 
+    def test_unused_optional_web_push_files_do_not_block_rehearsal(self):
+        for optional in gate.OPTIONAL_STATE:
+            candidate = self.state / optional
+            if candidate.exists():
+                candidate.unlink()
+        folder, manifest = gate.snapshot(self.state, self.xray,
+                                         self.hub_code, self.root)
+        self.assertTrue(all(manifest["required_files_present"].values()))
+        self.assertFalse(any(manifest["optional_files_present"].values()))
+        gate.inspect_archive(folder)
+
     def test_missing_auth_or_hold_prevents_snapshot(self):
         (self.state / "agent.token").unlink()
         with self.assertRaisesRegex(gate.GateError, "required"):
