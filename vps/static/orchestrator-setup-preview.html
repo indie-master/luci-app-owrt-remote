@@ -88,6 +88,11 @@
           <label for="key">Путь к приватному ключу (только для PEM)</label>
           <input id="key" placeholder="/etc/ssl/private/site.key">
         </div>
+        <div id="certNameBox" hidden>
+          <label for="certName">Имя сертификата Certbot</label>
+          <input id="certName" placeholder="cdnvc.xyz (включая wildcard)">
+          <p class="info">Монтируются только live/имя и archive/имя, не все сертификаты VPS.</p>
+        </div>
       </div>
     </section>
 
@@ -186,6 +191,7 @@
     id("providerBox").hidden = tls !== "acme_dns01";
     id("certBox").hidden = !(tls === "existing_pem" || tls === "existing_letsencrypt");
     id("keyBox").hidden = tls !== "existing_pem";
+    id("certNameBox").hidden = tls !== "existing_letsencrypt";
     id("realityFields").hidden = !id("reality").checked;
   }
   function adaptTls() {
@@ -194,6 +200,7 @@
     id("providerBox").hidden = tls !== "acme_dns01";
     id("certBox").hidden = !(tls === "existing_pem" || tls === "existing_letsencrypt");
     id("keyBox").hidden = tls !== "existing_pem";
+    id("certNameBox").hidden = tls !== "existing_letsencrypt";
   }
   id("mode").addEventListener("change", refresh);
   id("tls").addEventListener("change", adaptTls);
@@ -226,6 +233,7 @@
     }
     const cert = id("cert").value.trim();
     const key = id("key").value.trim();
+    const certName = id("certName").value.trim() || domain;
     const email = id("email").value.trim();
     const provider = id("provider").value.trim();
     if (tls.startsWith("acme_") && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -255,6 +263,7 @@
       wss_path: path, cert_path: tls === "existing_pem" ||
       tls === "existing_letsencrypt" ? cert : "",
       key_path: tls === "existing_pem" ? key : "",
+      cert_name: tls === "existing_letsencrypt" ? certName : "",
       acme_email: tls.startsWith("acme_") ? email : "",
       dns_provider: tls === "acme_dns01" ? provider : "",
       automatic_nginx_overwrite: false,
