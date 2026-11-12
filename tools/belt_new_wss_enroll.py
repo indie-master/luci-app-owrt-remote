@@ -87,6 +87,8 @@ def target_removed(candidate, router_id, row):
         selected = [c for c in pool if c.get("email") in names]
         if inbound is wss:
             require(len(selected) == 2, "candidate WSS registration is incomplete")
+            require({client["email"] for client in selected} == set(names),
+                    "candidate WSS identities are duplicated/incomplete")
             for client in selected:
                 require(client.get("id") == names[client["email"]],
                         "WSS UUID does not match HUB DB")
@@ -156,13 +158,23 @@ def copy_db_live(src, dst):
 
 
 def service_up():
-    result = subprocess.run(
-        ["systemctl", "is-active", "--quiet", XRAY_SERVICE],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
-    require(result.returncode == 0, "dedicated Xray service not active")
-    for port in (18443, 18444):
-        with socket.create_connection(("127.0.0.1", port), timeout=2):
-            pass
+    import time
+    # A restarted service can be active before Xray binds both listeners.
+    # Give it a bounded grace period before triggering an automatic rollback.
+    for _ in range(15):
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", XRAY_SERVICE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+        if result.returncode == 0:
+            try:
+                for port in (18443, 18444):
+                    with socket.create_connection(("127.0.0.1", port), timeout=1):
+                        pass
+                return
+            except OSError:
+                pass
+        time.sleep(1)
+    raise Blocked("dedicated Xray listeners not healthy")
 
 
 def make_hold(path):
@@ -206,6 +218,8 @@ def install_candidate(candidate, live, backup, target_hash):
         installed = True
         try:
             restart_xray()
+            require(digest(live) == digest(candidate),
+                    "installed Xray config changed unexpectedly after restart")
         except Exception:
             # Restore exact previous JSON and try to bring back old service.
             rollback = live.parent / (".new-wss-rollback-" + str(os.getpid()) + ".json")
