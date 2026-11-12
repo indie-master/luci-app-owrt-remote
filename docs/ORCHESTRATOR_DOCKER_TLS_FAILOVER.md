@@ -164,6 +164,32 @@ The REALITY profile starts disabled. Its SNI, target and key
 references must be replaced with explicitly chosen and verified
 values before even a test candidate can be prepared.
 
+### Generate a selected alternative (private review fragments)
+
+On an isolated development/test machine, create a 0600 router JSON
+containing the two router UUIDs. If the selected profile is REALITY,
+provide a 0600 JSON secret file with private_key, public_key and short_id.
+Neither file belongs in a repository, a ticket, or an installation link.
+
+~~~sh
+umask 077
+python3 tools/orchestrator_profile_catalog.py candidate \
+  /root/transport-draft.json \
+  --profile wss-primary \
+  --router-file /root/private-router-identities.json \
+  --server-out /root/candidate-server.review.json \
+  --client-out /root/candidate-router.review.json
+~~~
+
+For REALITY only, add
+`--secrets-file /root/private-reality-keypair.json`.
+The command rejects world-readable secret files, refuses existing
+output paths, and never prints UUIDs or key contents. The server fragment
+includes the private key only where required; the client fragment
+contains only the public key. Both outputs remain NONDEPLOYABLE
+fragments, not a complete live Xray JSON or an installation script.
+Do not copy either JSON directly to the production Xray config.
+
 ## Tests and next deploy gates
 
 - Python backend validation and port collisions
