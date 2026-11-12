@@ -14,6 +14,9 @@
 - [Аудит конфигурации HUB/SQLite и Xray после миграции четырёх WSS-роутеров](docs/WSS_FLEET_HUB_PARITY_GATE.md)
 - [Симуляция согласования HUB DB и генератора Xray без изменения Belt](docs/BELT_MULTI_WSS_DB_PARITY.md)
 - [Транзакционное согласование WSS в SQLite HUB: backup, hold, проверка и откат](docs/BELT_MULTI_WSS_DB_APPLY.md)
+- [Исправление экспорта OpenWrt: vps_host без https://](docs/HUB_OPENWRT_HOST_EXPORT.md)
+- [Belt: изолированный hotfix генератора конфигурации без замены всего HUB](docs/BELT_HUB_HOST_EXPORT_HOTFIX.md)
+- [Безопасная регистрация одного нового WSS-роутера в Xray](docs/NEW_ROUTER_WSS_ENROLLMENT.md)
 - [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
 - [Оригинальный проект](https://github.com/kzolotarev95/luci-app-owrt-remote) — автор kzolotarev95. Сохраняются оригинальные copyright и [MIT LICENSE](LICENSE).
 - Текущий рабочий форк: [indie-master/luci-app-owrt-remote](https://github.com/indie-master/luci-app-owrt-remote). Будущее имя репозитория **router-orchestrator** пока не активировано; URL обновлений не менять до проверки миграции.
