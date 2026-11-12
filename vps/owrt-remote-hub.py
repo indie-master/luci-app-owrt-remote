@@ -4611,7 +4611,18 @@ _XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"
 
 
 def assert_xray_mutation_allowed():
-    """Fail closed during a guarded Hub upgrade without touching Xray service."""
+    """Fail closed in Docker HUB-only mode and during guarded Xray maintenance.
+
+    The future container control adapter must be an explicit, authenticated
+    implementation; never attempt systemctl from an isolated HUB container.
+    Existing systemd installations keep the original behavior by default.
+    """
+    backend = str(os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND", "systemd")).strip().lower()
+    if backend != "systemd":
+        raise RuntimeError(
+            "Xray mutation disabled: HUB control backend is " + backend +
+            ". An authenticated Docker Xray lifecycle adapter is required."
+        )
     if _XRAY_MAINTENANCE_HOLD.exists():
         raise RuntimeError(
             "Xray restart/reload is locked during a guarded Hub upgrade; "
