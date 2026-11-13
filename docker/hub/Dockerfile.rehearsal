@@ -25,6 +25,8 @@ RUN apt-get update \
 
 WORKDIR /opt/owrt-remote
 COPY --chmod=0755 hub-source.py /opt/owrt-remote/owrt-remote-hub.py
+RUN test "${#SOURCE_SHA256}" -eq 64 \
+    && echo "${SOURCE_SHA256}  /opt/owrt-remote/owrt-remote-hub.py" | sha256sum --check --status
 COPY static/ /opt/owrt-remote/static/
 
 # Private state must come from a VERIFIED disposable rehearsal copy.
