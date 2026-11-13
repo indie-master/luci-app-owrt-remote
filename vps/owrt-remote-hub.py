@@ -20627,7 +20627,8 @@ def cmd_serve(args):
             print(f"{APP_NAME} also listening on https://{args.host}:{port}")
         print(f"{APP_NAME} listening on http://{args.host}:{args.port}")
         print(f"HUB_LOGIN: {auth.get('username', 'admin')}")
-        print(f"AGENT_TOKEN: {app.agent_token}")
+        # Do not disclose long-lived router credentials in systemd or Docker logs.
+        print("AGENT_TOKEN: [redacted; stored in the private HUB state directory]")
         server.serve_forever()
     except KeyboardInterrupt:
         print("")
