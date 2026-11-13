@@ -92,6 +92,10 @@ def run_rehearsal(stage: Path, image: str, *, attempts: int = 25) -> dict:
     cmd = [
         "run", "--detach", "--rm",
         "--name", name,
+        # Private shadow files are mode 0600 and owned by the operator.
+        # Docker root without CAP_DAC_OVERRIDE cannot read an unprivileged
+        # CI user's state. Use exactly the snapshot owner's numeric UID/GID.
+        "--user", str(os.geteuid()) + ":" + str(os.getegid()),
         "--log-driver", "none",  # legacy source prints AGENT_TOKEN
         "--network", "none",
         "--read-only",
