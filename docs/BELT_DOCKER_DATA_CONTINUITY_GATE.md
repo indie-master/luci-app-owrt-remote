@@ -112,6 +112,8 @@ Do not store archive material or real state in GitHub or Telegram.
 
 ## Stage 2 — isolated Docker HUB rehearsal
 
+**Реализация изолированного Docker shadow имеется в ветке разработки и проверена GitHub Actions на синтетической базе шести роутеров (5 WSS + 1 TCP).** Настоящий snapshot Belt пока НЕ запускали в контейнере; на продакшен ничего не переносили. См. [DOCKER_HUB_SHADOW_REHEARSAL.md](DOCKER_HUB_SHADOW_REHEARSAL.md). Контейнерная проверка не подтверждает LuCI/SSH или всё функциональное соответствие v119.
+
 - Build a pinned, dependency-complete Docker image from the **exact
   already deployed and approved HUB Python revision**, not the whole
   experimental branch. The source SHA256 must match installed Belt.
