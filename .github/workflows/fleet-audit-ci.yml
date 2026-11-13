@@ -137,6 +137,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 tools/orchestrator_docker_shadow_runner.py \
+          if ! python3 tools/orchestrator_docker_shadow_runner.py \
             --stage "$RO_STAGE" \
-            --image orchestrator-shadow:ci
+            --image orchestrator-shadow:ci; then
+            echo "CI SYNTHETIC DEBUG (tokens redacted):"
+            timeout 8s docker run --rm --network none --read-only \
+              --cap-drop ALL --security-opt no-new-privileges \
+              --mount "type=bind,src=$RO_STAGE/state,dst=/var/lib/owrt-remote" \
+              --tmpfs "/tmp:rw,nosuid,nodev,size=64m" \
+              orchestrator-shadow:ci 2>&1 \
+              | sed -E 's/AGENT_TOKEN:.*/AGENT_TOKEN: [redacted]/' \
+              | tail -n 70 || true
+            exit 1
+          fi
