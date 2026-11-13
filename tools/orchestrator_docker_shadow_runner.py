@@ -67,10 +67,12 @@ def router_credentials(state: Path) -> list[tuple]:
     conn = sqlite3.connect((state / "hub.db").resolve().as_uri() + "?mode=ro",
                            uri=True, timeout=10)
     try:
+        columns = {r[1] for r in conn.execute("pragma table_info(routers)")}
+        fallback = "vps_allow_legacy" if "vps_allow_legacy" in columns else "0"
         return conn.execute(
             "select id, vless_uuid, ssh_vless_uuid, entry_port, "
-            "ssh_entry_port, vps_transport, vless_port, "
-            "vps_allow_legacy from routers order by id").fetchall()
+            "ssh_entry_port, vps_transport, vless_port, " +
+            fallback + " as vps_allow_legacy from routers order by id").fetchall()
     finally:
         conn.close()
 
