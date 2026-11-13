@@ -81,6 +81,9 @@ class DockerShadowTests(unittest.TestCase):
                 self.assertIn("none", args)
                 self.assertIn("--log-driver", args)
                 self.assertIn("--read-only", args)
+                self.assertIn("--user", args)
+                import os
+                self.assertIn(str(os.geteuid()) + ":" + str(os.getegid()), args)
                 self.assertIn("--cap-drop", args)
                 self.assertIn("ALL", args)
                 self.assertNotIn("--publish", args)
