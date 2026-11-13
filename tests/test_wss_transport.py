@@ -65,6 +65,11 @@ class WssHubTests(unittest.TestCase):
         self.assertEqual(old2["vps_transport"], "tcp")
         self.assertEqual(old2["vless_port"], 18443)
 
+    def test_hub_startup_logs_cannot_disclose_agent_token(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn('print(f"AGENT_TOKEN: {app.agent_token}")', source)
+        self.assertIn('AGENT_TOKEN: [redacted;', source)
+
     def test_docker_hub_only_blocks_xray_restart_and_regeneration(self):
         # Docker HUB migration keeps existing reverse Xray on systemd.
         # No container-side fallback to systemctl is permitted.
