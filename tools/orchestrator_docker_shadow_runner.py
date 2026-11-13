@@ -163,9 +163,13 @@ def main() -> int:
         print("BELT: Xray/Nginx/systemd and live SQLite were never mounted or modified")
         print("NO CUTOVER: Docker container stopped; disposable state copy can be discarded")
         return 0
-    except (PilotError, shadow.Blocked, gate.GateError, OSError,
-            ValueError, TypeError, subprocess.TimeoutExpired, sqlite3.Error) as e:
-        print("DOCKER SHADOW: BLOCKED — " + type(e).__name__, file=sys.stderr)
+    except PilotError as exc:
+        # PilotError messages are fixed operator-facing text; no credential material.
+        print("DOCKER SHADOW: BLOCKED — " + str(exc), file=sys.stderr)
+        return 2
+    except (shadow.Blocked, gate.GateError, OSError,
+            ValueError, TypeError, subprocess.TimeoutExpired, sqlite3.Error) as exc:
+        print("DOCKER SHADOW: BLOCKED — " + type(exc).__name__, file=sys.stderr)
         return 2
 
 
