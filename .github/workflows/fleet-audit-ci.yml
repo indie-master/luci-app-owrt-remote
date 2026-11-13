@@ -14,6 +14,7 @@ on:
       - "tools/orchestrator_docker_shadow_runner.py"
       - "tests/test_orchestrator_docker_shadow_runner.py"
       - "docker/hub/Dockerfile.rehearsal"
+      - "tests/ci_orchestrator_shadow_fixture.py"
       - "tests/test_orchestrator_docker_rehearsal_restore.py"
       - "tests/test_orchestrator_belt_docker_migration_gate.py"
       - "tests/test_orchestrator_profile_catalog.py"
@@ -105,3 +106,43 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_belt_fleet_config_audit.py' -v
           sudo python3 -m unittest discover -s tests -p 'test_belt_wss_db_reconcile_stage.py' -v
           python3 -m unittest discover -s tests -p 'test_belt_wss_db_reconcile_apply.py' -v
+
+  docker-shadow:
+    name: Boot real HUB in networkless Docker against synthetic six-router state
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build synthetic state and isolated source-exact image context
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          echo "RO_SHADOW_DIR=$WORK" >> "$GITHUB_ENV"
+          python3 tests/ci_orchestrator_shadow_fixture.py --output-root "$WORK"
+      - name: Build rehearsal HUB image (never pushed or deployed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          eval "$(python3 - <<'PY'
+import json, os, shlex
+from pathlib import Path
+data=json.loads((Path(os.environ["RO_SHADOW_DIR"]) / "ci-paths.json").read_text())
+print("RO_CONTEXT="+shlex.quote(data["context"]))
+print("RO_SOURCE_SHA="+shlex.quote(data["source_sha256"]))
+print("RO_STAGE="+shlex.quote(data["stage"]))
+PY
+          )"
+          echo "RO_STAGE=$RO_STAGE" >> "$GITHUB_ENV"
+          docker build --pull \
+            --build-arg "SOURCE_SHA256=$RO_SOURCE_SHA" \
+            -f "$RO_CONTEXT/Dockerfile" \
+            -t orchestrator-shadow:ci \
+            "$RO_CONTEXT"
+      - name: Run HUB process with no network, no host ports and no live volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/orchestrator_docker_shadow_runner.py \
+            --stage "$RO_STAGE" \
+            --image orchestrator-shadow:ci
