@@ -1,0 +1,36 @@
+# Docker HUB rehearsal ONLY; never use as a production cutover image.
+# Build context must contain ONLY the exact approved hub-source.py and static/.
+# Final release must pin the Python image by digest and lock all dependencies.
+ARG PYTHON_BASE=python:3.12-slim-bookworm
+FROM ${PYTHON_BASE}
+
+ARG SOURCE_SHA256
+LABEL org.router-orchestrator.purpose="isolated-hub-rehearsal" \
+      org.router-orchestrator.hub-source-sha256="${SOURCE_SHA256}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    OWRT_REMOTE_STATE_DIR=/var/lib/owrt-remote \
+    OWRT_REMOTE_XRAY_CONTROL_BACKEND=external_readonly \
+    OWRT_REMOTE_BIND=127.0.0.1 \
+    OWRT_REMOTE_PORT=8088 \
+    OWRT_REMOTE_EXTRA_PORTS="" \
+    OWRT_REMOTE_TLS_PORTS=""
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         openssh-client ca-certificates curl iproute2 procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir "pywebpush==2.5.0" "fido2==2.2.1"
+
+WORKDIR /opt/owrt-remote
+COPY --chmod=0755 hub-source.py /opt/owrt-remote/owrt-remote-hub.py
+COPY static/ /opt/owrt-remote/static/
+
+# Private state must come from a VERIFIED disposable rehearsal copy.
+# Host /etc/xray, Nginx, TLS keys and Docker socket are not mounted.
+HEALTHCHECK --interval=15s --timeout=4s --retries=3 --start-period=15s \
+  CMD python3 -c "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8088/health', timeout=3)).get('ok') is True"
+
+ENTRYPOINT ["python3", "/opt/owrt-remote/owrt-remote-hub.py"]
+CMD ["serve", "--host", "127.0.0.1", "--port", "8088"]
