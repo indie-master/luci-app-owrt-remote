@@ -20,6 +20,7 @@
 - [Планирование собственной установки: домен, WSS/REALITY, версии Xray и откат](docs/ORCHESTRATOR_SETUP_XRAY_PROFILES.md)
 - [Два режима Nginx/Docker и безопасный выбор резервных профилей](docs/ORCHESTRATOR_DOCKER_TLS_FAILOVER.md)
 - [Belt → Docker: сохранность всех данных, история, аудит и двухэтапный перенос](docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md)
+- [Изолированный Docker HUB: восстановление полного снимка, проверка SHA и запуск без сети](docs/DOCKER_HUB_SHADOW_REHEARSAL.md)
 - [Контракт финального релиза: все функции, Docker, Xray и безопасная миграция Belt](docs/ROUTER_ORCHESTRATOR_RELEASE_ACCEPTANCE.md)
 - [Черновик первого веб-мастера настройки](vps/static/orchestrator-setup-preview.html)
 - [Процедура guarded HUB-only upgrade](docs/BELT_GUARDED_DEPLOY.md)
