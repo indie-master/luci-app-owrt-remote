@@ -124,15 +124,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          eval "$(python3 - <<'PY'
-import json, os, shlex
-from pathlib import Path
-data=json.loads((Path(os.environ["RO_SHADOW_DIR"]) / "ci-paths.json").read_text())
-print("RO_CONTEXT="+shlex.quote(data["context"]))
-print("RO_SOURCE_SHA="+shlex.quote(data["source_sha256"]))
-print("RO_STAGE="+shlex.quote(data["stage"]))
-PY
-          )"
+          RO_CONTEXT="$(python3 -c 'import os,json;from pathlib import Path;p=Path(os.environ["RO_SHADOW_DIR"])/"ci-paths.json";print(json.loads(p.read_text())["context"])')"
+          RO_SOURCE_SHA="$(python3 -c 'import os,json;from pathlib import Path;p=Path(os.environ["RO_SHADOW_DIR"])/"ci-paths.json";print(json.loads(p.read_text())["source_sha256"])')"
+          RO_STAGE="$(python3 -c 'import os,json;from pathlib import Path;p=Path(os.environ["RO_SHADOW_DIR"])/"ci-paths.json";print(json.loads(p.read_text())["stage"])')"
           echo "RO_STAGE=$RO_STAGE" >> "$GITHUB_ENV"
           docker build --pull \
             --build-arg "SOURCE_SHA256=$RO_SOURCE_SHA" \
