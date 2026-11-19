@@ -106,6 +106,8 @@ def git_sha():
 
 def build_image():
     require(APP.is_file() and not APP.is_symlink(), "HUB source missing")
+    require(not call("git", "status", "--porcelain").stdout.strip(),
+            "Git tree is dirty: build only a reviewed committed revision")
     commit = git_sha()
     image = "router-orchestrator-hub:" + commit[:12]
     source_hash = hashlib.sha256(APP.read_bytes()).hexdigest()
@@ -263,6 +265,131 @@ def restore(args):
     print("PASS: isolated restore:", dest)
     print("Never mount it over the live state without a separate cutover plan")
 
+RELEASE_STATE = Path("/opt/router-orchestrator/.releases.json")
+
+
+def write_release(data):
+    RELEASE_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = json.dumps(data, sort_keys=True, indent=2) + "\\n"
+    fd, name = tempfile.mkstemp(prefix=".releases-", dir=RELEASE_STATE.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, RELEASE_STATE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def read_release():
+    require(RELEASE_STATE.is_file() and not RELEASE_STATE.is_symlink(),
+            "No verified release history")
+    state = json.loads(RELEASE_STATE.read_text())
+    require(isinstance(state, dict) and "previous_image" in state,
+            "Invalid release history")
+    return state
+
+
+def write_image(image):
+    conf = settings()
+    require(image.startswith("router-orchestrator-hub:"), "Invalid image")
+    original = ENV.read_text()
+    old = "RO_IMAGE=" + conf["RO_IMAGE"] + "\\n"
+    require(original.count(old) == 1, "Image entry is ambiguous")
+    target = original.replace(old, "RO_IMAGE=" + image + "\\n")
+    fd, tempname = tempfile.mkstemp(prefix=".env-", dir=ENV.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            os.fchmod(out.fileno(), 0o600)
+            out.write(target)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tempname, ENV)
+    finally:
+        if os.path.exists(tempname):
+            os.unlink(tempname)
+
+
+def compose_up():
+    subprocess.run(["docker", "compose", "up", "-d", "--no-build", "hub"],
+                   cwd=ROOT, check=True)
+
+
+def compose_stop():
+    subprocess.run(["docker", "compose", "stop", "hub"], cwd=ROOT, check=True)
+
+
+def image_present(image):
+    return call("docker", "image", "inspect", image, check=False).returncode == 0
+
+
+def deploy(args):
+    require_root()
+    require(args.acknowledge_schema_risk,
+            "Schema compatibility is not proven: --acknowledge-schema-risk required")
+    require(not status_service(), "Host HUB is active: refuse concurrent Docker handover")
+    conf = settings()
+    require(docker_running(), "Existing Docker HUB must be running")
+    old = conf["RO_IMAGE"]
+    require(image_present(old), "Current image missing; cannot roll back")
+    new = build_image()
+    require(old != new, "Already running this image; no upgrade")
+    require(image_present(new), "Candidate image missing")
+    compose_stop()
+    archive = backup()
+    try:
+        write_image(new)
+        compose_up()
+        require(health(int(conf["RO_PORT"])), "New image failed /health")
+    except BaseException:
+        # Keep current written data; never rewind from an old snapshot.
+        compose_stop()
+        write_image(old)
+        compose_up()
+        require(health(int(conf["RO_PORT"])),
+                "Rollback health failed: operator recovery required")
+        raise
+    write_release({"previous_image": old, "current_image": new,
+                   "snapshot": str(archive), "commit": git_sha(),
+                   "timestamp": time.time()})
+    print("DEPLOY PASS:", new, "PREVIOUS:", old)
+    print("Retain previous image until router parity / soak are verified")
+
+
+def rollback(args):
+    require_root()
+    require(args.confirm, "Explicit --confirm required")
+    require(not status_service(), "Host HUB active: refuse mixed-writer rollback")
+    conf = settings()
+    prior = read_release()
+    current = conf["RO_IMAGE"]
+    old = prior["previous_image"]
+    require(prior["current_image"] == current and old != current,
+            "Release history does not match current deployment")
+    require(image_present(old) and image_present(current),
+            "Required rollback images missing")
+    compose_stop()
+    archive = backup()
+    try:
+        write_image(old)
+        compose_up()
+        require(health(int(conf["RO_PORT"])), "Previous image health failed")
+    except BaseException:
+        compose_stop()
+        write_image(current)
+        compose_up()
+        require(health(int(conf["RO_PORT"])),
+                "Both rollback and recovery failed; operator action required")
+        raise
+    write_release({"previous_image": current, "current_image": old,
+                   "snapshot": str(archive), "timestamp": time.time()})
+    print("ROLLBACK PASS:", old)
+    print("State NOT restored from snapshot: all current history retained")
+
+
 def status():
     print("Repository:", ROOT)
     if ENV.exists():
@@ -284,6 +411,10 @@ def main():
     subs.add_parser("status")
     subs.add_parser("build")
     subs.add_parser("backup")
+    upgrade_parser = subs.add_parser("upgrade")
+    upgrade_parser.add_argument("--acknowledge-schema-risk", action="store_true")
+    rollback_parser = subs.add_parser("rollback")
+    rollback_parser.add_argument("--confirm", action="store_true")
     restore_parser = subs.add_parser("restore")
     restore_parser.add_argument("archive")
     restore_parser.add_argument("--destination", required=True)
@@ -300,6 +431,10 @@ def main():
             backup()
         elif args.action == "restore":
             restore(args)
+        elif args.action == "upgrade":
+            deploy(args)
+        elif args.action == "rollback":
+            rollback(args)
         return 0
     except (Blocked, OSError, subprocess.CalledProcessError, ValueError,
             sqlite3.DatabaseError, tarfile.TarError) as exc:

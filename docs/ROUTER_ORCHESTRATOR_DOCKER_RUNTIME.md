@@ -66,8 +66,7 @@ docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md.
 - Metrics are not yet wired; disk may represent container filesystem.
 - Web Push, LuCI/SSH, external API and authenticated sessions must be retested
   with exactly matched source and live snapshot before any production cutover.
-- No production-grade update / rollback switcher yet; a version-tagged image
-  and offline backup are prerequisites, not a substitute for tested rollback.
+- A guarded CLI upgrade/rollback switcher exists for Docker-only installations.\n  It preserves current live state, snapshots after stop and reverts the image on\n  failed health. It has NOT been exercised against a real fleet or certified\n  for database schema rollback; the operator must explicitly acknowledge risk.
 - Dependencies have exact version pins but not per-wheel hashes/SBOM.
 - Production TLS/cert ownership, unattended renewals and separate Xray
   container migration are OUT OF SCOPE of this first HUB-only draft.
@@ -88,3 +87,21 @@ docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md.
 
 See docs/DOCKER_HUB_SHADOW_REHEARSAL.md and
 docs/ROUTER_ORCHESTRATOR_ARCHITECTURE.md for existing tests/architecture.
+
+## Docker-only upgrade / rollback (NOT a Belt handover)
+
+After reviewing and checking out a new immutable commit, run:
+
+~~~bash
+sudo python3 docker/manager.py upgrade --acknowledge-schema-risk
+sudo python3 docker/manager.py rollback --confirm
+~~~
+
+Upgrade builds a source-hashed image from a clean Git tree, stops only the
+Docker HUB, makes an offline state backup, switches the image reference and
+checks /health. A failed check switches back the old image **on the current
+state**, not the old snapshot. Rollback uses the retained previous image.
+Schema backward compatibility is NOT guaranteed; a container may exit after
+modifying the DB. Both operations are blocked while the old host HUB runs.
+An image health check is not router-level acceptance, and operators must
+retain the old image until an independent LuCI/SSH/heartbeat matrix passes.
