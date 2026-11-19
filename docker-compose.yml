@@ -1,0 +1,34 @@
+name: router-orchestrator
+services:
+  hub:
+    image: ${RO_IMAGE:?Set RO_IMAGE in .env}
+    container_name: router-orchestrator-hub
+    network_mode: host
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 512m
+    environment:
+      OWRT_REMOTE_STATE_DIR: /var/lib/owrt-remote
+      OWRT_REMOTE_BIND: "127.0.0.1"
+      OWRT_REMOTE_PORT: "${RO_PORT:?Set RO_PORT in .env}"
+      OWRT_REMOTE_PUBLIC_URL: "${RO_PUBLIC_URL:-}"
+      OWRT_REMOTE_XRAY_CONTROL_BACKEND: "${RO_XRAY_BACKEND:-external_readonly}"
+      OWRT_REMOTE_RUNTIME: docker
+      OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT: "0"
+    volumes:
+      - type: bind
+        source: ${RO_STATE_DIR:?Set RO_STATE_DIR in .env}
+        target: /var/lib/owrt-remote
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
+      - /run:rw,nosuid,nodev,size=8m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,os,urllib.request; p=os.environ['OWRT_REMOTE_PORT']; d=json.load(urllib.request.urlopen('http://127.0.0.1:'+p+'/health',timeout=3)); assert d.get('ok') is True"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
