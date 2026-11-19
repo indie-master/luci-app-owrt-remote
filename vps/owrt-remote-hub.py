@@ -70,7 +70,8 @@ except Exception:
     UserVerificationRequirement = None
 
 
-APP_NAME = "OpenWrt Remote Hub"
+APP_NAME = os.environ.get("OWRT_REMOTE_APP_NAME", "OpenWrt Remote Hub")
+DOCKER_RUNTIME = os.environ.get("OWRT_REMOTE_RUNTIME", "").strip().lower() == "docker"
 RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119").rstrip("/")
 APP_DIR = Path(__file__).resolve().parent
 
@@ -14799,7 +14800,8 @@ class VpsResourceMonitor:
             now = time.monotonic()
             if self.cached is None or now - self.last_sample >= self.interval:
                 self.cached = {"cpu": self.cpu_usage(), "memory": self.memory_usage(),
-                               "disk": self.disk_usage(), "sampled_at": time.time()}
+                               "disk": self.disk_usage(), "sampled_at": time.time(),
+                               "scope": "container-mixed" if DOCKER_RUNTIME else "host"}
                 self.last_sample = now
             return self.cached
 
@@ -15634,6 +15636,8 @@ def hub_update_health(url, revision, attempts=30):
 
 
 def run_hub_update_worker(job_id, directory=None, target=None):
+    if DOCKER_RUNTIME:
+        raise RuntimeError("Docker HUB is updated externally with a versioned image, never via systemd")
     directory = Path(directory or STATE_DIR / 'panel-update')
     target = Path(target or Path(__file__).resolve())
     with hub_update_lock(directory, blocking=True):
@@ -15703,6 +15707,14 @@ class HubUpdateManager:
         self.health_url = 'http://127.0.0.1:8088/health'
 
     def check(self, force=False):
+        if DOCKER_RUNTIME:
+            with self.lock:
+                self.checked_at = time.monotonic()
+                self.error = "Docker: обновление управляется с хоста через версионированный образ."
+                self.candidate = None
+                self.remote_revision = ""
+                self.remote_version = ""
+            return
         with self.lock:
             job = hub_update_state(self.directory)
             if self.checking or job.get('status') in HUB_UPDATE_ACTIVE:
@@ -15758,6 +15770,8 @@ class HubUpdateManager:
                     'job': job, 'csrf': self.csrf}
 
     def start(self, revision):
+        if DOCKER_RUNTIME:
+            raise RuntimeError("Docker HUB updates require a reviewed image and host-side update manager")
         with self.lock:
             with hub_update_lock(self.directory):
                 job = hub_update_state(self.directory)
@@ -17585,6 +17599,10 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
             self.send_response(403 if self.admin_ok() else 401)
             self.end_headers()
             return
+        if is_vps_terminal_id(router_id) and DOCKER_RUNTIME:
+            self.send_response(409)
+            self.end_headers()
+            return
         if not is_vps_terminal_id(router_id):
             with self.app.conn() as conn:
                 row = get_active_router(conn, router_id)
@@ -17627,6 +17645,9 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
             self.send_json(403, {"ok": False, "error": "not authorized", "tcp_ok": False})
             return
         if is_vps_terminal_id(router_id):
+            if DOCKER_RUNTIME:
+                self.send_json(409, {"ok": False, "router_id": router_id, "tcp_ok": False, "error": "Host VPS terminal adapter required"})
+                return
             self.send_json(200, {"ok": True, "router_id": router_id, "tcp_ok": True, "mode": "local-shell"})
             return
         with self.app.conn() as conn:
@@ -18481,6 +18502,8 @@ exit 127
         return {"mac": clean_mac, "iface": str(iface or ""), "output": output.strip() or "Wake packet sent"}
 
     def vps_shell_args(self):
+        if DOCKER_RUNTIME:
+            raise RuntimeError("VPS host shell is unavailable in Docker without an audited host terminal adapter")
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         shell = env.get("SHELL", "")
@@ -18812,6 +18835,9 @@ exit 127
         )
 
     def backup_restore(self):
+        if DOCKER_RUNTIME:
+            self.send_json(409, {"ok": False, "error": "Docker restore requires stopped HUB and offline verified restore"})
+            return
         try:
             payload = self.read_payload()
             archive_b64 = str(payload.get("archive_b64") or "")
@@ -18846,6 +18872,9 @@ exit 127
             self.send_json(400, {"ok": False, "error": str(exc)})
 
     def router_endpoints_rewrite(self):
+        if DOCKER_RUNTIME:
+            self.send_json(409, {"ok": False, "error": "Endpoint rewrite requires an approved host Xray adapter in Docker"})
+            return
         try:
             payload = self.read_payload()
             vps_host = str(payload.get("vps_host") or "").strip()
