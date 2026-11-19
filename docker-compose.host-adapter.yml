@@ -1,0 +1,12 @@
+# Optional, SUPERVISED integration. Do not use in current Belt staging.
+# The host service must create /run/router-orchestrator/control.sock first.
+services:
+  hub:
+    environment:
+      OWRT_REMOTE_XRAY_CONTROL_BACKEND: host_adapter
+      OWRT_REMOTE_HOST_ADAPTER_SOCKET: /run/router-orchestrator/control.sock
+    volumes:
+      - type: bind
+        source: /run/router-orchestrator
+        target: /run/router-orchestrator
+        read_only: true

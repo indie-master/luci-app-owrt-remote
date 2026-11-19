@@ -70,7 +70,8 @@ except Exception:
     UserVerificationRequirement = None
 
 
-APP_NAME = "OpenWrt Remote Hub"
+APP_NAME = os.environ.get("OWRT_REMOTE_APP_NAME", "OpenWrt Remote Hub")
+DOCKER_RUNTIME = os.environ.get("OWRT_REMOTE_RUNTIME", "").strip().lower() == "docker"
 RAW_REPO_BASE = os.environ.get("RAW_REPO_BASE", "https://raw.githubusercontent.com/indie-master/luci-app-owrt-remote/feature/wss-reverse-v119").rstrip("/")
 APP_DIR = Path(__file__).resolve().parent
 
@@ -4610,6 +4611,55 @@ _XRAY_RELOAD_LOCK = threading.RLock()
 _XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"
 
 
+def host_adapter_request(operation, payload=None):
+    """One bounded, fixed-protocol request to the host control service."""
+    if not DOCKER_RUNTIME:
+        raise RuntimeError("Host adapter is only available in Docker runtime")
+    path = os.environ.get("OWRT_REMOTE_HOST_ADAPTER_SOCKET", "/run/router-orchestrator/control.sock")
+    data = {"op": operation}
+    if payload is not None:
+        data.update(payload)
+    encoded = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(encoded) > 2 * 1024 * 1024:
+        raise RuntimeError("Host adapter request exceeds size limit")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(35)
+        channel.connect(path)
+        channel.sendall(encoded)
+        with channel.makefile("rb") as reader:
+            response = reader.readline(2 * 1024 * 1024 + 1)
+    if not response.endswith(b"\n") or len(response) > 2 * 1024 * 1024:
+        raise RuntimeError("Host adapter returned an incomplete response")
+    data = json.loads(response)
+    if not data.get("ok"):
+        raise RuntimeError("Host adapter: " + str(data.get("error") or "request rejected")[:180])
+    return data
+
+
+def reload_vps_xray_host_adapter(db_path):
+    """Generate a candidate in the HUB; validate/apply/rollback only on host."""
+    status = host_adapter_request("xray.current")
+    current = status["config"]
+    old_legacy = next((item for item in current.get("inbounds", [])
+                       if item.get("tag") == "owrt-remote-vless"), None)
+    if old_legacy is None:
+        raise RuntimeError("Host Xray legacy inbound missing; refusing apply")
+    with connect(db_path) as conn:
+        init_db(conn)
+        rows = list_router_rows(conn)
+    candidate = make_server_xray_config(rows,
+        listen_host=old_legacy.get("listen", "0.0.0.0"),
+        listen_port=int(old_legacy["port"]))
+    if current == candidate:
+        return {"config": "/etc/xray/owrt-remote.json", "service": "owrt-remote-xray",
+                "routers": len(rows), "unchanged": True}
+    applied = host_adapter_request("xray.apply", {"expected_sha256": status["sha256"],
+                                                 "config": candidate})
+    return {"config": "/etc/xray/owrt-remote.json", "service": applied["service"],
+            "routers": len(rows), "unchanged": applied.get("unchanged", False),
+            "backup": applied.get("backup", "")}
+
+
 def assert_xray_mutation_allowed():
     """Fail closed in Docker HUB-only mode and during guarded Xray maintenance.
 
@@ -4618,6 +4668,8 @@ def assert_xray_mutation_allowed():
     Existing systemd installations keep the original behavior by default.
     """
     backend = str(os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND", "systemd")).strip().lower()
+    if DOCKER_RUNTIME and backend == "systemd":
+        raise RuntimeError("Docker HUB cannot invoke host systemd directly")
     if backend != "systemd":
         raise RuntimeError(
             "Xray mutation disabled: HUB control backend is " + backend +
@@ -4633,6 +4685,8 @@ def assert_xray_mutation_allowed():
 
 def reload_vps_xray(db_path=DB_PATH):
     """Validate a private candidate, retain a backup and roll back failed restarts."""
+    if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
+        return reload_vps_xray_host_adapter(db_path)
     assert_xray_mutation_allowed()
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
@@ -4722,6 +4776,8 @@ def reload_vps_xray(db_path=DB_PATH):
 
 
 def restart_vps_xray():
+    if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
+        return host_adapter_request("xray.restart")
     assert_xray_mutation_allowed()
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
     result = subprocess.run(
@@ -14795,11 +14851,17 @@ class VpsResourceMonitor:
             return None
 
     def snapshot(self):
+        if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_HOST_ADAPTER_SOCKET"):
+            try:
+                return host_adapter_request("host.metrics")
+            except (OSError, ValueError, RuntimeError):
+                pass  # Explicit scope below identifies the container fallback.
         with self.lock:
             now = time.monotonic()
             if self.cached is None or now - self.last_sample >= self.interval:
                 self.cached = {"cpu": self.cpu_usage(), "memory": self.memory_usage(),
-                               "disk": self.disk_usage(), "sampled_at": time.time()}
+                               "disk": self.disk_usage(), "sampled_at": time.time(),
+                               "scope": "container-mixed" if DOCKER_RUNTIME else "host"}
                 self.last_sample = now
             return self.cached
 
@@ -15634,6 +15696,8 @@ def hub_update_health(url, revision, attempts=30):
 
 
 def run_hub_update_worker(job_id, directory=None, target=None):
+    if DOCKER_RUNTIME:
+        raise RuntimeError("Docker HUB is updated externally with a versioned image, never via systemd")
     directory = Path(directory or STATE_DIR / 'panel-update')
     target = Path(target or Path(__file__).resolve())
     with hub_update_lock(directory, blocking=True):
@@ -15703,6 +15767,14 @@ class HubUpdateManager:
         self.health_url = 'http://127.0.0.1:8088/health'
 
     def check(self, force=False):
+        if DOCKER_RUNTIME:
+            with self.lock:
+                self.checked_at = time.monotonic()
+                self.error = "Docker: обновление управляется с хоста через версионированный образ."
+                self.candidate = None
+                self.remote_revision = ""
+                self.remote_version = ""
+            return
         with self.lock:
             job = hub_update_state(self.directory)
             if self.checking or job.get('status') in HUB_UPDATE_ACTIVE:
@@ -15758,6 +15830,8 @@ class HubUpdateManager:
                     'job': job, 'csrf': self.csrf}
 
     def start(self, revision):
+        if DOCKER_RUNTIME:
+            raise RuntimeError("Docker HUB updates require a reviewed image and host-side update manager")
         with self.lock:
             with hub_update_lock(self.directory):
                 job = hub_update_state(self.directory)
@@ -17585,6 +17659,10 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
             self.send_response(403 if self.admin_ok() else 401)
             self.end_headers()
             return
+        if is_vps_terminal_id(router_id) and DOCKER_RUNTIME:
+            self.send_response(409)
+            self.end_headers()
+            return
         if not is_vps_terminal_id(router_id):
             with self.app.conn() as conn:
                 row = get_active_router(conn, router_id)
@@ -17627,6 +17705,9 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
             self.send_json(403, {"ok": False, "error": "not authorized", "tcp_ok": False})
             return
         if is_vps_terminal_id(router_id):
+            if DOCKER_RUNTIME:
+                self.send_json(409, {"ok": False, "router_id": router_id, "tcp_ok": False, "error": "Host VPS terminal adapter required"})
+                return
             self.send_json(200, {"ok": True, "router_id": router_id, "tcp_ok": True, "mode": "local-shell"})
             return
         with self.app.conn() as conn:
@@ -18481,6 +18562,8 @@ exit 127
         return {"mac": clean_mac, "iface": str(iface or ""), "output": output.strip() or "Wake packet sent"}
 
     def vps_shell_args(self):
+        if DOCKER_RUNTIME:
+            raise RuntimeError("VPS host shell is unavailable in Docker without an audited host terminal adapter")
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         shell = env.get("SHELL", "")
@@ -18812,6 +18895,9 @@ exit 127
         )
 
     def backup_restore(self):
+        if DOCKER_RUNTIME:
+            self.send_json(409, {"ok": False, "error": "Docker restore requires stopped HUB and offline verified restore"})
+            return
         try:
             payload = self.read_payload()
             archive_b64 = str(payload.get("archive_b64") or "")
@@ -18846,6 +18932,9 @@ exit 127
             self.send_json(400, {"ok": False, "error": str(exc)})
 
     def router_endpoints_rewrite(self):
+        if DOCKER_RUNTIME:
+            self.send_json(409, {"ok": False, "error": "Endpoint rewrite requires an approved host Xray adapter in Docker"})
+            return
         try:
             payload = self.read_payload()
             vps_host = str(payload.get("vps_host") or "").strip()
