@@ -66,7 +66,10 @@ docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md.
 - Metrics are not yet wired; disk may represent container filesystem.
 - Web Push, LuCI/SSH, external API and authenticated sessions must be retested
   with exactly matched source and live snapshot before any production cutover.
-- A guarded CLI upgrade/rollback switcher exists for Docker-only installations.\n  It preserves current live state, snapshots after stop and reverts the image on\n  failed health. It has NOT been exercised against a real fleet or certified\n  for database schema rollback; the operator must explicitly acknowledge risk.
+- A guarded CLI upgrade/rollback switcher exists for Docker-only installations.
+  It preserves current live state, snapshots after stop and reverts the image on
+  failed health. It has NOT been exercised against a real fleet or certified
+  for database schema rollback; the operator must explicitly acknowledge risk.
 - Dependencies have exact version pins but not per-wheel hashes/SBOM.
 - Production TLS/cert ownership, unattended renewals and separate Xray
   container migration are OUT OF SCOPE of this first HUB-only draft.

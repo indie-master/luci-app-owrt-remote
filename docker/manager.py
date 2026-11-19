@@ -270,7 +270,7 @@ RELEASE_STATE = Path("/opt/router-orchestrator/.releases.json")
 
 def write_release(data):
     RELEASE_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload = json.dumps(data, sort_keys=True, indent=2) + "\\n"
+    payload = json.dumps(data, sort_keys=True, indent=2) + "\n"
     fd, name = tempfile.mkstemp(prefix=".releases-", dir=RELEASE_STATE.parent)
     try:
         with os.fdopen(fd, "w") as stream:
@@ -297,9 +297,9 @@ def write_image(image):
     conf = settings()
     require(image.startswith("router-orchestrator-hub:"), "Invalid image")
     original = ENV.read_text()
-    old = "RO_IMAGE=" + conf["RO_IMAGE"] + "\\n"
+    old = "RO_IMAGE=" + conf["RO_IMAGE"] + "\n"
     require(original.count(old) == 1, "Image entry is ambiguous")
-    target = original.replace(old, "RO_IMAGE=" + image + "\\n")
+    target = original.replace(old, "RO_IMAGE=" + image + "\n")
     fd, tempname = tempfile.mkstemp(prefix=".env-", dir=ENV.parent)
     try:
         with os.fdopen(fd, "w") as out:
