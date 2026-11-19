@@ -17,7 +17,8 @@ services:
       OWRT_REMOTE_PORT: "${RO_PORT:?Set RO_PORT in .env}"
       OWRT_REMOTE_PUBLIC_URL: "${RO_PUBLIC_URL:-}"
       OWRT_REMOTE_XRAY_CONTROL_BACKEND: "${RO_XRAY_BACKEND:-external_readonly}"
-      OWRT_REMOTE_RUNTIME: docker\n      OWRT_REMOTE_APP_NAME: Router Orchestrator
+      OWRT_REMOTE_RUNTIME: docker
+      OWRT_REMOTE_APP_NAME: "Router Orchestrator"
       OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT: "0"
     volumes:
       - type: bind
