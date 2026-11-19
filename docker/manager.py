@@ -147,7 +147,7 @@ def install(args):
     require(answer.lower() == "yes", "Cancelled")
     image = build_image()
     state.mkdir(mode=0o700, parents=True, exist_ok=False)
-    os.chown(state, 65532, 65532)
+    os.chown(state, 23088, 23088)
     save_env({"RO_IMAGE": image, "RO_STATE_DIR": str(state), "RO_PORT": str(port),
               "RO_PUBLIC_URL": url, "RO_XRAY_BACKEND": "external_readonly"})
     try:
@@ -252,10 +252,10 @@ def restore(args):
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 target.write_bytes(chunk)
                 target.chmod(0o600)
-                os.chown(target, 65532, 65532)
+                os.chown(target, 23088, 23088)
             for directory in sorted((p for p in dest.rglob("*") if p.is_dir()), reverse=True):
-                os.chown(directory, 65532, 65532)
-            os.chown(dest, 65532, 65532)
+                os.chown(directory, 23088, 23088)
+            os.chown(dest, 23088, 23088)
             with sqlite3.connect(f"file:{dest / 'hub.db'}?mode=ro", uri=True) as db:
                 require(db.execute("PRAGMA integrity_check").fetchone()[0] == "ok",
                         "Restored SQLite corrupt")

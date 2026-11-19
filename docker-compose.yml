@@ -5,7 +5,7 @@ services:
     container_name: router-orchestrator-hub
     network_mode: host
     restart: unless-stopped
-    user: "65532:65532"
+    user: "23088:23088"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

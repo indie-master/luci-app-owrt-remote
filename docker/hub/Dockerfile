@@ -15,6 +15,6 @@ RUN test -n "$HUB_SOURCE_SHA256" && \
     printf '%s  %s\n' "$HUB_SOURCE_SHA256" /opt/owrt-remote/owrt-remote-hub.py | sha256sum -c -
 COPY vps/static/ /opt/owrt-remote/static/
 RUN mkdir -p /var/lib/owrt-remote && \
-    chown -R 65532:65532 /opt/owrt-remote /var/lib/owrt-remote
-USER 65532:65532
+    chown -R 23088:23088 /opt/owrt-remote /var/lib/owrt-remote
+USER 23088:23088
 CMD ["python", "/opt/owrt-remote/owrt-remote-hub.py", "serve"]

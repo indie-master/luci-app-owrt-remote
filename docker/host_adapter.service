@@ -1,0 +1,26 @@
+# Systemd host-side service. This unit is not installed/enabled automatically.
+[Unit]
+Description=Router Orchestrator host control adapter (opt-in)
+After=network-online.target owrt-remote-xray.service
+ConditionPathExists=/opt/router-orchestrator/release/docker/host_adapter.py
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=router-orchestrator
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/release/docker/host_adapter.py --peer-uid 23088
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/run/router-orchestrator
+# Xray config mutation requires a separate reviewed override with
+# --allow-xray-apply AND ReadWritePaths=/etc/xray.
+# Never grant CAP_SYS_ADMIN or unrestricted shell execution.
+
+[Install]
+WantedBy=multi-user.target
