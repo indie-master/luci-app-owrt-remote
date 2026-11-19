@@ -4611,6 +4611,55 @@ _XRAY_RELOAD_LOCK = threading.RLock()
 _XRAY_MAINTENANCE_HOLD = STATE_DIR / ".xray-maintenance-hold"
 
 
+def host_adapter_request(operation, payload=None):
+    """One bounded, fixed-protocol request to the host control service."""
+    if not DOCKER_RUNTIME:
+        raise RuntimeError("Host adapter is only available in Docker runtime")
+    path = os.environ.get("OWRT_REMOTE_HOST_ADAPTER_SOCKET", "/run/router-orchestrator/control.sock")
+    data = {"op": operation}
+    if payload is not None:
+        data.update(payload)
+    encoded = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(encoded) > 2 * 1024 * 1024:
+        raise RuntimeError("Host adapter request exceeds size limit")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(35)
+        channel.connect(path)
+        channel.sendall(encoded)
+        with channel.makefile("rb") as reader:
+            response = reader.readline(2 * 1024 * 1024 + 1)
+    if not response.endswith(b"\n") or len(response) > 2 * 1024 * 1024:
+        raise RuntimeError("Host adapter returned an incomplete response")
+    data = json.loads(response)
+    if not data.get("ok"):
+        raise RuntimeError("Host adapter: " + str(data.get("error") or "request rejected")[:180])
+    return data
+
+
+def reload_vps_xray_host_adapter(db_path):
+    """Generate a candidate in the HUB; validate/apply/rollback only on host."""
+    status = host_adapter_request("xray.current")
+    current = status["config"]
+    old_legacy = next((item for item in current.get("inbounds", [])
+                       if item.get("tag") == "owrt-remote-vless"), None)
+    if old_legacy is None:
+        raise RuntimeError("Host Xray legacy inbound missing; refusing apply")
+    with connect(db_path) as conn:
+        init_db(conn)
+        rows = list_router_rows(conn)
+    candidate = make_server_xray_config(rows,
+        listen_host=old_legacy.get("listen", "0.0.0.0"),
+        listen_port=int(old_legacy["port"]))
+    if current == candidate:
+        return {"config": "/etc/xray/owrt-remote.json", "service": "owrt-remote-xray",
+                "routers": len(rows), "unchanged": True}
+    applied = host_adapter_request("xray.apply", {"expected_sha256": status["sha256"],
+                                                 "config": candidate})
+    return {"config": "/etc/xray/owrt-remote.json", "service": applied["service"],
+            "routers": len(rows), "unchanged": applied.get("unchanged", False),
+            "backup": applied.get("backup", "")}
+
+
 def assert_xray_mutation_allowed():
     """Fail closed in Docker HUB-only mode and during guarded Xray maintenance.
 
@@ -4619,6 +4668,8 @@ def assert_xray_mutation_allowed():
     Existing systemd installations keep the original behavior by default.
     """
     backend = str(os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND", "systemd")).strip().lower()
+    if DOCKER_RUNTIME and backend == "systemd":
+        raise RuntimeError("Docker HUB cannot invoke host systemd directly")
     if backend != "systemd":
         raise RuntimeError(
             "Xray mutation disabled: HUB control backend is " + backend +
@@ -4634,6 +4685,8 @@ def assert_xray_mutation_allowed():
 
 def reload_vps_xray(db_path=DB_PATH):
     """Validate a private candidate, retain a backup and roll back failed restarts."""
+    if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
+        return reload_vps_xray_host_adapter(db_path)
     assert_xray_mutation_allowed()
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
@@ -4723,6 +4776,8 @@ def reload_vps_xray(db_path=DB_PATH):
 
 
 def restart_vps_xray():
+    if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
+        return host_adapter_request("xray.restart")
     assert_xray_mutation_allowed()
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
     result = subprocess.run(
@@ -14796,6 +14851,11 @@ class VpsResourceMonitor:
             return None
 
     def snapshot(self):
+        if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_HOST_ADAPTER_SOCKET"):
+            try:
+                return host_adapter_request("host.metrics")
+            except (OSError, ValueError, RuntimeError):
+                pass  # Explicit scope below identifies the container fallback.
         with self.lock:
             now = time.monotonic()
             if self.cached is None or now - self.last_sample >= self.interval:

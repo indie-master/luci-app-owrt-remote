@@ -56,5 +56,29 @@ class DockerRuntimeContracts(unittest.TestCase):
         self.assertIn("unsupported operation", adapter_src)
         self.assertIn("SO_PEERCRED", adapter_src)
 
+
+    def test_host_adapter_requires_explicit_mutation(self):
+        spec2 = importlib.util.spec_from_file_location("host_control", REPO / "docker" / "host_adapter.py")
+        host = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(host)
+        adapter = host.Adapter()
+        with self.assertRaises(host.Rejected):
+            adapter.handle({"op": "xray.restart"})
+        with self.assertRaises(host.Rejected):
+            adapter.handle({"op": "shell.exec", "command": "id"})
+
+    def test_host_adapter_rejects_xray_transport_changes(self):
+        spec2 = importlib.util.spec_from_file_location("host_control", REPO / "docker" / "host_adapter.py")
+        host = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(host)
+        old = {"inbounds": [
+          {"tag":"owrt-remote-vless", "protocol":"vless", "port":18443, "listen":"0.0.0.0", "streamSettings":{}},
+          {"tag":"owrt-remote-wss", "protocol":"vless", "port":18444, "listen":"127.0.0.1", "streamSettings":{}},
+        ], "routing":{"rules":[]}}
+        candidate = json.loads(json.dumps(old))
+        candidate["inbounds"][1]["port"] = 18445
+        with self.assertRaises(host.Rejected):
+            host.validate_transition(old, candidate)
+
 if __name__ == "__main__":
     unittest.main()

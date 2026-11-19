@@ -15,9 +15,7 @@ Do not run the fresh installer on Belt while owrt-remote.service is active.
 - A clean-state interactive installer; a noninteractive invocation exists for CI.
 - Read-only/offline state backup through SQLite's backup API and all state files;
   integrity-checked restore to a **new** directory, never implicit overwrite.
-- A separate host adapter prototype with peer-UID-gated socket and a read-only
-  Xray/status/metrics API. An opt-in Xray restart requires the maintenance hold
-  to be absent and is rate-limited. The adapter is NOT yet wired to the HUB.
+- An optional host adapter with a dedicated UID 23088 and a Unix socket.\n  Read-only host metrics and Xray status/current config are available; Xray\n  restart/apply are independently opt-in with maintenance-hold and cooldown.\n  Candidate apply validates the existing reverse portals, runs xray -test,\n  backs up the previous config and restarts with a rollback on failed health.\n  The HUB can connect through the optional Compose overlay, not by default.
 - External Docker lifecycle ownership: HUB source updater is intentionally
   blocked in Docker mode in the accompanying source code change.
 
@@ -58,8 +56,7 @@ docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md.
 ## Explicitly not complete
 
 - No live cutover coordinator or automatic change to host Nginx upstream.
-- No container-to-host Xray apply (regenerating JSON/restarting real routers
-  without parity checks is prohibited). Xray button is disabled by default.
+- Host Xray adapter apply is implemented behind an explicit opt-in but has\n  NOT passed a live router parity test, so it must remain disabled on Belt.
 - VPS terminal in Docker must NOT be mistaken for a host shell. The source
   now blocks that action to avoid opening an unaudited container shell.
 - Host adapter has no terminal transport and is not automatically enabled.
@@ -108,3 +105,13 @@ Schema backward compatibility is NOT guaranteed; a container may exit after
 modifying the DB. Both operations are blocked while the old host HUB runs.
 An image health check is not router-level acceptance, and operators must
 retain the old image until an independent LuCI/SSH/heartbeat matrix passes.
+
+## Host adapter (separate supervised pilot only)
+
+Do NOT install or enable this unit on Belt until a separate security review.
+The opt-in systemd example is docker/host_adapter.service and uses peer UID
+23088. To enable mutation deliberately, a reviewed systemd override must add
+--allow-xray-restart and/or --allow-xray-apply; Xray apply also requires
+ReadWritePaths=/etc/xray and the maintenance hold must be handled by the
+operator. Do not blindly remove .xray-maintenance-hold. The Docker overlay
+is docker-compose.host-adapter.yml. It only mounts a narrow /run Unix socket.
