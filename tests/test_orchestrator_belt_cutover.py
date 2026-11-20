@@ -143,6 +143,34 @@ class SingleWriterCutoverTests(unittest.TestCase):
                 self.assertEqual(saved.read_text(), "RO_IMAGE=example")
                 self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
 
+    def test_rollback_promotes_latest_history_not_old_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original = root / "var" / "owrt-remote"
+            original.parent.mkdir()
+            latest = root / "data"
+            backup = root / "backups"
+            backup.mkdir()
+            fixture_state(original)
+            fixture_state(latest)
+            with sqlite3.connect(latest / "hub.db") as db:
+                db.execute("INSERT INTO router_logs VALUES (2,'new-heartbeat')")
+            def analyze(location, xray):
+                return cutover.gate.db_inventory(location / "hub.db"), {}
+            with patch.object(cutover, "STATE", original), \
+                 patch.object(cutover, "DATA", latest), \
+                 patch.object(cutover, "BACKUPS", backup), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover.gate, "analyze", side_effect=analyze), \
+                 patch.object(cutover.os, "chown"):
+                cutover.promote_latest_state({"id": "synthetic"})
+            self.assertEqual(cutover.gate.db_inventory(original / "hub.db")
+                             ["tables"]["router_logs"], 2)
+            self.assertEqual(cutover.gate.db_inventory(
+                backup / "pre-docker-host-state-synthetic" / "hub.db")
+                ["tables"]["router_logs"], 1)
+            self.assertTrue(latest.exists())
+
     def test_preflight_does_not_call_writers(self):
         args = type("Args", (), {"expect_commit": "a" * 40,
                                  "public_url": "https://hub.example.org"})()
