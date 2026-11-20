@@ -222,6 +222,7 @@ class SingleWriterCutoverTests(unittest.TestCase):
                  patch.object(cutover, "ENV", root / ".env"), \
                  patch.object(cutover, "mark") as marker, \
                  patch.object(cutover, "stop_docker") as fence, \
+                 patch.object(cutover, "host_health", return_value=True), \
                  patch.object(cutover, "recover_host") as recovery:
                 cutover.recover(args)
                 recovery.assert_not_called()
@@ -278,6 +279,34 @@ class SingleWriterCutoverTests(unittest.TestCase):
         self.assertLess(
             events.index(("docker", "update", "--restart=no", cutover.DOCKER_NAME)),
             events.index(("docker", "stop", "-t", "30", cutover.DOCKER_NAME)))
+
+    def test_host_restart_requires_docker_fenced_and_env_sealed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env = root / ".env"
+            with patch.object(cutover, "ENV", env), \
+                 patch.object(cutover, "docker_running", return_value=True), \
+                 patch.object(cutover, "command_ok") as service:
+                with self.assertRaisesRegex(cutover.Blocked, "Docker writer"):
+                    cutover.restart_host({"was_enabled": True})
+                service.assert_not_called()
+            env.write_text("RO_PORT=8088")
+            with patch.object(cutover, "ENV", env), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover, "command_ok") as service:
+                with self.assertRaisesRegex(cutover.Blocked, "environment still armed"):
+                    cutover.restart_host({"was_enabled": False})
+                service.assert_not_called()
+
+    def test_host_http_readiness_failure_blocks_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / ".env"
+            with patch.object(cutover, "ENV", env), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover, "command_ok"), \
+                 patch.object(cutover, "host_health", return_value=False):
+                with self.assertRaisesRegex(cutover.Blocked, "HTTP readiness"):
+                    cutover.restart_host({"was_enabled": False})
 
     def test_unavailable_docker_daemon_blocks_recovery(self):
         with patch.object(cutover, "command") as cmd:
