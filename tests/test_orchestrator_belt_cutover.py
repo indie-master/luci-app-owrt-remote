@@ -122,9 +122,13 @@ class SingleWriterCutoverTests(unittest.TestCase):
         self.assertNotIn("systemctl restart", activate)
 
     def test_missing_container_does_not_block_auto_recovery(self):
-        with patch.object(cutover, "command") as cmd, \
+        def query(*args, **kwargs):
+            class Result:
+                returncode = 0 if args[:2] == ("docker", "info") else 1
+                stdout = ""
+            return Result()
+        with patch.object(cutover, "command", side_effect=query), \
              patch.object(cutover, "docker_running", return_value=False):
-            cmd.return_value.returncode = 1
             cutover.stop_docker()
 
     def test_restored_data_fences_container_and_disables_env(self):
