@@ -129,7 +129,13 @@ def main() -> int:
     p.add_argument("--dockerfile", type=Path,
                    default=Path(__file__).resolve().parents[1] /
                    "docker/hub/Dockerfile.rehearsal")
-    p.add_argument("--static", type=Path, default=STATIC)
+    # Some production HUB installations inline their UI and have no
+    # /opt/owrt-remote/static directory. Use the pinned repository assets
+    # for this isolated smoke test only; source code remains source-exact.
+    repo_static = Path(__file__).resolve().parents[1] / "vps/static"
+    existing_static = STATIC.is_dir() and any(p.is_file() for p in STATIC.rglob("*"))
+    p.add_argument("--static", type=Path,
+                   default=STATIC if existing_static else repo_static)
     args = p.parse_args()
     try:
         require(ROOT.is_dir() and not ROOT.is_symlink(),
