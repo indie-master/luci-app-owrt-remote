@@ -4636,7 +4636,7 @@ def host_adapter_request(operation, payload=None):
     return data
 
 
-def build_additive_wss_candidate(current, rows):
+def build_additive_wss_candidate(current, rows, expected_new_id=None):
     """Add only ONE missing WSS router to the *deployed* host Xray JSON.
 
     Never regenerate or replace the existing inbounds, TCP client pool,
@@ -4729,10 +4729,17 @@ def build_additive_wss_candidate(current, rows):
             raise RuntimeError("Only a complete new WSS/443 router can be registered")
         pending.append(row)
 
+    if len(pending) > 1:
+        raise RuntimeError("Register one new WSS router per Xray transaction")
+    if expected_new_id is not None:
+        expected_new_id = clean_router_id(expected_new_id)
+        if pending and clean_router_id(pending[0]["id"]) != expected_new_id:
+            raise RuntimeError("Requested router differs from pending WSS registration")
+        if not pending and not any(
+                clean_router_id(row["id"]) == expected_new_id for row in rows):
+            raise RuntimeError("Requested WSS router is missing from database")
     if not pending:
         return copy.deepcopy(current)
-    if len(pending) != 1:
-        raise RuntimeError("Register one new WSS router per Xray transaction")
 
     row = pending[0]
     rid = clean_router_id(row["id"])
@@ -4764,7 +4771,7 @@ def build_additive_wss_candidate(current, rows):
     return updated
 
 
-def reload_vps_xray_host_adapter(db_path):
+def reload_vps_xray_host_adapter(db_path, expected_new_id=None):
     """Apply one additive WSS enrollment, preserving the deployed Xray JSON."""
     with _XRAY_RELOAD_LOCK:
         status = host_adapter_request("xray.current")
@@ -4772,7 +4779,7 @@ def reload_vps_xray_host_adapter(db_path):
         with connect(db_path) as conn:
             init_db(conn)
             rows = list_router_rows(conn)
-        candidate = build_additive_wss_candidate(current, rows)
+        candidate = build_additive_wss_candidate(current, rows, expected_new_id=expected_new_id)
         if current == candidate:
             return {"config": "/etc/xray/owrt-remote.json",
                     "service": "owrt-remote-xray",
@@ -4809,10 +4816,10 @@ def assert_xray_mutation_allowed():
 
 
 
-def reload_vps_xray(db_path=DB_PATH):
+def reload_vps_xray(db_path=DB_PATH, expected_new_id=None):
     """Validate a private candidate, retain a backup and roll back failed restarts."""
     if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
-        return reload_vps_xray_host_adapter(db_path)
+        return reload_vps_xray_host_adapter(db_path, expected_new_id=expected_new_id)
     assert_xray_mutation_allowed()
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
@@ -19892,7 +19899,7 @@ exit 127
                     # Register new reverse UUIDs and entry/SSH inbounds immediately.
                     # An Xray failure never deletes a successfully registered router.
                     try:
-                        xray_sync = reload_vps_xray(self.app.db_path)
+                        xray_sync = reload_vps_xray(self.app.db_path, expected_new_id=router_id)
                     except Exception as exc:
                         self.log_message("new router xray sync failed: %s", exc)
                         xray_sync = {"error": str(exc)}
@@ -19929,7 +19936,7 @@ exit 127
                     if row_str_value(row, "vps_transport", "tcp") != "ws":
                         self.send_json(409, {"ok": False, "error": "Повторная регистрация доступна только для WSS"})
                         return
-                    result = reload_vps_xray(self.app.db_path)
+                    result = reload_vps_xray(self.app.db_path, expected_new_id=router_id)
                 self.send_json(200, {"ok": True, "router_id": router_id,
                                      "pending_registration": False, "xray": result})
             except Exception as exc:
