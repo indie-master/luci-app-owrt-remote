@@ -19717,52 +19717,100 @@ exit 127
                 if payload["vps_transport"] not in ("ws", "tcp"):
                     raise ValueError("Недопустимый транспорт Xray")
                 payload["vless_port"] = 443 if payload["vps_transport"] == "ws" else DEFAULT_VLESS_PORT
+                if DOCKER_RUNTIME:
+                    if payload["vps_transport"] != "ws":
+                        self.send_json(409, {"ok": False, "error": "В Docker новые роутеры добавляются только по WSS/443"})
+                        return
+                    if os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") != "host_adapter":
+                        self.send_json(503, {"ok": False, "error": "Для регистрации нового роутера нужен проверенный host Xray adapter"})
+                        return
                 entry_port = int(payload.get("entry_port") or 0)
                 ssh_entry_port = int(payload.get("ssh_entry_port") or (entry_port + 1000))
                 if entry_port <= 0:
                     self.send_text(400, "entry_port должен быть больше 0")
                     return
-                with self.app.conn() as conn:
-                    existing = get_router(conn, router_id)
-                    if existing and not router_deleted(existing):
-                        self.send_text(
-                            409,
-                            f"Router ID '{router_id}' уже есть. Для второго роутера укажи новый ID, например node-2 или main123.",
-                        )
-                        return
-                    port_owner = get_router_by_any_port(conn, entry_port, router_id)
-                    if port_owner:
-                        self.send_text(
-                            409,
-                            f"entry_port {entry_port} уже занят роутером '{port_owner['id']}'. Для следующего роутера поставь другой порт, например {entry_port + 10}.",
-                        )
-                        return
-                    ssh_port_owner = get_router_by_any_port(conn, ssh_entry_port, router_id)
-                    if ssh_port_owner:
-                        self.send_text(
-                            409,
-                            f"ssh_entry_port {ssh_entry_port} уже занят роутером '{ssh_port_owner['id']}'. Поставь entry_port так, чтобы entry_port + 1000 был свободен.",
-                        )
-                        return
-                    if not router_group_exists(conn, payload["group_id"]):
-                        self.send_text(400, "Группа роутера не найдена")
-                        return
-                    payload["ssh_entry_port"] = ssh_entry_port
-                    row = upsert_router(conn, payload)
-                    router = row_to_router(row)
-                if current and not current.get("is_owner"):
-                    grant_delegated_router_flag(load_auth(), current.get("username", ""), router_id, "G")
-                # Register new reverse UUIDs and entry/SSH inbounds immediately.
-                # An Xray failure never deletes a successfully registered router.
-                try:
-                    xray_sync = reload_vps_xray(self.app.db_path)
-                except Exception as exc:
-                    self.log_message("new router xray sync failed: %s", exc)
-                    xray_sync = {"error": str(exc)}
+                # Serialize SQLite enrollment and Xray registration. Otherwise
+                # two concurrent additions can produce an unsafe multi-router
+                # Xray diff rejected by the host adapter.
+                with _XRAY_RELOAD_LOCK:
+                    with self.app.conn() as conn:
+                        existing = get_router(conn, router_id)
+                        if existing and not router_deleted(existing):
+                            self.send_text(
+                                409,
+                                f"Router ID '{router_id}' уже есть. Для второго роутера укажи новый ID, например node-2 или main123.",
+                            )
+                            return
+                        port_owner = get_router_by_any_port(conn, entry_port, router_id)
+                        if port_owner:
+                            self.send_text(
+                                409,
+                                f"entry_port {entry_port} уже занят роутером '{port_owner['id']}'. Для следующего роутера поставь другой порт, например {entry_port + 10}.",
+                            )
+                            return
+                        ssh_port_owner = get_router_by_any_port(conn, ssh_entry_port, router_id)
+                        if ssh_port_owner:
+                            self.send_text(
+                                409,
+                                f"ssh_entry_port {ssh_entry_port} уже занят роутером '{ssh_port_owner['id']}'. Поставь entry_port так, чтобы entry_port + 1000 был свободен.",
+                            )
+                            return
+                        if not router_group_exists(conn, payload["group_id"]):
+                            self.send_text(400, "Группа роутера не найдена")
+                            return
+                        payload["ssh_entry_port"] = ssh_entry_port
+                        row = upsert_router(conn, payload)
+                        router = row_to_router(row)
+                    if current and not current.get("is_owner"):
+                        grant_delegated_router_flag(load_auth(), current.get("username", ""), router_id, "G")
+                    # Register new reverse UUIDs and entry/SSH inbounds immediately.
+                    # An Xray failure never deletes a successfully registered router.
+                    try:
+                        xray_sync = reload_vps_xray(self.app.db_path)
+                    except Exception as exc:
+                        self.log_message("new router xray sync failed: %s", exc)
+                        xray_sync = {"error": str(exc)}
+                if xray_sync.get("error"):
+                    # The DB row remains for an explicit retry; never claim
+                    # that a router is connectable before host Xray accepts it.
+                    self.send_json(503, {
+                        "ok": False,
+                        "pending_registration": True,
+                        "router": router,
+                        "error": "Роутер сохранён, но Xray не зарегистрировал WSS. Повтори регистрацию через /api/router/<id>/xray/sync.",
+                        "xray": {"error": xray_sync["error"]},
+                    })
+                    return
                 self.send_json(200, {"ok": True, "router": router,
                                      "xray": xray_sync, "auth": self.build_auth_meta()})
             except Exception as exc:
                 self.send_text(400, str(exc))
+            return
+        if path.startswith("/api/router/") and path.endswith("/xray/sync"):
+            if not self.require_owner(json_mode=True):
+                return
+            router_id = urllib.parse.unquote(path.split("/")[3])
+            if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") != "host_adapter":
+                self.send_json(503, {"ok": False, "error": "Host Xray adapter не включён"})
+                return
+            try:
+                with _XRAY_RELOAD_LOCK:
+                    with self.app.conn() as conn:
+                        row = get_active_router(conn, router_id)
+                    if row is None:
+                        self.send_json(404, {"ok": False, "error": "Роутер не найден"})
+                        return
+                    if row_str_value(row, "vps_transport", "tcp") != "ws":
+                        self.send_json(409, {"ok": False, "error": "Повторная регистрация доступна только для WSS"})
+                        return
+                    result = reload_vps_xray(self.app.db_path)
+                self.send_json(200, {"ok": True, "router_id": router_id,
+                                     "pending_registration": False, "xray": result})
+            except Exception as exc:
+                self.log_message("WSS registration retry failed for %s: %s", router_id, exc)
+                self.send_json(503, {"ok": False, "router_id": router_id,
+                                     "pending_registration": True,
+                                     "error": "Xray WSS registration failed; retry after host adapter checks"})
             return
         if path.startswith("/api/router/") and path.endswith("/wol/devices"):
             parts = path.strip("/").split("/")
