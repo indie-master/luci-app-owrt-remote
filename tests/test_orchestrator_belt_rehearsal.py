@@ -53,6 +53,7 @@ class RehearsalOps(unittest.TestCase):
                 return context, digest
 
             with patch.object(ops.os, "geteuid", return_value=0), \
+                 patch.object(ops, "private_root"), \
                  patch.object(ops, "service_active", return_value=True), \
                  patch.object(ops.gate, "analyze"), \
                  patch.object(ops.gate, "snapshot", return_value=(snapshot, {})), \
