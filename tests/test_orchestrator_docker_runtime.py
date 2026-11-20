@@ -50,6 +50,34 @@ class DockerRuntimeContracts(unittest.TestCase):
             with patch.object(mgr, "ENV", p):
                 self.assertEqual(mgr.settings()["RO_PORT"], "18089")
 
+    def test_manager_operations_are_serialized(self):
+        # No production paths are accessed by this test.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.object(mgr, "LOCK", root / ".deploy.lock"), \
+                 patch.object(mgr, "require_root", lambda: None):
+                with mgr.deployment_lock():
+                    self.assertEqual((root / ".deploy.lock").stat().st_mode & 0o777, 0o600)
+                    with self.assertRaisesRegex(mgr.Blocked, "Another Router Orchestrator"):
+                        with mgr.deployment_lock():
+                            pass
+                with mgr.deployment_lock():
+                    pass
+
+    def test_manager_rejects_symlink_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "other"
+            target.write_text("do-not-touch")
+            lock = root / ".deploy.lock"
+            lock.symlink_to(target)
+            with patch.object(mgr, "LOCK", lock), \
+                 patch.object(mgr, "require_root", lambda: None):
+                with self.assertRaises(OSError):
+                    with mgr.deployment_lock():
+                        pass
+            self.assertEqual(target.read_text(), "do-not-touch")
+
     def test_adapter_never_accepts_shell(self):
         adapter_src = (REPO / "docker" / "host_adapter.py").read_text()
         self.assertNotIn("shell=True", adapter_src)
