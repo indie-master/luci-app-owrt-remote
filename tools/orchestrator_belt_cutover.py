@@ -328,12 +328,31 @@ def original_service_enabled() -> bool:
     return command("systemctl", "is-enabled", "--quiet", HOST_SERVICE).returncode == 0
 
 
+def host_health(*, attempts: int = 12) -> bool:
+    """Check that systemd HUB accepts HTTP, not merely that its unit is active."""
+    for i in range(attempts):
+        if not service_active(HOST_SERVICE):
+            return False
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{PORT}/health", timeout=2) as response:
+                if json.load(response).get("ok") is True:
+                    return True
+        except (OSError, ValueError, urllib.error.HTTPError):
+            pass
+        if i + 1 < attempts:
+            time.sleep(1)
+    return False
+
+
 def restart_host(document: dict) -> None:
+    require(not docker_running(), "Docker writer still active before host restart")
+    require(not ENV.exists(), "Docker environment still armed before host restart")
     if document.get("was_enabled"):
         command_ok("systemctl", "enable", "--now", HOST_SERVICE)
     else:
         command_ok("systemctl", "start", HOST_SERVICE)
-    require(service_active(HOST_SERVICE), "host HUB failed to restart")
+    require(host_health(), "host HUB failed HTTP readiness after recovery")
 
 
 def stop_docker() -> None:
@@ -489,6 +508,7 @@ def recover(args) -> None:
             require(not ENV.exists() and not docker,
                     "cannot mark recovery complete while Docker remains armed")
             stop_docker()
+            require(host_health(attempts=2), "host HUB active but HTTP not ready")
             archive = BACKUPS / ("pre-docker-host-state-" + doc["id"])
             require(not DATA.exists() or
                     (archive.is_dir() and STATE.is_dir() and
