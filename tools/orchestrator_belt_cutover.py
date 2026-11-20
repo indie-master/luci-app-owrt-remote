@@ -331,7 +331,11 @@ def restart_host(document: dict) -> None:
 
 
 def stop_docker() -> None:
-    command_ok("docker", "compose", "stop", "hub", timeout=75)
+    # A failed 'compose up' may not have created any container. Rollback
+    # must still restart the original host, not fail on 'no such service'.
+    probe = command("docker", "inspect", DOCKER_NAME)
+    if probe.returncode == 0:
+        command_ok("docker", "compose", "stop", "hub", timeout=75)
     require(not docker_running(), "Docker HUB still running")
 
 
