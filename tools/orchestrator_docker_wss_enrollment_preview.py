@@ -155,7 +155,8 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
         with hub.connect(state / "hub.db") as db:
             hub.upsert_router(db, new_values)
             new_rows = hub.list_router_rows(db)
-            generated = hub.build_additive_wss_candidate(xray, new_rows)
+            generated = hub.build_additive_wss_candidate(
+                xray, new_rows, expected_new_id=synthetic_id)
         phase = "synthetic.xray.transition"
         adapter.validate_transition(xray, generated)
 
