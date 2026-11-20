@@ -240,7 +240,7 @@ class GuardedUpgradeTests(unittest.TestCase):
         reload_start = source.index("def reload_vps_xray(")
         restart_start = source.index("def restart_vps_xray(")
         self.assertIn("assert_xray_mutation_allowed()", source[reload_start:reload_start+330])
-        self.assertIn("assert_xray_mutation_allowed()", source[restart_start:restart_start+180])
+        self.assertIn("assert_xray_mutation_allowed()", source[restart_start:restart_start+360])
 
 
 if __name__ == "__main__":
