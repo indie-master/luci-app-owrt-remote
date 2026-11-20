@@ -221,9 +221,11 @@ class SingleWriterCutoverTests(unittest.TestCase):
                  patch.object(cutover, "DATA", root / "missing"), \
                  patch.object(cutover, "ENV", root / ".env"), \
                  patch.object(cutover, "mark") as marker, \
+                 patch.object(cutover, "stop_docker") as fence, \
                  patch.object(cutover, "recover_host") as recovery:
                 cutover.recover(args)
                 recovery.assert_not_called()
+                fence.assert_called_once_with()
                 self.assertEqual(marker.call_args.args[1], "AUTO_ROLLED_BACK")
 
     def test_power_loss_between_two_state_renames_recovers_latest(self):
