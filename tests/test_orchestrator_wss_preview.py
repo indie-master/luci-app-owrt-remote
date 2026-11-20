@@ -1,5 +1,7 @@
 """Offline sanity checks for candidate WSS enrollment on a private snapshot."""
 from pathlib import Path
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -30,6 +32,36 @@ class WssSnapshotPreviewTests(unittest.TestCase):
                 with self.assertRaisesRegex(preview.Blocked, "root"):
                     preview.preview(root / "missing", "a" * 40, root)
                 restore.assert_not_called()
+
+    def test_restoration_blocker_identifies_stage_not_private_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "snapshot"
+            archive.mkdir()
+            with patch.object(preview.os, "geteuid", return_value=0), \
+                 patch.object(preview.candidate, "verify_private_parent"), \
+                 patch.object(preview.candidate, "verify_checkout"), \
+                 patch.object(preview.gate, "inspect_archive",
+                              return_value={"kind": "REHEARSAL_ONLY_NOT_CUTOVER"}), \
+                 patch.object(preview.restored, "restore",
+                              side_effect=preview.restored.Blocked("secret-token-123")):
+                with self.assertRaises(preview.Blocked) as failed:
+                    preview.preview(archive, "a" * 40, root)
+            self.assertEqual(str(failed.exception), "snapshot.restore: Blocked")
+            self.assertNotIn("secret-token", str(failed.exception))
+
+    def test_cli_surfaces_only_reviewed_blocker_message(self):
+        with patch.object(sys, "argv", ["preview", "--snapshot", "/tmp/snapshot",
+                                        "--expect-commit", "a" * 40]), \
+             patch.object(preview, "preview",
+                          side_effect=preview.Blocked(
+                              "candidate.baseline.generator: config mismatch")):
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                code = preview.main()
+        self.assertEqual(code, 2)
+        self.assertIn("candidate.baseline.generator: config mismatch",
+                      errors.getvalue())
 
     def test_repo_tool_has_no_live_xray_mutations(self):
         source = (Path(__file__).resolve().parents[1] /
