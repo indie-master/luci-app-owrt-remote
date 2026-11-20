@@ -35,6 +35,27 @@ TRANSIENT = {"hub.db-wal", "hub.db-shm", "hub.db-journal"}
 class Blocked(Exception):
     pass
 
+@contextlib.contextmanager
+def deployment_lock():
+    """Serialize installers, backups and release switches across processes.
+
+    The lock is permanent metadata under the Router Orchestrator root.
+    Never unlink a flock file while it may be held by another process.
+    """
+    require_root()
+    require(LOCK.parent.is_dir() and not LOCK.parent.is_symlink(),
+            "Deployment directory missing/unsafe")
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Blocked("Another Router Orchestrator operation is running") from exc
+        yield
+    finally:
+        os.close(fd)
+
 def require(condition, message):
     if not condition:
         raise Blocked(message)
@@ -420,21 +441,22 @@ def main():
     restore_parser.add_argument("--destination", required=True)
     args = parser.parse_args()
     try:
-        if args.action == "install":
-            install(args)
-        elif args.action == "status":
+        if args.action == "status":
             status()
-        elif args.action == "build":
-            require_root()
-            print("BUILT:", build_image())
-        elif args.action == "backup":
-            backup()
-        elif args.action == "restore":
-            restore(args)
-        elif args.action == "upgrade":
-            deploy(args)
-        elif args.action == "rollback":
-            rollback(args)
+        else:
+            with deployment_lock():
+                if args.action == "install":
+                    install(args)
+                elif args.action == "build":
+                    print("BUILT:", build_image())
+                elif args.action == "backup":
+                    backup()
+                elif args.action == "restore":
+                    restore(args)
+                elif args.action == "upgrade":
+                    deploy(args)
+                elif args.action == "rollback":
+                    rollback(args)
         return 0
     except (Blocked, OSError, subprocess.CalledProcessError, ValueError,
             sqlite3.DatabaseError, tarfile.TarError) as exc:

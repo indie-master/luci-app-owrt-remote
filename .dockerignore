@@ -1,0 +1,12 @@
+# Only the reviewed application, runtime Dockerfile and pinned dependencies
+# belong in a production image build context.
+# Never send .git, state snapshots, environment files or logs to Docker.
+**
+!docker/
+!docker/hub/
+!docker/hub/Dockerfile
+!docker/hub/requirements.lock
+!vps/
+!vps/owrt-remote-hub.py
+!vps/static/
+!vps/static/**

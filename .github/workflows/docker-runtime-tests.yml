@@ -13,6 +13,8 @@ on:
       - 'tools/orchestrator_belt_rehearsal.py'
       - 'tests/test_orchestrator_docker_candidate_rehearsal.py'
       - 'tools/orchestrator_docker_candidate_rehearsal.py'
+      - 'tools/orchestrator_belt_cutover.py'
+      - 'tests/test_orchestrator_belt_cutover.py'
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -22,7 +24,7 @@ jobs:
         with:
           python-version: '3.10'
       - name: Compile source files
-        run: python -m py_compile docker/manager.py docker/host_adapter.py vps/owrt-remote-hub.py tools/orchestrator_belt_rehearsal.py tools/orchestrator_docker_candidate_rehearsal.py
+        run: python -m py_compile docker/manager.py docker/host_adapter.py vps/owrt-remote-hub.py tools/orchestrator_belt_rehearsal.py tools/orchestrator_docker_candidate_rehearsal.py tools/orchestrator_belt_cutover.py
       - name: Shell syntax
         run: sh -n docker/install.sh
       - name: Unit tests
@@ -30,6 +32,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_orchestrator_docker_runtime.py' -v
           python -m unittest discover -s tests -p 'test_orchestrator_belt_rehearsal.py' -v
           python -m unittest discover -s tests -p 'test_orchestrator_docker_candidate_rehearsal.py' -v
+          python -m unittest discover -s tests -p 'test_orchestrator_belt_cutover.py' -v
       - name: Validate compose model
         run: |
           cp .env.example .env
