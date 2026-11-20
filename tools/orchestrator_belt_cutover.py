@@ -483,8 +483,12 @@ def recover(args) -> None:
         require(not (host and docker), "two active HUB writers: operator intervention")
         if host:
             # Crashed after host restart but before journal completion.
+            # Even a *stopped* Docker container could have a restart policy
+            # that revives it at reboot. Disarm its policy before accepting
+            # the already-running systemd HUB as the sole writer.
             require(not ENV.exists() and not docker,
                     "cannot mark recovery complete while Docker remains armed")
+            stop_docker()
             archive = BACKUPS / ("pre-docker-host-state-" + doc["id"])
             require(not DATA.exists() or
                     (archive.is_dir() and STATE.is_dir() and
