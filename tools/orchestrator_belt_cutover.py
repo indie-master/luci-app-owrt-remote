@@ -499,7 +499,10 @@ def main() -> int:
     for verb in ("preflight", "prepare"):
         cmd = subs.add_parser(verb)
         cmd.add_argument("--expect-commit", required=True)
-        cmd.add_argument("--public-url", required=True)
+        # Read-only preflight does not persist the URL. No guesswork about
+        # the actual production HTTPS hostname is necessary at this stage.
+        cmd.add_argument("--public-url", required=(verb == "prepare"),
+                         default="https://preflight.invalid")
     start = subs.add_parser("activate")
     start.add_argument("--acknowledge-live-cutover", action="store_true")
     start.add_argument("--acknowledge-candidate-pass", action="store_true")
