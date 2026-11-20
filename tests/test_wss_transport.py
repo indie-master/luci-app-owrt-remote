@@ -176,6 +176,22 @@ class WssHubTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "identity differs"):
             hub.build_additive_wss_candidate(live, rows)
 
+    def test_additive_wss_retry_targets_exact_pending_router(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            before = hub.make_server_xray_config(hub.list_router_rows(conn))
+        self.add("new", "ws", 443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        with self.assertRaisesRegex(RuntimeError, "Requested router differs"):
+            hub.build_additive_wss_candidate(before, rows, expected_new_id="old")
+        candidate = hub.build_additive_wss_candidate(
+            before, rows, expected_new_id="new")
+        self.assertEqual(len(candidate["inbounds"]), len(before["inbounds"]) + 2)
+        with self.assertRaisesRegex(RuntimeError, "missing from database"):
+            hub.build_additive_wss_candidate(
+                candidate, rows, expected_new_id="nonexistent")
+
     def test_additive_wss_refuses_multiple_unregistered_routers(self):
         self.add("old", "tcp", 18443)
         with hub.connect(self.db) as conn:
