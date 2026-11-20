@@ -24,7 +24,8 @@ jobs:
       - name: Shell syntax
         run: sh -n docker/install.sh
       - name: Unit tests
-        run: python -m unittest discover -s tests -p 'test_orchestrator_docker_runtime.py' -v
+        run: |
+          python -m unittest discover -s tests -p 'test_orchestrator_docker_runtime.py' -v
           python -m unittest discover -s tests -p 'test_orchestrator_belt_rehearsal.py' -v
       - name: Validate compose model
         run: |
