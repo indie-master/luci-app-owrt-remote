@@ -13,7 +13,7 @@ class WssSnapshotPreviewTests(unittest.TestCase):
     def test_select_pair_never_uses_existing_ports(self):
         taken = {18443, 18444, 24000, 24001, 25002}
         admin, ssh = preview.select_pair(taken)
-        self.assertEqual((admin, ssh), (24002, 25003))
+        self.assertEqual((admin, ssh), (24003, 25003))
         self.assertNotIn(admin, taken)
         self.assertNotIn(ssh, taken)
         self.assertEqual(ssh-admin, 1000)
