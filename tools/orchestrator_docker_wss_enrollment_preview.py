@@ -77,9 +77,21 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
     try:
         stage, _ = restored.restore(snapshot, backup_root)
         state = stage / "state"
-        xray = json.loads((stage / "reference/xray.json").read_text())
+        xray_ref = stage / "reference/xray.json"
+        xray = json.loads(xray_ref.read_text())
         baseline = gate.db_inventory(state / "hub.db")
         require(baseline["active_count"] > 0, "no existing routers")
+        # Refuse a stale snapshot after a real fleet or host Xray change.
+        # Reading the live files here never modifies them.
+        live_xray = Path("/etc/xray/owrt-remote.json")
+        live_state = Path("/var/lib/owrt-remote")
+        require(live_xray.is_file() and not live_xray.is_symlink(),
+                "live host Xray reference is missing/unsafe")
+        require(gate.file_sha(xray_ref) == gate.file_sha(live_xray),
+                "host Xray has changed since snapshot")
+        actual = gate.db_inventory(live_state / "hub.db")
+        require(actual["routers"] == baseline["routers"],
+                "live router identity/transport inventory changed since snapshot")
 
         # The checked code receives *only* the private restored state path.
         os.environ.update({
