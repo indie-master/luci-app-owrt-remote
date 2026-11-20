@@ -67,6 +67,114 @@ class DockerRuntimeContracts(unittest.TestCase):
         with self.assertRaises(host.Rejected):
             adapter.handle({"op": "shell.exec", "command": "id"})
 
+    @staticmethod
+    def sample_new_wss_config():
+        legacy = {"tag": "owrt-remote-vless", "listen": "0.0.0.0",
+                  "port": 18443, "protocol": "vless",
+                  "settings": {"clients": [], "decryption": "none"},
+                  "streamSettings": {"network": "tcp", "security": "none"}}
+        wss = {"tag": "owrt-remote-wss", "listen": "127.0.0.1",
+               "port": 18444, "protocol": "vless",
+               "settings": {"clients": [
+                   {"id": "old-admin", "email": "old@owrt-remote",
+                    "reverse": {"tag": "reverse-old"}},
+                   {"id": "old-ssh", "email": "old-ssh@owrt-remote",
+                    "reverse": {"tag": "reverse-old-ssh"}}],
+                            "decryption": "none"},
+               "streamSettings": {"network": "ws", "security": "none",
+                                  "wsSettings": {"path": "/owrt-ws/"}}}
+        old_admin = {"tag": "entry-old", "listen": "127.0.0.1",
+                     "port": 18090, "protocol": "tunnel",
+                     "settings": {"allowedNetwork": "tcp",
+                                  "rewriteAddress": "127.0.0.1", "rewritePort": 80}}
+        old_ssh = {"tag": "ssh-old", "listen": "127.0.0.1",
+                   "port": 19090, "protocol": "tunnel",
+                   "settings": {"allowedNetwork": "tcp",
+                                "rewriteAddress": "127.0.0.1", "rewritePort": 22}}
+        old = {"log": {"loglevel": "warning"},
+               "inbounds": [legacy, wss, old_admin, old_ssh],
+               "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+               "routing": {"rules": [
+                   {"type": "field", "inboundTag": ["entry-old"],
+                    "outboundTag": "reverse-old"},
+                   {"type": "field", "inboundTag": ["ssh-old"],
+                    "outboundTag": "reverse-old-ssh"}]},
+               "remarks": "OpenWrt Remote Hub server config"}
+        import copy
+        new = copy.deepcopy(old)
+        new["inbounds"][1]["settings"]["clients"].extend([
+            {"id": "new-admin", "email": "new@owrt-remote",
+             "reverse": {"tag": "reverse-new"}},
+            {"id": "new-ssh", "email": "new-ssh@owrt-remote",
+             "reverse": {"tag": "reverse-new-ssh"}}])
+        new["inbounds"].extend([
+            {"tag": "entry-new", "listen": "127.0.0.1", "port": 18130,
+             "protocol": "tunnel",
+             "settings": {"allowedNetwork": "tcp",
+                          "rewriteAddress": "127.0.0.1", "rewritePort": 80}},
+            {"tag": "ssh-new", "listen": "127.0.0.1", "port": 19130,
+             "protocol": "tunnel",
+             "settings": {"allowedNetwork": "tcp",
+                          "rewriteAddress": "127.0.0.1", "rewritePort": 22}}])
+        new["routing"]["rules"].extend([
+            {"type": "field", "inboundTag": ["entry-new"],
+             "outboundTag": "reverse-new"},
+            {"type": "field", "inboundTag": ["ssh-new"],
+             "outboundTag": "reverse-new-ssh"}])
+        return old, new
+
+    def test_wss_addition_preserves_existing_identities(self):
+        spec2 = importlib.util.spec_from_file_location("host_control", REPO / "docker" / "host_adapter.py")
+        host = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(host)
+        old, new = self.sample_new_wss_config()
+        host.validate_transition(old, new)
+        # A generated config may insert a new router between existing ones.
+        new["routing"]["rules"].insert(0, new["routing"]["rules"].pop())
+        host.validate_transition(old, new)
+
+    def test_wss_mutations_and_partial_enrollment_are_blocked(self):
+        import copy
+        spec2 = importlib.util.spec_from_file_location("host_control", REPO / "docker" / "host_adapter.py")
+        host = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(host)
+        old, expected = self.sample_new_wss_config()
+        for case in ("delete-old", "change-uuid", "change-reverse", "add-tcp",
+                     "remove-ssh", "reroute-old", "change-dns", "change-outbound",
+                     "duplicate-port", "public-listener", "duplicate-client",
+                     "extra-client", "rule-reorder"):
+            candidate = copy.deepcopy(expected)
+            clients = candidate["inbounds"][1]["settings"]["clients"]
+            if case == "delete-old":
+                clients.pop(0)
+            elif case == "change-uuid":
+                clients[0]["id"] = "spoofed"
+            elif case == "change-reverse":
+                clients[-1]["reverse"]["tag"] = "wrong"
+            elif case == "add-tcp":
+                candidate["inbounds"][0]["settings"]["clients"].append(clients[-1])
+            elif case == "remove-ssh":
+                candidate["inbounds"] = [x for x in candidate["inbounds"]
+                                         if x["tag"] != "ssh-new"]
+            elif case == "reroute-old":
+                candidate["routing"]["rules"][0]["outboundTag"] = "wrong"
+            elif case == "change-dns":
+                candidate["dns"] = {"servers": ["8.8.8.8"]}
+            elif case == "change-outbound":
+                candidate["outbounds"][0]["protocol"] = "blackhole"
+            elif case == "duplicate-port":
+                candidate["inbounds"][-1]["port"] = 18090
+            elif case == "public-listener":
+                candidate["inbounds"][-1]["listen"] = "0.0.0.0"
+            elif case == "duplicate-client":
+                clients[-1]["id"] = clients[0]["id"]
+            elif case == "extra-client":
+                clients.append({"id": "rogue", "email": "other@owrt-remote"})
+            elif case == "rule-reorder":
+                candidate["routing"]["rules"][:2] = list(reversed(candidate["routing"]["rules"][:2]))
+            with self.subTest(case=case), self.assertRaises(host.Rejected):
+                host.validate_transition(old, candidate)
+
     def test_host_adapter_rejects_xray_transport_changes(self):
         spec2 = importlib.util.spec_from_file_location("host_control", REPO / "docker" / "host_adapter.py")
         host = importlib.util.module_from_spec(spec2)

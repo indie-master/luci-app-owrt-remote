@@ -53,24 +53,149 @@ def config_inbounds(value):
         by_tag[tag] = item
     return by_tag
 
+def _client_map(inbound):
+    """Index clients without exposing credentials in validation errors."""
+    settings = inbound.get("settings", {})
+    require(isinstance(settings, dict), "invalid Xray inbound settings")
+    clients = settings.get("clients", [])
+    require(isinstance(clients, list), "invalid Xray client collection")
+    indexed = {}
+    emails = set()
+    for entry in clients:
+        require(isinstance(entry, dict), "invalid Xray client")
+        identity = entry.get("id")
+        email = entry.get("email")
+        require(isinstance(identity, str) and identity and identity not in indexed,
+                "missing/duplicate Xray client identity")
+        require(isinstance(email, str) and email and email not in emails,
+                "missing/duplicate Xray client label")
+        indexed[identity] = entry
+        emails.add(email)
+    return indexed
+
+
 def validate_transition(previous, candidate):
+    """Fail closed: the only approved mutation enrolls ONE new WSS router.
+
+    Existing LuCI/SSH listeners, identities and routing remain unchanged.
+    An unrelated Xray change needs an independently reviewed transaction.
+    """
+    require(isinstance(previous, dict) and isinstance(candidate, dict),
+            "invalid Xray config")
+    require(previous.keys() == candidate.keys(),
+            "unexpected top-level Xray config change")
+    for key in previous:
+        if key not in {"inbounds", "routing"}:
+            require(previous[key] == candidate[key],
+                    "unrelated Xray setting changed")
     old = config_inbounds(previous)
     new = config_inbounds(candidate)
+    require(set(old).issubset(new), "existing Xray inbound removed")
+    for tag, earlier in old.items():
+        latest = new[tag]
+        if tag in ("owrt-remote-vless", "owrt-remote-wss"):
+            require({k: v for k, v in earlier.items() if k != "settings"} ==
+                    {k: v for k, v in latest.items() if k != "settings"},
+                    "existing transport listener/TLS/WS policy changed")
+            original_settings = dict(earlier.get("settings", {}))
+            updated_settings = dict(latest.get("settings", {}))
+            original_settings.pop("clients", None)
+            updated_settings.pop("clients", None)
+            require(original_settings == updated_settings,
+                    "existing transport settings changed")
+        else:
+            require(latest == earlier,
+                    "existing LuCI/SSH reverse portal changed")
     for tag in ("owrt-remote-vless", "owrt-remote-wss"):
         require(tag in old and tag in new, "missing required Xray transport")
-        for field in ("protocol", "listen", "port", "streamSettings"):
-            require(new[tag].get(field) == old[tag].get(field),
-                    "transport listener/TLS/WS policy changed")
-    # Protect all existing router reverse portals. Removing/reassigning a portal
-    # requires a separate reviewed maintenance transaction, never auto-apply.
-    for tag, old_inbound in old.items():
-        if tag.startswith(("entry-", "ssh-")):
-            require(tag in new and new[tag] == old_inbound,
-                    "existing LuCI/SSH reverse portal changed: " + tag)
+
+    legacy = _client_map(old["owrt-remote-vless"])
+    next_legacy = _client_map(new["owrt-remote-vless"])
+    require(legacy == next_legacy,
+            "TCP identities changed; new routers must use WSS")
+    wss = _client_map(old["owrt-remote-wss"])
+    next_wss = _client_map(new["owrt-remote-wss"])
+    require(all(next_wss.get(uid) == row for uid, row in wss.items()),
+            "existing WSS router identity changed or removed")
+    added = [row for uid, row in next_wss.items() if uid not in wss]
+
+    new_tags = set(new) - set(old)
+    routing_before = previous.get("routing", {})
+    routing_after = candidate.get("routing", {})
+    require(isinstance(routing_before, dict) and isinstance(routing_after, dict),
+            "invalid routing settings")
+    require({k: v for k, v in routing_before.items() if k != "rules"} ==
+            {k: v for k, v in routing_after.items() if k != "rules"},
+            "unrelated routing settings changed")
+    before_rules = routing_before.get("rules", [])
+    after_rules = routing_after.get("rules", [])
+    require(isinstance(before_rules, list) and isinstance(after_rules, list),
+            "invalid routing rules")
+
+    # Preserve the relative order of existing routing rules even when the
+    # generated config inserts new router rules in the middle of the list.
+    pending = iter(after_rules)
+    for rule in before_rules:
+        for found in pending:
+            if rule == found:
+                break
+        else:
+            raise Rejected("existing routing rule removed or reordered")
+    extra_rules = list(after_rules)
+    for rule in before_rules:
+        extra_rules.remove(rule)
+
+    if not (added or new_tags or extra_rules):
+        return  # Read-only/no-op candidate.
+
+    require(len(added) == 2, "new WSS router requires exactly two clients")
+    labels = {r["email"]: r for r in added}
+    owners = [email[:-len("@owrt-remote")] for email in labels
+              if email.endswith("@owrt-remote")
+              and not email.endswith("-ssh@owrt-remote")]
+    require(len(owners) == 1 and owners[0] and
+            all(ch.isascii() and (ch.isalnum() or ch in "_.-")
+                for ch in owners[0]),
+            "invalid new router identity")
+    router_id = owners[0]
+    normal = router_id + "@owrt-remote"
+    ssh = router_id + "-ssh@owrt-remote"
+    require(set(labels) == {normal, ssh},
+            "new WSS client pair is incomplete")
+    require(labels[normal].get("reverse", {}).get("tag") ==
+            "reverse-" + router_id and
+            labels[ssh].get("reverse", {}).get("tag") ==
+            "reverse-" + router_id + "-ssh",
+            "new WSS reverse tags do not match")
+    expected_tags = {"entry-" + router_id, "ssh-" + router_id}
+    require(new_tags == expected_tags, "new reverse portal set changed")
+    ports = [int(item.get("port", 0)) for item in new.values()]
+    require(len(ports) == len(set(ports)),
+            "new reverse portal port conflicts with existing listener")
+    for tag in expected_tags:
+        item = new[tag]
+        require(item.get("protocol") == "tunnel" and
+                item.get("listen") == "127.0.0.1" and
+                isinstance(item.get("port"), int) and 1024 <= item["port"] <= 65535,
+                "new reverse portal is not a loopback TCP tunnel")
+        settings = item.get("settings", {})
+        require(isinstance(settings, dict) and
+                settings.get("allowedNetwork") == "tcp" and
+                isinstance(settings.get("rewriteAddress"), str) and
+                isinstance(settings.get("rewritePort"), int),
+                "new reverse portal target is invalid")
+    expected_rules = [
+        {"type": "field", "inboundTag": ["entry-" + router_id],
+         "outboundTag": "reverse-" + router_id},
+        {"type": "field", "inboundTag": ["ssh-" + router_id],
+         "outboundTag": "reverse-" + router_id + "-ssh"},
+    ]
+    require(len(extra_rules) == 2 and
+            all(rule in extra_rules for rule in expected_rules),
+            "new router rules differ from expected LuCI/SSH routes")
     require(len(json.dumps(candidate).encode()) <= MAX_REQUEST - 4096,
             "candidate Xray config exceeds limit")
-    rules = candidate.get("routing", {}).get("rules", [])
-    require(isinstance(rules, list), "invalid routing rules")
+
 
 def atomic_replace(path, data):
     fd, temp = tempfile.mkstemp(prefix=".ro-xray-", suffix=".json", dir=path.parent)
