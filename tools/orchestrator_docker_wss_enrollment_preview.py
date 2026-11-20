@@ -74,9 +74,11 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
     original_env = {name: os.environ.get(name) for name in (
         "OWRT_REMOTE_STATE_DIR", "OWRT_REMOTE_RUNTIME",
         "OWRT_REMOTE_XRAY_CONTROL_BACKEND")}
+    phase = "snapshot.restore"
     try:
         stage, _ = restored.restore(snapshot, backup_root)
         state = stage / "state"
+        phase = "snapshot.inventory"
         xray_ref = stage / "reference/xray.json"
         xray = json.loads(xray_ref.read_text())
         baseline = gate.db_inventory(state / "hub.db")
@@ -87,8 +89,10 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
         live_state = Path("/var/lib/owrt-remote")
         require(live_xray.is_file() and not live_xray.is_symlink(),
                 "live host Xray reference is missing/unsafe")
+        phase = "live.xray.sha256"
         require(gate.file_sha(xray_ref) == gate.file_sha(live_xray),
                 "host Xray has changed since snapshot")
+        phase = "live.router.inventory"
         actual = gate.db_inventory(live_state / "hub.db")
         require(actual["routers"] == baseline["routers"],
                 "live router identity/transport inventory changed since snapshot")
@@ -99,6 +103,7 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
             "OWRT_REMOTE_RUNTIME": "docker",
             "OWRT_REMOTE_XRAY_CONTROL_BACKEND": "external_readonly",
         })
+        phase = "candidate.import"
         hub = import_checked_module(
             "orchestrator_preview_hub_" + uuid.uuid4().hex,
             REPO / "vps/owrt-remote-hub.py")
@@ -111,6 +116,7 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
         listen = old_tcp[0].get("listen", "0.0.0.0")
         port = int(old_tcp[0]["port"])
 
+        phase = "candidate.baseline.generator"
         with hub.connect(state / "hub.db") as db:
             hub.init_db(db)  # on disposable copy only
             rows = hub.list_router_rows(db)
@@ -120,6 +126,7 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
                 "new HUB source generates Xray config different from deployed Belt; "
                 "review drift before enabling writes")
 
+        phase = "synthetic.port.selection"
         used = {int(i.get("port", 0)) for i in xray.get("inbounds", [])}
         used.update(int(r[k]) for r in rows for k in
                     ("entry_port", "ssh_entry_port") if r[k])
@@ -141,13 +148,16 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
             "ssh_port": 22,
             "vps_allow_legacy": 0,
         }
+        phase = "synthetic.sqlite.insert"
         with hub.connect(state / "hub.db") as db:
             hub.upsert_router(db, new_values)
             new_rows = hub.list_router_rows(db)
             generated = hub.make_server_xray_config(
                 new_rows, listen_host=listen, listen_port=port)
+        phase = "synthetic.xray.transition"
         adapter.validate_transition(xray, generated)
 
+        phase = "synthetic.postcheck"
         after = gate.db_inventory(state / "hub.db")
         require(after["active_count"] == baseline["active_count"] + 1,
                 "synthetic enrollment row count invalid")
@@ -161,6 +171,15 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
         return {"routers": baseline["active_count"], "wss": baseline["wss"],
                 "tcp": baseline["tcp"], "new_router": "WSS",
                 "preserved_logs": baseline["tables"]["router_logs"]}
+    except Blocked as exc:
+        # Only our own fixed, operator-safe messages reach the terminal.
+        # No raw Xray JSON, UUID, token, key or SQLite data is printed.
+        raise Blocked(f"{phase}: {exc}") from exc
+    except (gate.GateError, restored.Blocked, candidate.Rejected,
+            ValueError, TypeError, KeyError, RuntimeError) as exc:
+        # External modules can embed private IDs in their exception strings.
+        # Report the stable phase and exception class only.
+        raise Blocked(f"{phase}: {type(exc).__name__}") from exc
     finally:
         for name, old in original_env.items():
             if old is None:
@@ -192,7 +211,11 @@ def main() -> int:
         print("CLEANUP: private temporary restored state removed")
         print("NO CUTOVER: write capabilities remain disabled")
         return 0
-    except (Blocked, gate.GateError, restored.Blocked, candidate.Rejected,
+    except Blocked as exc:
+        print("WSS ENROLLMENT PREVIEW: BLOCKED — " + str(exc)[:230],
+              file=sys.stderr)
+        return 2
+    except (gate.GateError, restored.Blocked, candidate.Rejected,
             OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
         print("WSS ENROLLMENT PREVIEW: BLOCKED — " + type(exc).__name__,
               file=sys.stderr)
