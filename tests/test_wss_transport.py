@@ -65,6 +65,51 @@ class WssHubTests(unittest.TestCase):
         self.assertEqual(old2["vps_transport"], "tcp")
         self.assertEqual(old2["vless_port"], 18443)
 
+    def test_docker_host_adapter_accepts_one_wss_enrollment(self):
+        import hashlib
+        import importlib.util
+        adapter_path = ROOT / "docker" / "host_adapter.py"
+        spec = importlib.util.spec_from_file_location("wss_adapter_pilot", adapter_path)
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            before = hub.make_server_xray_config(hub.list_router_rows(conn))
+
+        self.add("new", "ws", 443)
+        def fake_host_adapter(op, payload=None):
+            if op == "xray.current":
+                data = (json.dumps(before, sort_keys=True) + "\n").encode()
+                return {"ok": True, "config": before,
+                        "sha256": hashlib.sha256(data).hexdigest()}
+            self.assertEqual(op, "xray.apply")
+            self.assertTrue(payload["expected_sha256"])
+            adapter.validate_transition(before, payload["config"])
+            self.assertEqual(len(payload["config"]["inbounds"]),
+                             len(before["inbounds"]) + 2)
+            return {"ok": True, "service": "owrt-remote-xray",
+                    "unchanged": False, "backup": "/private/mock-backup"}
+
+        with mock.patch.object(hub, "host_adapter_request",
+                               side_effect=fake_host_adapter) as requests:
+            result = hub.reload_vps_xray_host_adapter(self.db)
+        self.assertFalse(result["unchanged"])
+        self.assertEqual(requests.call_count, 2)
+
+    def test_docker_enrollment_pending_failure_is_retryable(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        begin = source.index('if path == "/api/router":')
+        finish = source.index('if path.startswith("/api/router/") and path.endswith("/wol/devices"):', begin)
+        registration = source[begin:finish]
+        self.assertIn('with _XRAY_RELOAD_LOCK:', registration)
+        self.assertIn('if xray_sync.get("error"):', registration)
+        self.assertIn('"pending_registration": True', registration)
+        self.assertIn('self.send_json(503', registration)
+        self.assertIn('if path.startswith("/api/router/") and path.endswith("/xray/sync"):', registration)
+        self.assertIn('self.require_owner(json_mode=True)', registration)
+        self.assertIn('if row_str_value(row, "vps_transport", "tcp") != "ws":', registration)
+
     def test_hub_startup_logs_cannot_disclose_agent_token(self):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertNotIn('print(f"AGENT_TOKEN: {app.agent_token}")', source)
