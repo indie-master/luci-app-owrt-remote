@@ -4636,28 +4636,161 @@ def host_adapter_request(operation, payload=None):
     return data
 
 
-def reload_vps_xray_host_adapter(db_path):
-    """Generate a candidate in the HUB; validate/apply/rollback only on host."""
-    status = host_adapter_request("xray.current")
-    current = status["config"]
-    old_legacy = next((item for item in current.get("inbounds", [])
-                       if item.get("tag") == "owrt-remote-vless"), None)
-    if old_legacy is None:
-        raise RuntimeError("Host Xray legacy inbound missing; refusing apply")
-    with connect(db_path) as conn:
-        init_db(conn)
-        rows = list_router_rows(conn)
-    candidate = make_server_xray_config(rows,
-        listen_host=old_legacy.get("listen", "0.0.0.0"),
-        listen_port=int(old_legacy["port"]))
-    if current == candidate:
-        return {"config": "/etc/xray/owrt-remote.json", "service": "owrt-remote-xray",
-                "routers": len(rows), "unchanged": True}
-    applied = host_adapter_request("xray.apply", {"expected_sha256": status["sha256"],
-                                                 "config": candidate})
-    return {"config": "/etc/xray/owrt-remote.json", "service": applied["service"],
-            "routers": len(rows), "unchanged": applied.get("unchanged", False),
-            "backup": applied.get("backup", "")}
+def build_additive_wss_candidate(current, rows, expected_new_id=None):
+    """Add only ONE missing WSS router to the *deployed* host Xray JSON.
+
+    Never regenerate or replace the existing inbounds, TCP client pool,
+    reverse portals, routing order, custom settings or unrelated metadata.
+    An already-registered fleet is a no-op; incomplete/ambiguous changes fail
+    before the root-owned host adapter is asked to apply anything.
+    """
+    import copy
+
+    if not isinstance(current, dict) or not isinstance(rows, list):
+        raise RuntimeError("Xray registration requires a config and router list")
+    inbounds = current.get("inbounds")
+    routing = current.get("routing")
+    if not isinstance(inbounds, list) or not isinstance(routing, dict):
+        raise RuntimeError("Host Xray lacks inbounds/routing")
+    old_rules = routing.get("rules")
+    if not isinstance(old_rules, list):
+        raise RuntimeError("Host Xray lacks routing rules")
+
+    indexed = {}
+    for inbound in inbounds:
+        if not isinstance(inbound, dict) or not isinstance(inbound.get("tag"), str):
+            raise RuntimeError("Invalid deployed Xray inbound")
+        tag = inbound["tag"]
+        if tag in indexed:
+            raise RuntimeError("Duplicate deployed Xray inbound")
+        indexed[tag] = inbound
+    for required_tag in ("owrt-remote-vless", "owrt-remote-wss"):
+        if required_tag not in indexed:
+            raise RuntimeError("Required host Xray transport missing")
+
+    pools = {}
+    for tag in ("owrt-remote-vless", "owrt-remote-wss"):
+        settings = indexed[tag].get("settings")
+        if not isinstance(settings, dict) or not isinstance(settings.get("clients"), list):
+            raise RuntimeError("Host Xray transport clients invalid")
+        pool = settings["clients"]
+        if not all(isinstance(item, dict) for item in pool):
+            raise RuntimeError("Host Xray client entry invalid")
+        emails = [item.get("email") for item in pool]
+        if len(emails) != len(set(emails)):
+            raise RuntimeError("Duplicate Xray client labels")
+        pools[tag] = {item.get("email"): item for item in pool}
+
+    pending = []
+    for row in rows:
+        rid = clean_router_id(row["id"])
+        transport = row_str_value(row, "vps_transport", "tcp")
+        if transport not in ("ws", "tcp"):
+            raise RuntimeError("Unsupported router transport")
+        pool_tag = "owrt-remote-wss" if transport == "ws" else "owrt-remote-vless"
+        labels = (
+            (f"{rid}@owrt-remote", row["vless_uuid"], f"reverse-{rid}"),
+            (f"{rid}-ssh@owrt-remote", row["ssh_vless_uuid"], f"reverse-{rid}-ssh"),
+        )
+        found = []
+        for email, identity, reverse_tag in labels:
+            client = pools[pool_tag].get(email)
+            found.append(client is not None)
+            if client is not None:
+                if client.get("id") != identity or (
+                    (client.get("reverse") or {}).get("tag") != reverse_tag
+                ):
+                    raise RuntimeError("Existing Xray router identity differs from database")
+            else:
+                other_tag = ("owrt-remote-vless" if pool_tag == "owrt-remote-wss"
+                             else "owrt-remote-wss")
+                if email in pools[other_tag]:
+                    raise RuntimeError("Router identity exists in wrong transport")
+        portals = ("entry-" + rid, "ssh-" + rid)
+        if all(found):
+            for tag, db_port in zip(portals, (row["entry_port"], row["ssh_entry_port"])):
+                inbound = indexed.get(tag)
+                if (not isinstance(inbound, dict)
+                        or int(inbound.get("port") or 0) != int(db_port or 0)
+                        or inbound.get("listen") != "127.0.0.1"
+                        or inbound.get("protocol") != "tunnel"):
+                    raise RuntimeError("Existing reverse portal differs from database")
+            continue
+        if any(found) or any(tag in indexed for tag in portals):
+            raise RuntimeError("Partially registered Xray router; manual review required")
+        if any(any(tag in (rule.get("inboundTag") or []) for tag in portals)
+               for rule in old_rules if isinstance(rule, dict)):
+            raise RuntimeError("Orphan reverse routing rule; manual review required")
+        if (transport != "ws" or int(row["vless_port"] or 0) != 443
+                or row_int_value(row, "vps_allow_legacy", 0) != 0
+                or not all(row[x] for x in ("vless_uuid", "ssh_vless_uuid"))
+                or not all(1024 <= int(row[x] or 0) <= 65535
+                           for x in ("entry_port", "ssh_entry_port"))):
+            raise RuntimeError("Only a complete new WSS/443 router can be registered")
+        pending.append(row)
+
+    if len(pending) > 1:
+        raise RuntimeError("Register one new WSS router per Xray transaction")
+    if expected_new_id is not None:
+        expected_new_id = clean_router_id(expected_new_id)
+        if pending and clean_router_id(pending[0]["id"]) != expected_new_id:
+            raise RuntimeError("Requested router differs from pending WSS registration")
+        if not pending and not any(
+                clean_router_id(row["id"]) == expected_new_id for row in rows):
+            raise RuntimeError("Requested WSS router is missing from database")
+    if not pending:
+        return copy.deepcopy(current)
+
+    row = pending[0]
+    rid = clean_router_id(row["id"])
+    tcp = indexed["owrt-remote-vless"]
+    # Generate ONLY the fresh router's two clients, two private reverse
+    # listeners and two routing rules. The old config is never regenerated.
+    generated = make_server_xray_config(
+        [row], listen_host=tcp.get("listen", "0.0.0.0"),
+        listen_port=int(tcp["port"]))
+    wanted = ("entry-" + rid, "ssh-" + rid)
+    additions = [x for x in generated["inbounds"] if x["tag"] in wanted]
+    clients = next(x for x in generated["inbounds"]
+                   if x["tag"] == "owrt-remote-wss")["settings"]["clients"]
+    rules = generated["routing"]["rules"]
+    expected_emails = {f"{rid}@owrt-remote", f"{rid}-ssh@owrt-remote"}
+    if (len(additions) != 2 or {x["tag"] for x in additions} != set(wanted)
+            or len(clients) != 2
+            or {x["email"] for x in clients} != expected_emails
+            or len(rules) != 2
+            or {tuple(x.get("inboundTag") or []) for x in rules}
+                != {(wanted[0],), (wanted[1],)}):
+        raise RuntimeError("New WSS router generator output is incomplete")
+
+    updated = copy.deepcopy(current)
+    updated_index = {x["tag"]: x for x in updated["inbounds"]}
+    updated_index["owrt-remote-wss"]["settings"]["clients"].extend(clients)
+    updated["inbounds"].extend(additions)
+    updated["routing"]["rules"].extend(rules)
+    return updated
+
+
+def reload_vps_xray_host_adapter(db_path, expected_new_id=None):
+    """Apply one additive WSS enrollment, preserving the deployed Xray JSON."""
+    with _XRAY_RELOAD_LOCK:
+        status = host_adapter_request("xray.current")
+        current = status["config"]
+        with connect(db_path) as conn:
+            init_db(conn)
+            rows = list_router_rows(conn)
+        candidate = build_additive_wss_candidate(current, rows, expected_new_id=expected_new_id)
+        if current == candidate:
+            return {"config": "/etc/xray/owrt-remote.json",
+                    "service": "owrt-remote-xray",
+                    "routers": len(rows), "unchanged": True}
+        applied = host_adapter_request(
+            "xray.apply", {"expected_sha256": status["sha256"],
+                           "config": candidate})
+        return {"config": "/etc/xray/owrt-remote.json",
+                "service": applied["service"], "routers": len(rows),
+                "unchanged": applied.get("unchanged", False),
+                "backup": applied.get("backup", "")}
 
 
 def assert_xray_mutation_allowed():
@@ -4683,10 +4816,10 @@ def assert_xray_mutation_allowed():
 
 
 
-def reload_vps_xray(db_path=DB_PATH):
+def reload_vps_xray(db_path=DB_PATH, expected_new_id=None):
     """Validate a private candidate, retain a backup and roll back failed restarts."""
     if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
-        return reload_vps_xray_host_adapter(db_path)
+        return reload_vps_xray_host_adapter(db_path, expected_new_id=expected_new_id)
     assert_xray_mutation_allowed()
     out = Path(os.environ.get("OWRT_REMOTE_XRAY_CONFIG", "/etc/xray/owrt-remote.json"))
     service = os.environ.get("OWRT_REMOTE_XRAY_SERVICE", "owrt-remote-xray")
@@ -19766,7 +19899,7 @@ exit 127
                     # Register new reverse UUIDs and entry/SSH inbounds immediately.
                     # An Xray failure never deletes a successfully registered router.
                     try:
-                        xray_sync = reload_vps_xray(self.app.db_path)
+                        xray_sync = reload_vps_xray(self.app.db_path, expected_new_id=router_id)
                     except Exception as exc:
                         self.log_message("new router xray sync failed: %s", exc)
                         xray_sync = {"error": str(exc)}
@@ -19803,7 +19936,7 @@ exit 127
                     if row_str_value(row, "vps_transport", "tcp") != "ws":
                         self.send_json(409, {"ok": False, "error": "Повторная регистрация доступна только для WSS"})
                         return
-                    result = reload_vps_xray(self.app.db_path)
+                    result = reload_vps_xray(self.app.db_path, expected_new_id=router_id)
                 self.send_json(200, {"ok": True, "router_id": router_id,
                                      "pending_registration": False, "xray": result})
             except Exception as exc:

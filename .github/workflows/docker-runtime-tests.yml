@@ -37,6 +37,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_orchestrator_docker_candidate_rehearsal.py' -v
           python -m unittest discover -s tests -p 'test_orchestrator_belt_cutover.py' -v
           python -m unittest discover -s tests -p 'test_orchestrator_wss_preview.py' -v
+          python -m unittest discover -s tests -p 'test_wss_transport.py' -v
       - name: Validate compose model
         run: |
           cp .env.example .env

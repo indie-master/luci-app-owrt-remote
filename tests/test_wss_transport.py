@@ -97,6 +97,123 @@ class WssHubTests(unittest.TestCase):
         self.assertFalse(result["unchanged"])
         self.assertEqual(requests.call_count, 2)
 
+    def test_additive_wss_preserves_custom_deployed_xray(self):
+        import copy
+        import importlib.util
+        adapter_path = ROOT / "docker" / "host_adapter.py"
+        spec = importlib.util.spec_from_file_location("wss_additive_host", adapter_path)
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            initial = hub.make_server_xray_config(hub.list_router_rows(conn))
+        # Historical server settings/metadata must survive new enrollment.
+        initial["remarks"] = "Custom Belt operator note"
+        initial["inbounds"][1]["streamSettings"]["wsSettings"]["headers"] = {
+            "Host": "protected.example.invalid"
+        }
+        before = copy.deepcopy(initial)
+        self.add("new", "ws", 443)
+        with hub.connect(self.db) as conn:
+            expanded = hub.list_router_rows(conn)
+        generated_all = hub.make_server_xray_config(expanded)
+        self.assertNotEqual(before, generated_all)
+        additive = hub.build_additive_wss_candidate(before, expanded)
+        adapter.validate_transition(before, additive)
+        self.assertEqual(before, initial, "function must not modify live config")
+        self.assertEqual(additive["remarks"], before["remarks"])
+        # The WSS client list alone gains the two new identities; all
+        # pre-existing inbound fields and the TCP clients stay untouched.
+        self.assertEqual(additive["inbounds"][0], before["inbounds"][0])
+        self.assertEqual(additive["inbounds"][2:4], before["inbounds"][2:4])
+        self.assertEqual(
+            additive["inbounds"][1]["settings"]["clients"][:-2],
+            before["inbounds"][1]["settings"]["clients"])
+        self.assertEqual(
+            {key: value for key, value in additive["inbounds"][1].items()
+             if key != "settings"},
+            {key: value for key, value in before["inbounds"][1].items()
+             if key != "settings"})
+        self.assertEqual(additive["routing"]["rules"][:2],
+                         before["routing"]["rules"])
+        self.assertEqual(len(additive["inbounds"]), len(before["inbounds"]) + 2)
+        self.assertEqual(len(additive["inbounds"][1]["settings"]["clients"]),
+                         len(before["inbounds"][1]["settings"]["clients"]) + 2)
+
+    def test_additive_wss_is_noop_for_existing_fleet(self):
+        self.add("old", "tcp", 18443)
+        self.add("new", "ws", 443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        current = hub.make_server_xray_config(rows)
+        current["remarks"] = "Keep deployed remarks"
+        new = hub.build_additive_wss_candidate(current, rows)
+        self.assertEqual(new, current)
+        self.assertIsNot(new, current)
+
+    def test_additive_wss_refuses_partial_registration(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            before = hub.make_server_xray_config(hub.list_router_rows(conn))
+        self.add("new", "ws", 443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        generated = hub.make_server_xray_config(rows)
+        partial = json.loads(json.dumps(before))
+        # Only one new UUID without its matching SSH bridge.
+        partial["inbounds"][1]["settings"]["clients"].append(
+            generated["inbounds"][1]["settings"]["clients"][-2]
+        )
+        with self.assertRaisesRegex(RuntimeError, "Partially registered"):
+            hub.build_additive_wss_candidate(partial, rows)
+
+    def test_additive_wss_refuses_modified_existing_identity(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        live = hub.make_server_xray_config(rows)
+        live["inbounds"][0]["settings"]["clients"][0]["id"] = "unexpected-change"
+        with self.assertRaisesRegex(RuntimeError, "identity differs"):
+            hub.build_additive_wss_candidate(live, rows)
+
+    def test_additive_wss_retry_targets_exact_pending_router(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            before = hub.make_server_xray_config(hub.list_router_rows(conn))
+        self.add("new", "ws", 443)
+        with hub.connect(self.db) as conn:
+            rows = hub.list_router_rows(conn)
+        with self.assertRaisesRegex(RuntimeError, "Requested router differs"):
+            hub.build_additive_wss_candidate(before, rows, expected_new_id="old")
+        candidate = hub.build_additive_wss_candidate(
+            before, rows, expected_new_id="new")
+        self.assertEqual(len(candidate["inbounds"]), len(before["inbounds"]) + 2)
+        with self.assertRaisesRegex(RuntimeError, "missing from database"):
+            hub.build_additive_wss_candidate(
+                candidate, rows, expected_new_id="nonexistent")
+
+    def test_additive_wss_refuses_multiple_unregistered_routers(self):
+        self.add("old", "tcp", 18443)
+        with hub.connect(self.db) as conn:
+            before = hub.make_server_xray_config(hub.list_router_rows(conn))
+        self.add("new", "ws", 443)
+        import uuid
+        with hub.connect(self.db) as conn:
+            hub.upsert_router(conn, {
+                "id": "second-new",
+                "name": "second-new",
+                "entry_port": 18230,
+                "ssh_entry_port": 19230,
+                "vps_host": "hub.example",
+                "vps_transport": "ws",
+                "vless_port": 443,
+                "vless_uuid": str(uuid.uuid4()),
+                "ssh_vless_uuid": str(uuid.uuid4()),
+            })
+            rows = hub.list_router_rows(conn)
+        with self.assertRaisesRegex(RuntimeError, "one new WSS"):
+            hub.build_additive_wss_candidate(before, rows)
+
     def test_docker_enrollment_pending_failure_is_retryable(self):
         source = SOURCE.read_text(encoding="utf-8")
         begin = source.index('if path == "/api/router":')

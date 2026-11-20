@@ -37,10 +37,15 @@ sudo python3 tools/orchestrator_docker_wss_enrollment_preview.py \
 The preview compares the archive to *current* live router identities and host
 Xray SHA256 to reject stale snapshots. It then restores the snapshot to a new
 private temporary directory, imports the **candidate** HUB under its private
-state path, verifies that its regenerated six-router Xray exactly matches
-the deployed reference, adds a synthetic 7th WSS record to the **temporary**
-SQLite copy, and invokes the same `validate_transition` used by the host
-adapter. It removes the restored copy afterwards.
+state path, checks existing Xray-to-database identity and port parity, preserves
+all non-generated host configuration, adds a synthetic 7th WSS record to the **temporary**
+SQLite copy. The preview verifies existing DB/Xray identity/port parity,
+then constructs a **strictly additive** candidate: exactly two WSS clients,
+two reverse listeners and two rules for the synthetic new router. Historical
+changes in the existing host Xray JSON remain untouched, even where the
+new HUB's whole-config generator differs. The preview invokes the same
+`validate_transition` used by the host adapter and removes the restored
+copy afterwards.
 
 A PASS establishes only code/config compatibility, **not a real Xray restart,
 WSS router connection or permission to enable mutations**.
