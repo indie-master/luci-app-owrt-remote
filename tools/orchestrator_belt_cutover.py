@@ -176,6 +176,10 @@ def basic_preflight(expected_commit: str, public_url: str,
     check_url(public_url)
     source_checkout(expected_commit)
     secure_dir(BACKUPS)
+    # Rollback uses an atomic rename of the old host state into BACKUPS.
+    # Detect cross-filesystem layouts BEFORE stopping the live service.
+    require(BACKUPS.stat().st_dev == STATE.parent.stat().st_dev,
+            "host state and backups must share filesystem for safe rollback")
     require(service_active(HOST_SERVICE), "production HUB not active")
     require(service_active(XRAY_SERVICE), "host Xray not active")
     require(not docker_running(), "Docker production HUB already running")
