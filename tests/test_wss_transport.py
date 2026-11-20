@@ -122,7 +122,18 @@ class WssHubTests(unittest.TestCase):
         adapter.validate_transition(before, additive)
         self.assertEqual(before, initial, "function must not modify live config")
         self.assertEqual(additive["remarks"], before["remarks"])
-        self.assertEqual(additive["inbounds"][:4], before["inbounds"])
+        # The WSS client list alone gains the two new identities; all
+        # pre-existing inbound fields and the TCP clients stay untouched.
+        self.assertEqual(additive["inbounds"][0], before["inbounds"][0])
+        self.assertEqual(additive["inbounds"][2:4], before["inbounds"][2:4])
+        self.assertEqual(
+            additive["inbounds"][1]["settings"]["clients"][:-2],
+            before["inbounds"][1]["settings"]["clients"])
+        self.assertEqual(
+            {key: value for key, value in additive["inbounds"][1].items()
+             if key != "settings"},
+            {key: value for key, value in before["inbounds"][1].items()
+             if key != "settings"})
         self.assertEqual(additive["routing"]["rules"][:2],
                          before["routing"]["rules"])
         self.assertEqual(len(additive["inbounds"]), len(before["inbounds"]) + 2)
