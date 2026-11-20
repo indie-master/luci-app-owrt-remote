@@ -122,9 +122,13 @@ class SingleWriterCutoverTests(unittest.TestCase):
         self.assertNotIn("systemctl restart", activate)
 
     def test_missing_container_does_not_block_auto_recovery(self):
-        with patch.object(cutover, "command") as cmd, \
+        def query(*args, **kwargs):
+            class Result:
+                returncode = 0 if args[:2] == ("docker", "info") else 1
+                stdout = ""
+            return Result()
+        with patch.object(cutover, "command", side_effect=query), \
              patch.object(cutover, "docker_running", return_value=False):
-            cmd.return_value.returncode = 1
             cutover.stop_docker()
 
     def test_restored_data_fences_container_and_disables_env(self):
@@ -170,6 +174,158 @@ class SingleWriterCutoverTests(unittest.TestCase):
                 backup / "pre-docker-host-state-synthetic" / "hub.db")
                 ["tables"]["router_logs"], 1)
             self.assertTrue(latest.exists())
+
+    def test_recover_requires_explicit_acknowledgement(self):
+        args = type("Args", (), {"confirm": False})()
+        with self.assertRaises(cutover.Blocked):
+            cutover.recover(args)
+
+    def test_recover_rejects_dual_writers(self):
+        args = type("Args", (), {"confirm": True})()
+        doc = {"schema": 1, "id": "test", "phase": "HOST_STOPPED"}
+        with patch.object(cutover, "exclusive_lock", return_value=nullcontext()), \
+             patch.object(cutover, "load_journal", return_value=doc), \
+             patch.object(cutover, "service_active", return_value=True), \
+             patch.object(cutover, "docker_running", return_value=True), \
+             patch.object(cutover, "recover_host") as restoration:
+            with self.assertRaisesRegex(cutover.Blocked, "two active"):
+                cutover.recover(args)
+            restoration.assert_not_called()
+
+    def test_recover_resume_at_stopped_host_phase(self):
+        args = type("Args", (), {"confirm": True})()
+        doc = {"schema": 1, "id": "test", "phase": "DOCKER_START_REQUESTED"}
+        states = []
+        def mark(document, phase):
+            states.append(phase)
+            document["phase"] = phase
+        with patch.object(cutover, "exclusive_lock", return_value=nullcontext()), \
+             patch.object(cutover, "load_journal", return_value=doc), \
+             patch.object(cutover, "service_active", return_value=False), \
+             patch.object(cutover, "docker_running", return_value=True), \
+             patch.object(cutover, "mark", side_effect=mark), \
+             patch.object(cutover, "recover_host") as recovery:
+            cutover.recover(args)
+            recovery.assert_called_once_with(doc)
+        self.assertEqual(states, ["RECOVERING", "AUTO_ROLLED_BACK"])
+
+    def test_recover_after_systemd_restart_before_journal_commit(self):
+        args = type("Args", (), {"confirm": True})()
+        doc = {"schema": 1, "id": "test", "phase": "HOST_RESTART_REQUESTED"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.object(cutover, "exclusive_lock", return_value=nullcontext()), \
+                 patch.object(cutover, "load_journal", return_value=doc), \
+                 patch.object(cutover, "service_active", return_value=True), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover, "DATA", root / "missing"), \
+                 patch.object(cutover, "ENV", root / ".env"), \
+                 patch.object(cutover, "mark") as marker, \
+                 patch.object(cutover, "stop_docker") as fence, \
+                 patch.object(cutover, "host_health", return_value=True), \
+                 patch.object(cutover, "recover_host") as recovery:
+                cutover.recover(args)
+                recovery.assert_not_called()
+                fence.assert_called_once_with()
+                self.assertEqual(marker.call_args.args[1], "AUTO_ROLLED_BACK")
+
+    def test_power_loss_between_two_state_renames_recovers_latest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original = root / "host" / "owrt-remote"
+            original.parent.mkdir()
+            data = root / "data"
+            backups = root / "backups"
+            backups.mkdir()
+            fixture_state(original)
+            fixture_state(data)
+            with sqlite3.connect(data / "hub.db") as db:
+                db.execute("INSERT INTO router_logs VALUES (2,'after-docker-writes')")
+            archived = backups / "pre-docker-host-state-reboot"
+            # Simulate SIGKILL right after os.replace(STATE, archived).
+            os.replace(original, archived)
+            self.assertFalse(original.exists())
+            def analyze(location, xray):
+                return cutover.gate.db_inventory(location / "hub.db"), {}
+            with patch.object(cutover, "STATE", original), \
+                 patch.object(cutover, "DATA", data), \
+                 patch.object(cutover, "BACKUPS", backups), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover.gate, "analyze", side_effect=analyze), \
+                 patch.object(cutover.os, "chown"):
+                cutover.promote_latest_state({"id": "reboot"})
+                self.assertEqual(cutover.gate.db_inventory(original / "hub.db")
+                                 ["tables"]["router_logs"], 2)
+                # Repeated recovery doesn't rename or overwrite anything.
+                cutover.promote_latest_state({"id": "reboot"})
+            self.assertEqual(cutover.gate.db_inventory(archived / "hub.db")
+                             ["tables"]["router_logs"], 1)
+
+    def test_stop_docker_fences_restarts_without_env_file(self):
+        events = []
+        def call(*args, **kwargs):
+            events.append(args)
+            class Result:
+                returncode = 0
+                stdout = "router-orchestrator/hub\n"
+            return Result()
+        with patch.object(cutover, "command", side_effect=call), \
+             patch.object(cutover, "docker_running", return_value=False):
+            cutover.stop_docker()
+        self.assertIn(("docker", "update", "--restart=no", cutover.DOCKER_NAME),
+                      events)
+        self.assertIn(("docker", "stop", "-t", "30", cutover.DOCKER_NAME),
+                      events)
+        self.assertLess(
+            events.index(("docker", "update", "--restart=no", cutover.DOCKER_NAME)),
+            events.index(("docker", "stop", "-t", "30", cutover.DOCKER_NAME)))
+
+    def test_host_restart_requires_docker_fenced_and_env_sealed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env = root / ".env"
+            with patch.object(cutover, "ENV", env), \
+                 patch.object(cutover, "docker_running", return_value=True), \
+                 patch.object(cutover, "command_ok") as service:
+                with self.assertRaisesRegex(cutover.Blocked, "Docker writer"):
+                    cutover.restart_host({"was_enabled": True})
+                service.assert_not_called()
+            env.write_text("RO_PORT=8088")
+            with patch.object(cutover, "ENV", env), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover, "command_ok") as service:
+                with self.assertRaisesRegex(cutover.Blocked, "environment still armed"):
+                    cutover.restart_host({"was_enabled": False})
+                service.assert_not_called()
+
+    def test_host_http_readiness_failure_blocks_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = Path(td) / ".env"
+            with patch.object(cutover, "ENV", env), \
+                 patch.object(cutover, "docker_running", return_value=False), \
+                 patch.object(cutover, "command_ok"), \
+                 patch.object(cutover, "host_health", return_value=False):
+                with self.assertRaisesRegex(cutover.Blocked, "HTTP readiness"):
+                    cutover.restart_host({"was_enabled": False})
+
+    def test_unavailable_docker_daemon_blocks_recovery(self):
+        with patch.object(cutover, "command") as cmd:
+            cmd.return_value.returncode = 1
+            with self.assertRaisesRegex(cutover.Blocked, "Docker daemon unavailable"):
+                cutover.stop_docker()
+
+    def test_seal_env_recovery_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env = root / ".env"
+            backup = root / "backups"
+            backup.mkdir()
+            env.write_text("RO_PORT=8088\n")
+            with patch.object(cutover, "ENV", env), patch.object(cutover, "BACKUPS", backup):
+                cutover.seal_env({"id": "reboot"})
+                cutover.seal_env({"id": "reboot"})
+                self.assertFalse(env.exists())
+                self.assertTrue((backup / "docker-env-reboot.env").exists())
 
     def test_preflight_does_not_call_writers(self):
         args = type("Args", (), {"expect_commit": "a" * 40,

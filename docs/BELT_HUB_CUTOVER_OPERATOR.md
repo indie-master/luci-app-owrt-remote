@@ -62,3 +62,32 @@ yet support automated addition of new routers.
 
 Never upload private snapshots, Xray UUIDs, session keys, tokens or
 authentication files into GitHub, chat or CI.
+
+## Manual crash recovery (not authorized on production yet)
+
+If the journal reports STOP_REQUESTED, HOST_STOPPED, STATE_COPIED,
+DOCKER_START_REQUESTED, RECOVERING, RECOVERY_FAILED, ROLLBACK_STARTED,
+DOCKER_FENCED, STATE_RECOVERED, ENV_SEALED or HOST_RESTART_REQUESTED:
+
+1. Use a trusted rescue console, confirm Xray and Nginx remain healthy, and
+   inspect current writers with the read-only command:
+
+       sudo python3 tools/orchestrator_belt_cutover.py status
+
+2. Do **not** manually restart both HUB instances. If both are running,
+   stop and investigate: recovery is designed to fail closed.
+3. After reviewing the private transaction journal, the guarded manual
+   recovery entry point is:
+
+       sudo python3 tools/orchestrator_belt_cutover.py recover --confirm
+
+   It first disables the Docker restart policy and stops the container,
+   verifies the latest data, then promotes it to the systemd directory and
+   restores the old service. It can be rerun if interrupted; it never
+   uses the old pre-cutover snapshot to overwrite newer Docker history.
+4. If either the Docker daemon or state parity check cannot be verified,
+   recovery blocks rather than guessing. Do not delete the journal or
+   state directories, and do not bypass this guard.
+
+**Do not run the recovery command on Belt unless a genuine cutover failure
+is being handled in an approved maintenance window.**

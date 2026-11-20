@@ -182,6 +182,8 @@ def basic_preflight(expected_commit: str, public_url: str,
             "host state and backups must share filesystem for safe rollback")
     require(service_active(HOST_SERVICE), "production HUB not active")
     require(service_active(XRAY_SERVICE), "host Xray not active")
+    require(command("docker", "info", timeout=10).returncode == 0,
+            "Docker daemon unavailable; cannot verify single-writer isolation")
     require(not docker_running(), "Docker production HUB already running")
     if first_time:
         require(not JOURNAL.exists() and not JOURNAL.is_symlink(),
@@ -326,59 +328,201 @@ def original_service_enabled() -> bool:
     return command("systemctl", "is-enabled", "--quiet", HOST_SERVICE).returncode == 0
 
 
+def host_health(*, attempts: int = 12) -> bool:
+    """Check that systemd HUB accepts HTTP, not merely that its unit is active."""
+    for i in range(attempts):
+        if not service_active(HOST_SERVICE):
+            return False
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{PORT}/health", timeout=2) as response:
+                if json.load(response).get("ok") is True:
+                    return True
+        except (OSError, ValueError, urllib.error.HTTPError):
+            pass
+        if i + 1 < attempts:
+            time.sleep(1)
+    return False
+
+
 def restart_host(document: dict) -> None:
+    require(not docker_running(), "Docker writer still active before host restart")
+    require(not ENV.exists(), "Docker environment still armed before host restart")
     if document.get("was_enabled"):
         command_ok("systemctl", "enable", "--now", HOST_SERVICE)
     else:
         command_ok("systemctl", "start", HOST_SERVICE)
-    require(service_active(HOST_SERVICE), "host HUB failed to restart")
+    require(host_health(), "host HUB failed HTTP readiness after recovery")
 
 
 def stop_docker() -> None:
-    # A failed 'compose up' may not have created any container. Rollback
-    # must still restart the original host, not fail on 'no such service'.
+    """Fence an existing production container even if .env was already moved.
+
+    Docker must be reachable: treating an unavailable daemon as a stopped
+    container risks activating the old HUB alongside a restarted container.
+    """
+    require(command("docker", "info", timeout=10).returncode == 0,
+            "Docker daemon unavailable; cannot fence writer")
     probe = command("docker", "inspect", DOCKER_NAME)
     if probe.returncode == 0:
-        command_ok("docker", "compose", "stop", "hub", timeout=75)
+        label = command(
+            "docker", "inspect", "-f",
+            '{{index .Config.Labels "com.docker.compose.project"}}/'
+            '{{index .Config.Labels "com.docker.compose.service"}}',
+            DOCKER_NAME)
+        require(label.returncode == 0 and
+                label.stdout.strip() == "router-orchestrator/hub",
+                "named Docker container is not the expected HUB")
+        # Disable automatic restarts BEFORE stopping; retained across daemon
+        # restarts during a prolonged recovery or host reboot.
+        command_ok("docker", "update", "--restart=no", DOCKER_NAME)
+        command_ok("docker", "stop", "-t", "30", DOCKER_NAME, timeout=75)
     require(not docker_running(), "Docker HUB still running")
 
 
 def seal_env(document: dict) -> None:
+    archived = BACKUPS / ("docker-env-" + document["id"] + ".env")
+    require(not (ENV.exists() and archived.exists()),
+            "both active and archived Docker env exist")
     if ENV.exists():
-        archived = BACKUPS / ("docker-env-" + document["id"] + ".env")
-        require(not archived.exists(), "archived .env already exists")
+        require(not ENV.is_symlink(), "unsafe Docker environment file")
         os.replace(ENV, archived)
         os.chmod(archived, 0o600)
 
 
+def _sql_digest(path: Path) -> str:
+    """Compare SQL content across SQLite backup copies, not page layout."""
+    h = hashlib.sha256()
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("PRAGMA query_only=ON")
+        for statement in db.iterdump():
+            h.update(statement.encode("utf-8"))
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+def state_equivalent(first: Path, second: Path) -> bool:
+    """Conservative repeat-recovery check after an atomic state promotion."""
+    try:
+        a = gate.db_inventory(first / "hub.db")
+        b = gate.db_inventory(second / "hub.db")
+        if (a["tables"] != b["tables"] or identity_digest(a) != identity_digest(b)
+                or _sql_digest(first / "hub.db") != _sql_digest(second / "hub.db")):
+            return False
+        a_files = {Path(name).relative_to("state").as_posix(): file_sha(path)
+                   for path, name in gate.record_state_files(first)}
+        b_files = {Path(name).relative_to("state").as_posix(): file_sha(path)
+                   for path, name in gate.record_state_files(second)}
+        return a_files == b_files
+    except (OSError, ValueError, sqlite3.Error, gate.GateError):
+        return False
+
+
 def promote_latest_state(document: dict) -> None:
-    """Atomically change host state location, preserving original in backups."""
+    """Idempotent host-state promotion after container is safely fenced.
+
+    Handles power loss after moving the old host state into BACKUPS but before
+    moving a staged data copy into STATE. Never rewinds to a stale snapshot.
+    """
     require(not docker_running(), "Docker HUB must be stopped before promoting state")
     require(DATA.is_dir() and not DATA.is_symlink(), "latest Docker state missing")
     require(BACKUPS.stat().st_dev == STATE.parent.stat().st_dev,
             "backup and host state must share filesystem for atomic rollback")
-    tmp = STATE.parent / (".owrt-restore-" + document["id"])
-    require(not tmp.exists() and not tmp.is_symlink(),
-            "restore destination already exists")
-    stage_state(DATA, tmp, 0)
     archived = BACKUPS / ("pre-docker-host-state-" + document["id"])
-    require(not archived.exists(), "original host state archive already exists")
+    require(not archived.is_symlink() and not STATE.is_symlink(),
+            "unsafe host state directory")
+
+    if archived.exists():
+        require(archived.is_dir(), "original host state archive invalid")
+        if STATE.exists():
+            require(STATE.is_dir() and state_equivalent(STATE, DATA),
+                    "promoted host state differs from latest Docker data")
+            return  # Previous attempt already promoted the correct latest state.
+        # Crash after archiving the old STATE but before installing new STATE.
+        # Rebuild from the immutable, stopped Docker data instead of trusting
+        # a half-written temporary directory.
+        stage_state(DATA, STATE, 0)
+        return
+
+    require(STATE.is_dir(), "host state missing before promotion")
+    # Random staging names avoid colliding with interrupted prior attempts;
+    # any orphan directory requires an operator cleanup, not blind deletion.
+    import secrets
+    staging = STATE.parent / (".owrt-restore-" + document["id"] +
+                              "-" + secrets.token_hex(8))
+    stage_state(DATA, staging, 0)
     os.replace(STATE, archived)
-    try:
-        os.replace(tmp, STATE)
-    except BaseException:
-        os.replace(archived, STATE)
-        raise
+    # If interrupted here, a repeat recovery sees archived and regenerates
+    # a complete STATE from DATA. Never restart systemd while STATE is missing.
+    os.replace(staging, STATE)
 
 
 def recover_host(document: dict) -> None:
-    """Recover newest data, never roll back to an old snapshot after writes."""
-    if ENV.exists():
-        stop_docker()
-    if DATA.is_dir():
+    """Repeatable, fenced recovery with progress persisted after each gate."""
+    require(not service_active(HOST_SERVICE),
+            "host service unexpectedly running during recovery")
+    stop_docker()
+    mark(document, "DOCKER_FENCED")
+    if DATA.exists():
+        require(DATA.is_dir() and not DATA.is_symlink(),
+                "Docker data not a safe directory")
         promote_latest_state(document)
+    else:
+        require(STATE.is_dir() and not STATE.is_symlink(),
+                "neither host state nor Docker data is available")
+    mark(document, "STATE_RECOVERED")
     seal_env(document)
+    mark(document, "ENV_SEALED")
+    require(not docker_running(), "Docker reappeared during recovery")
+    mark(document, "HOST_RESTART_REQUESTED")
     restart_host(document)
+
+
+RECOVERABLE_PHASES = frozenset({
+    "STOP_REQUESTED", "HOST_STOPPED", "STATE_COPIED",
+    "DOCKER_START_REQUESTED", "RECOVERING", "RECOVERY_FAILED",
+    "ROLLBACK_STARTED", "DOCKER_FENCED", "STATE_RECOVERED",
+    "ENV_SEALED", "HOST_RESTART_REQUESTED",
+})
+
+
+def recover(args) -> None:
+    """Explicit rescue after SIGKILL/host reboot in an incomplete transition.
+
+    Never silently re-enables the old HUB if the Docker HUB may be writing.
+    """
+    require(args.confirm, "recover requires explicit --confirm")
+    with exclusive_lock():
+        doc = load_journal()
+        phase = doc["phase"]
+        require(phase in RECOVERABLE_PHASES,
+                "journal is not an incomplete recoverable transition")
+        host = service_active(HOST_SERVICE)
+        docker = docker_running()
+        require(not (host and docker), "two active HUB writers: operator intervention")
+        if host:
+            # Crashed after host restart but before journal completion.
+            # Even a *stopped* Docker container could have a restart policy
+            # that revives it at reboot. Disarm its policy before accepting
+            # the already-running systemd HUB as the sole writer.
+            require(not ENV.exists() and not docker,
+                    "cannot mark recovery complete while Docker remains armed")
+            stop_docker()
+            require(host_health(attempts=2), "host HUB active but HTTP not ready")
+            archive = BACKUPS / ("pre-docker-host-state-" + doc["id"])
+            require(not DATA.exists() or
+                    (archive.is_dir() and STATE.is_dir() and
+                     state_equivalent(STATE, DATA)),
+                    "host active before latest Docker data was promoted")
+        else:
+            mark(doc, "RECOVERING")
+            recover_host(doc)
+        mark(doc, "ROLLED_BACK" if phase == "ROLLBACK_STARTED" else
+             "AUTO_ROLLED_BACK")
+        print("RECOVERY PASS: host HUB active, Docker HUB fenced")
+        print("Latest retained Docker state was promoted when present")
+        print("Host Xray/Nginx were not restarted")
+
 
 
 def preflight(args) -> None:
@@ -441,6 +585,7 @@ def activate(args) -> None:
             stage_state(STATE, DATA, UID)
             mark(doc, "STATE_COPIED")
             write_env(doc)
+            mark(doc, "DOCKER_START_REQUESTED")
             command_ok("docker", "compose", "up", "-d", "--no-build", "hub", timeout=90)
             check_health()
             require(file_sha(XRAY) == doc["xray_hash"] and
@@ -508,6 +653,9 @@ def main() -> int:
     start.add_argument("--acknowledge-candidate-pass", action="store_true")
     back = subs.add_parser("rollback")
     back.add_argument("--confirm", action="store_true")
+    rescue = subs.add_parser("recover")
+    rescue.add_argument("--confirm", action="store_true",
+                        help="Recover an interrupted single-writer transaction")
     subs.add_parser("status")
     args = p.parse_args()
     try:
@@ -519,6 +667,8 @@ def main() -> int:
             activate(args)
         elif args.mode == "rollback":
             rollback(args)
+        elif args.mode == "recover":
+            recover(args)
         else:
             status()
         return 0
