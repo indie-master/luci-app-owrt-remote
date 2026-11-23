@@ -83,11 +83,11 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
             before = live.read_bytes()
             adapter = host.Adapter(uid=os.geteuid())
             with patch.object(host, "CONFIG", live), \
-                 patch.object(host, "SOCKET", root / "control.sock"), \
-                 patch.object(host.subprocess, "run") as subprocess_mock, \
+                 patch.object(host, "docker_inspect_image", return_value="router-orchestrator-xray:test"), \
+                 patch.object(host, "docker") as docker_mock, \
                  patch.object(host, "systemctl") as service, \
                  patch.object(host, "atomic_replace") as write:
-                subprocess_mock.return_value.returncode = 0
+                docker_mock.return_value.returncode = 0
                 response = self.exchange(adapter, {
                     "op": "xray.preview", "expected_sha256": host.sha(before),
                     "config": new})
@@ -96,9 +96,10 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
                 self.assertTrue(response["xray_config_unchanged"])
                 self.assertFalse(response["restart_performed"])
                 self.assertFalse(response["apply_performed"])
-                args = subprocess_mock.call_args.args[0]
-                self.assertEqual(args[:4], [host.BINARY, "run", "-test", "-config"])
-                self.assertEqual(Path(args[4]).parent, root)
+                args = docker_mock.call_args.args
+                self.assertEqual(args[:4], ("run", "--rm", "--pull", "never"))
+                self.assertIn("-config", args)
+                self.assertEqual(Path(args[args.index("-config") + 1]).parent, root)
                 service.assert_not_called()
                 write.assert_not_called()
             self.assertEqual(live.read_bytes(), before)
