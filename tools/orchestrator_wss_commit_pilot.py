@@ -277,9 +277,18 @@ def status(expected: str) -> dict:
     phase = "NONE"
     if JOURNAL.exists() or JOURNAL.is_symlink():
         phase = read_journal()["state"]
+    # Status remains read-only. Distinguish healthy current fleet from a
+    # fully ARMED emergency rollback path before any Xray restart.
+    try:
+        ensure_rescue_ready()
+    except (Blocked, OSError):
+        rescue_ready = False
+    else:
+        rescue_ready = True
     return {"tcp": inventory["tcp"], "wss": inventory["wss"],
             "active_count": inventory["active_count"],
-            "xray_sha": sha(CONFIG.read_bytes()), "transaction": phase}
+            "xray_sha": sha(CONFIG.read_bytes()), "transaction": phase,
+            "rescue_ready": rescue_ready}
 
 
 def preview(router_id: str, expected: str) -> dict:
@@ -465,6 +474,9 @@ def main():
             print("FLEET: {active_count} active | WSS={wss} TCP={tcp}".format(**result))
             print("XRAY SHA256:", result["xray_sha"])
             print("TRANSACTION:", result["transaction"])
+            print("INDEPENDENT RESCUE:",
+                  "PINNED_OK" if result["rescue_ready"]
+                  else "NOT_INSTALLED_OR_UNVERIFIED")
             print("HOST: systemd HUB/Xray active; adapter is read-only")
             print("NO CHANGE: status did not create files or restart services")
         elif args.mode == "preview":
