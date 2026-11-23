@@ -84,6 +84,10 @@ def ensure_services():
     require(service_active(ADAPTER_SERVICE), "read-only host adapter is not active")
 
 
+def require_root():
+    require(os.geteuid() == 0, "must run as root on Belt")
+
+
 def checkout(expected: str):
     require(COMMIT.fullmatch(expected) is not None, "full reviewed source SHA required")
     result = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
@@ -98,7 +102,7 @@ def checkout(expected: str):
 
 
 def preconditions(expected: str, router_id: str):
-    require(os.geteuid() == 0, "must run as root on Belt")
+    require_root()
     require(ROUTER_ID.fullmatch(router_id) is not None, "invalid router ID")
     checkout(expected)
     for item in (CONFIG, DB, HOLD, SOURCE, ADAPTER, XRAY):
@@ -228,7 +232,7 @@ def ready_xray(attempts: int = 15) -> bool:
 
 def status(expected: str) -> dict:
     """Read-only approval gate, works before any seventh router is created."""
-    require(os.geteuid() == 0, "root required for Belt fleet status")
+    require_root()
     checkout(expected)
     for path in (CONFIG, DB, HOLD):
         check_regular(path)
@@ -403,7 +407,7 @@ def apply(router_id: str, expected: str, approved_candidate_sha: str):
 
 def rollback(confirm: bool):
     require(confirm, "rollback requires --confirm")
-    require(os.geteuid() == 0, "rollback requires root")
+    require_root()
     with transaction_lock():
         secure_transaction_dir()
         doc = read_journal()
