@@ -19763,18 +19763,20 @@ exit 127
                 self.send_json(403, {"ok": False, "error": "invalid origin"})
                 return
             try:
-                from transport_profiles import ProfileError, validate_profiles
+                from transport_profiles import validate_profiles
                 payload = self.read_payload()
-                rendered = validate_profiles(payload.get("profiles"))
-                # Never echo a REALITY private key or future authentication
-                # fields to HTML, error logs or persisted state.
-                for item in rendered:
-                    reality = item["streamSettings"].get("realitySettings")
-                    if reality:
-                        reality["privateKey"] = "[REDACTED]"
-                self.send_json(200, {"ok": True, "preview": rendered,
+                profiles = payload.get("profiles")
+                # Cheap local fail-closed check before requesting host adapter.
+                validate_profiles(profiles)
+                status = host_adapter_request("xray.current")
+                result = host_adapter_request(
+                    "xray.transport.preview",
+                    {"profiles": profiles, "expected_sha256": status["sha256"]},
+                )
+                self.send_json(200, {"ok": True, "preview": result["preview"],
+                                     "validated_by_xray": result["validated"],
                                      "applied": False, "restart_performed": False})
-            except (ValueError, TypeError, KeyError) as exc:
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
         if path == "/api/xray/reload":
