@@ -19,7 +19,8 @@ spec.loader.exec_module(host)
 class ReadonlyHostAdapterTests(unittest.TestCase):
     def exchange(self, adapter, request):
         """Exercise actual SO_PEERCRED over a Linux AF_UNIX socket pair."""
-        with socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) as (client, server):
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        with client, server:
             client.sendall(json.dumps(request).encode() + b"\n")
             self.assertTrue(adapter.serve_peer(server))
             data = client.recv(65536)
@@ -37,7 +38,8 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
 
     def test_peer_uid_rejected_before_json_is_read(self):
         adapter = host.Adapter(uid=os.geteuid() + 1)
-        with socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) as (client, server):
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        with client, server:
             client.sendall(b'{"op":"health"}\n')
             with patch.object(adapter, "handle") as handler:
                 self.assertFalse(adapter.serve_peer(server))
@@ -79,11 +81,13 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
 
     def test_empty_and_oversized_requests_are_bounded(self):
         adapter = host.Adapter(uid=os.geteuid())
-        with socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) as (client, server):
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        with client, server:
             client.sendall(b"\n")
             self.assertTrue(adapter.serve_peer(server))
             self.assertFalse(json.loads(client.recv(4096))["ok"])
-        with socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) as (client, server):
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        with client, server:
             # The request is larger than the socket buffer; consume it from
             # another thread to avoid deadlocking the test itself.
             results = []
