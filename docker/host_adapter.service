@@ -1,8 +1,9 @@
-# Systemd host-side service. This unit is not installed/enabled automatically.
+# Opt-in read-only host control service. NOT auto-installed or enabled.
+# Future Xray apply/restart requires a separately reviewed override.
 [Unit]
-Description=Router Orchestrator host control adapter (opt-in)
+Description=Router Orchestrator read-only host adapter
 After=network-online.target owrt-remote-xray.service
-ConditionPathExists=/opt/router-orchestrator/release/docker/host_adapter.py
+ConditionPathExists=/opt/router-orchestrator/host-adapter/host_adapter.py
 
 [Service]
 Type=simple
@@ -10,17 +11,29 @@ User=root
 Group=root
 RuntimeDirectory=router-orchestrator
 RuntimeDirectoryMode=0750
-ExecStart=/usr/bin/python3 /opt/router-orchestrator/release/docker/host_adapter.py --peer-uid 23088
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/host-adapter/host_adapter.py --peer-uid 23088
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectHome=true
-ProtectSystem=full
+ProtectSystem=strict
 ReadWritePaths=/run/router-orchestrator
-# Xray config mutation requires a separate reviewed override with
-# --allow-xray-apply AND ReadWritePaths=/etc/xray.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=true
+# CAP_CHOWN is needed to assign the UNIX socket group to UID 23088.
+# Deliberately not writable: /etc/xray and /var/lib/owrt-remote.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=
 # Never grant CAP_SYS_ADMIN or unrestricted shell execution.
+# Safe write integration will require an independently reviewed new unit.
 
 [Install]
 WantedBy=multi-user.target

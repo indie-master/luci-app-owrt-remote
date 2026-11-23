@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -233,6 +234,38 @@ def wait_xray(attempts=15):
         time.sleep(1)
     return False
 
+def clear_stale_socket(path):
+    """Safely recover a crash-left socket; never remove an active listener.
+
+    Called only after checking a root-owned, non-writable runtime directory.
+    """
+    path = Path(path)
+    try:
+        meta = path.lstat()
+    except FileNotFoundError:
+        return False
+    require(stat.S_ISSOCK(meta.st_mode) and meta.st_uid == os.geteuid(),
+            "existing control.sock is not an owned UNIX socket")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        try:
+            probe.connect(str(path))
+        except ConnectionRefusedError:
+            # A lingering bind inode after SIGKILL does not have a listener.
+            again = path.lstat()
+            require(again.st_ino == meta.st_ino and
+                    stat.S_ISSOCK(again.st_mode) and again.st_uid == meta.st_uid,
+                    "control.sock changed while checking stale socket")
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise Rejected("control.sock could not be verified idle") from exc
+        else:
+            raise Rejected("Host adapter already listening on control.sock")
+
+
 class Adapter:
     def __init__(self, path=SOCKET, uid=23088, allow_restart=False, allow_apply=False):
         self.path = Path(path)
@@ -349,14 +382,53 @@ class Adapter:
             return self.xray_apply(request)
         raise Rejected("unsupported operation")
 
+    def serve_peer(self, conn):
+        """One peer-credential authorized request, tested on real UNIX sockets.
+
+        Unauthorized UIDs receive no payload or sensitive error message.
+        The peer check is performed before reading even one JSON byte.
+        """
+        _pid, uid, _gid = struct.unpack("3i", conn.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED,
+            struct.calcsize("3i")))
+        if uid != self.uid:
+            return False
+        conn.settimeout(8)
+        try:
+            with conn.makefile("rb") as reader:
+                raw = reader.readline(MAX_REQUEST + 1)
+            require(raw.endswith(b"\n") and len(raw) <= MAX_REQUEST,
+                    "request too large or incomplete")
+            response = self.handle(json.loads(raw))
+        except (Rejected, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            response = {"ok": False, "error": str(exc)[:180]}
+        encoded = json.dumps(response, ensure_ascii=False).encode() + b"\n"
+        if len(encoded) > MAX_RESPONSE:
+            encoded = b'{"ok":false,"error":"response too large"}\n'
+        try:
+            conn.sendall(encoded)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            return False
+        return True
+
     def run(self):
-        self.path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-        require(not self.path.exists() and not self.path.is_symlink(),
-                "Refuse existing socket; review ownership before starting")
-        os.chown(self.path.parent, 0, self.uid)
-        os.chmod(self.path.parent, 0o750)
+        require(self.path == SOCKET, "Host adapter is restricted to its fixed UNIX socket")
+        parent = self.path.parent
+        require(parent.exists() and not parent.is_symlink(),
+                "systemd runtime directory missing/unsafe")
+        meta = parent.lstat()
+        require(stat.S_ISDIR(meta.st_mode) and meta.st_uid == 0
+                and not (stat.S_IMODE(meta.st_mode) & 0o022),
+                "runtime directory must be root-owned and not writable by group/others")
+        # The group can traverse the directory and access only this socket;
+        # it cannot unlink or replace a root-owned socket entry.
+        os.chown(parent, 0, self.uid)
+        os.chmod(parent, 0o750)
+        clear_stale_socket(self.path)
+        bound_inode = None
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(self.path))
+            bound_inode = self.path.lstat().st_ino
             os.chown(self.path, 0, self.uid)
             os.chmod(self.path, 0o660)
             server.listen(8)
@@ -364,24 +436,16 @@ class Adapter:
                 while True:
                     conn, _ = server.accept()
                     with conn:
-                        pid, uid, gid = struct.unpack("3i", conn.getsockopt(
-                            socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                        if uid != self.uid:
-                            continue
-                        conn.settimeout(8)
-                        try:
-                            with conn.makefile("rb") as reader:
-                                raw = reader.readline(MAX_REQUEST + 1)
-                            require(raw.endswith(b"\n") and len(raw) <= MAX_REQUEST,
-                                    "request too large or incomplete")
-                            response = self.handle(json.loads(raw))
-                        except (Rejected, OSError, ValueError, subprocess.TimeoutExpired) as exc:
-                            response = {"ok": False, "error": str(exc)[:180]}
-                        encoded = json.dumps(response, ensure_ascii=False).encode() + b"\n"
-                        if len(encoded) <= MAX_RESPONSE:
-                            conn.sendall(encoded)
+                        self.serve_peer(conn)
             finally:
-                self.path.unlink(missing_ok=True)
+                # Never unlink a socket replaced behind our back.
+                try:
+                    info = self.path.lstat()
+                    if stat.S_ISSOCK(info.st_mode) and info.st_ino == bound_inode:
+                        self.path.unlink()
+                except FileNotFoundError:
+                    pass
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
@@ -390,5 +454,7 @@ if __name__ == "__main__":
     p.add_argument("--allow-xray-restart", action="store_true")
     p.add_argument("--allow-xray-apply", action="store_true")
     args = p.parse_args()
+    require(Path(args.socket) == SOCKET, "custom socket paths are forbidden")
+    require(0 < args.peer_uid < 65535, "invalid HUB peer UID")
     require(os.geteuid() == 0, "Host adapter requires root service")
     Adapter(args.socket, args.peer_uid, args.allow_xray_restart, args.allow_xray_apply).run()
