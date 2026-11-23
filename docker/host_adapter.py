@@ -408,7 +408,7 @@ class Adapter:
         is used for syntax validation; actual router enrollment remains a
         separate guarded transaction.
         """
-        from transport_profiles import validate_profiles
+        from transport_profiles import validate_profiles, render_router_outbound
         profiles = request.get("profiles")
         require(isinstance(profiles, list) and len(profiles) == 1,
                 "preview accepts one candidate profile")
@@ -452,10 +452,15 @@ class Adapter:
         reality = safe["streamSettings"].get("realitySettings")
         if reality:
             reality["privateKey"] = "[REDACTED]"
-        return {"ok": True, "validated": True, "preview": [safe],
-                "xray_config_unchanged": True,
-                "restart_performed": False, "apply_performed": False,
-                "candidate_sha256": sha(data)}
+        response = {"ok": True, "validated": True, "preview": [safe],
+                    "xray_config_unchanged": True,
+                    "restart_performed": False, "apply_performed": False,
+                    "candidate_sha256": sha(data)}
+        if request.get("router_uuid"):
+            response["router_outbound"] = render_router_outbound(
+                profiles[0], router_uuid=request["router_uuid"],
+                remote_host=request.get("remote_host"))
+        return response
 
     def xray_restart(self):
         self.can_mutate(self.allow_restart)
