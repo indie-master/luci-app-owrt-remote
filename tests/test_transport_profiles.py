@@ -12,6 +12,7 @@ ProfileError = module.ProfileError
 SUPPORTED = module.SUPPORTED
 render_stream_settings = module.render_stream_settings
 validate_profiles = module.validate_profiles
+render_router_outbound = module.render_router_outbound
 
 
 def tls_profile(transport):
@@ -79,6 +80,39 @@ class TransportProfilesTest(unittest.TestCase):
         two = {"name": "second", "port": 18443, "transport": "tcp"}
         with self.assertRaises(ProfileError):
             validate_profiles([one, two])
+
+    def test_client_outbound_for_each_transport(self):
+        uid = "550e8400-e29b-41d4-a716-446655440000"
+        profiles = [{"transport": "tcp"}]
+        for transport in ("wss", "xhttp", "grpc"):
+            profiles.append(tls_profile(transport))
+        reality = {
+            "transport": "reality-tcp",
+            "server_name": "www.example.org",
+            "server_names": ["www.example.org"],
+            "target_host": "www.example.org", "target_port": 443,
+            "private_key": "PRIVATE_TEST_VALUE_NEVER_IN_CLIENT",
+            "public_key": "A" * 43,
+            "short_ids": ["aabb"]
+        }
+        profiles.append(reality)
+        for i, item in enumerate(profiles):
+            with self.subTest(transport=item["transport"]):
+                item["name"] = "test" + str(i)
+                item["port"] = 18450 + i
+                outbound = render_router_outbound(
+                    item, router_uuid=uid, remote_host="router.example.org"
+                )
+                self.assertEqual(outbound["settings"]["vnext"][0]["users"][0]["id"], uid)
+                self.assertEqual(outbound["settings"]["vnext"][0]["port"], 18450 + i)
+                self.assertNotIn("PRIVATE_TEST_VALUE_NEVER_IN_CLIENT", str(outbound))
+
+    def test_client_rejects_malformed_identity(self):
+        profile = {"name": "probe", "port": 18455, "transport": "tcp"}
+        with self.assertRaises(ProfileError):
+            render_router_outbound(
+                profile, router_uuid="not-a-uuid", remote_host="router.example.org"
+            )
 
     def test_no_mutation_of_input(self):
         data = tls_profile("grpc")
