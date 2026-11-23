@@ -34,6 +34,7 @@ class PilotTests(unittest.TestCase):
         stack.enter_context(patch.object(pilot, "secure_transaction_dir"))
         stack.enter_context(patch.object(pilot, "service_active", return_value=True))
         stack.enter_context(patch.object(pilot, "fleet_identity_digest", return_value="fleet"))
+        stack.enter_context(patch.object(pilot, "ensure_rescue_ready"))
         return stack
 
     def test_apply_creates_private_backup_and_pending_journal(self):
@@ -53,6 +54,41 @@ class PilotTests(unittest.TestCase):
                 restart.assert_called_once()
                 self.assertEqual((control / "xray-before.json").stat().st_mode & 0o777,
                                  0o600)
+
+    def test_live_apply_is_blocked_without_independent_rescue(self):
+        with tempfile.TemporaryDirectory() as td:
+            control, live, original, candidate = self.workspace(Path(td))
+            with self.patch_paths(control, live), \
+                 patch.object(pilot, "ensure_rescue_ready",
+                              side_effect=pilot.Blocked("independent rescue missing")), \
+                 patch.object(pilot, "preview") as preview, \
+                 patch.object(pilot, "restart_xray") as restart:
+                with self.assertRaisesRegex(pilot.Blocked, "independent rescue"):
+                    pilot.apply("new", "a" * 40, pilot.sha(candidate))
+                preview.assert_not_called()
+                restart.assert_not_called()
+                self.assertFalse((control / "transaction.json").exists())
+                self.assertEqual(live.read_bytes(), original)
+
+    def test_installed_rescue_must_match_reviewed_source(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "approved.py"
+            source.write_text("approved rescue code")
+            # Fake the metadata of the root-pinned executable; GitHub CI
+            # runs as an unprivileged user, but the production check must
+            # still require UID 0 and exact 0700 permissions.
+            binary = Mock()
+            binary.is_file.return_value = True
+            binary.is_symlink.return_value = False
+            binary.stat.return_value = SimpleNamespace(
+                st_uid=0, st_mode=0o100700)
+            binary.read_bytes.return_value = b"modified rescue code"
+            with patch.object(pilot, "RESCUE_SOURCE", source), \
+                 patch.object(pilot, "RESCUE_BIN", binary):
+                with self.assertRaisesRegex(pilot.Blocked, "differs"):
+                    pilot.ensure_rescue_ready()
 
     def test_reject_wrong_approved_candidate_hash_without_writes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -183,6 +219,8 @@ class PilotTests(unittest.TestCase):
                  patch.object(pilot, "HOLD", hold), \
                  patch.object(pilot, "UNIT", unit), \
                  patch.object(pilot, "JOURNAL", root / "absent"), \
+                 patch.object(pilot, "ensure_rescue_ready",
+                              side_effect=pilot.Blocked("not installed")), \
                  patch.object(pilot, "atomic_write") as write, \
                  patch.object(pilot, "restart_xray") as restart, \
                  patch.object(pilot, "save_journal") as journal:
@@ -190,11 +228,43 @@ class PilotTests(unittest.TestCase):
                 self.assertEqual((report["wss"], report["tcp"]), (5, 1))
                 self.assertEqual(report["active_count"], 6)
                 self.assertEqual(report["transaction"], "NONE")
+                self.assertFalse(report["rescue_ready"])
                 parity.assert_called_once()
                 self.assertTrue(hold.exists())
                 write.assert_not_called()
                 restart.assert_not_called()
                 journal.assert_not_called()
+
+    def test_status_reports_installed_rescue_without_updating_state(self):
+        report = {"active_count": 6, "wss": 5, "tcp": 1}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config, db, hold, unit = (root / name for name in
+                                      ("xray.json", "hub.db", ".hold", "adapter.service"))
+            config.write_text('{"inbounds":[]}')
+            db.touch()
+            hold.write_text("retained")
+            unit.write_text(
+                "ExecStart=python3 host_adapter.py --peer-uid 23088\n"
+                "ProtectSystem=strict\n"
+                "ReadWritePaths=/run/router-orchestrator\n")
+            with patch.object(pilot, "require_root"), \
+                 patch.object(pilot, "checkout"), \
+                 patch.object(pilot, "ensure_services"), \
+                 patch.object(pilot, "CONFIG", config), \
+                 patch.object(pilot, "DB", db), \
+                 patch.object(pilot, "HOLD", hold), \
+                 patch.object(pilot, "UNIT", unit), \
+                 patch.object(pilot, "JOURNAL", root / "absent"), \
+                 patch.object(pilot.gate, "db_inventory",
+                              return_value=report), \
+                 patch.object(pilot.gate, "xray_parity"), \
+                 patch.object(pilot, "ensure_rescue_ready") as rescue_ready, \
+                 patch.object(pilot, "restart_xray") as restart:
+                result = pilot.status("a" * 40)
+                self.assertTrue(result["rescue_ready"])
+                rescue_ready.assert_called_once()
+                restart.assert_not_called()
 
     def test_status_refuses_adapter_write_flags(self):
         import sqlite3

@@ -40,6 +40,8 @@ DB = Path("/var/lib/owrt-remote/hub.db")
 HOLD = Path("/var/lib/owrt-remote/.xray-maintenance-hold")
 SOURCE = REPO / "vps/owrt-remote-hub.py"
 ADAPTER = REPO / "docker/host_adapter.py"
+RESCUE_SOURCE = REPO / "tools/orchestrator_wss_emergency_rescue.py"
+RESCUE_BIN = Path("/usr/local/sbin/router-orchestrator-wss-rescue")
 XRAY = Path("/usr/local/bin/xray")
 XRAY_SERVICE = "owrt-remote-xray.service"
 HUB_SERVICE = "owrt-remote.service"
@@ -102,6 +104,17 @@ def checkout(expected: str):
                            text=True, timeout=8, check=False)
     require(dirty.returncode == 0 and not dirty.stdout.strip(),
             "Git checkout contains unreviewed changes")
+
+
+def ensure_rescue_ready():
+    """Fail closed unless a reviewed independent emergency copy is installed."""
+    check_regular(RESCUE_SOURCE)
+    check_regular(RESCUE_BIN)
+    st = RESCUE_BIN.stat()
+    require(st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700,
+            "installed emergency rescue must be root-owned and mode 0700")
+    require(sha(RESCUE_SOURCE.read_bytes()) == sha(RESCUE_BIN.read_bytes()),
+            "independent rescue differs from approved Git version")
 
 
 def preconditions(expected: str, router_id: str):
@@ -264,9 +277,18 @@ def status(expected: str) -> dict:
     phase = "NONE"
     if JOURNAL.exists() or JOURNAL.is_symlink():
         phase = read_journal()["state"]
+    # Status remains read-only. Distinguish healthy current fleet from a
+    # fully ARMED emergency rollback path before any Xray restart.
+    try:
+        ensure_rescue_ready()
+    except (Blocked, OSError):
+        rescue_ready = False
+    else:
+        rescue_ready = True
     return {"tcp": inventory["tcp"], "wss": inventory["wss"],
             "active_count": inventory["active_count"],
-            "xray_sha": sha(CONFIG.read_bytes()), "transaction": phase}
+            "xray_sha": sha(CONFIG.read_bytes()), "transaction": phase,
+            "rescue_ready": rescue_ready}
 
 
 def preview(router_id: str, expected: str) -> dict:
@@ -369,6 +391,7 @@ def apply(router_id: str, expected: str, approved_candidate_sha: str):
     require(SHA.fullmatch(approved_candidate_sha) is not None,
             "explicit candidate SHA256 is required")
     with transaction_lock():
+        ensure_rescue_ready()
         stage = preview(router_id, expected)
         require(stage["candidate_sha"] == approved_candidate_sha,
                 "candidate differs from reviewed preview SHA256")
@@ -451,6 +474,9 @@ def main():
             print("FLEET: {active_count} active | WSS={wss} TCP={tcp}".format(**result))
             print("XRAY SHA256:", result["xray_sha"])
             print("TRANSACTION:", result["transaction"])
+            print("INDEPENDENT RESCUE:",
+                  "PINNED_OK" if result["rescue_ready"]
+                  else "NOT_INSTALLED_OR_UNVERIFIED")
             print("HOST: systemd HUB/Xray active; adapter is read-only")
             print("NO CHANGE: status did not create files or restart services")
         elif args.mode == "preview":
