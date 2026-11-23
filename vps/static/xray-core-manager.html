@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Router Orchestrator · Xray Core Manager</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui,sans-serif;background:#10151d;color:#eef1f7}
+*{box-sizing:border-box}body{max-width:980px;margin:0 auto;padding:24px}a{color:#9bbfff}
+.panel{background:#19232f;border:1px solid #364457;border-radius:12px;padding:20px;margin:18px 0}
+h1{font-size:24px}h2{font-size:18px}.muted{color:#a2afbf}
+button,select{background:#294974;color:#fff;border:1px solid #53677f;padding:11px;border-radius:8px;font:inherit}
+button{cursor:pointer}button.danger{background:#5f3037}button:disabled{opacity:.45}
+.actions{display:flex;flex-wrap:wrap;gap:9px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c121b;padding:16px;border-radius:8px}
+.warning{border-left:3px solid #e9ae59;background:#2b261d;padding:12px 16px}
+</style></head>
+<body data-csrf="__CSRF_TOKEN__">
+<a href="/">← Router Orchestrator</a>
+<h1>Xray Core Manager</h1>
+<div class="warning">Обновления ядра нарушают активные туннели на короткое время. Перед обновлением сохраняется предыдущий образ; новый считается исправным только после проверки heartbeat и SSH ранее активных роутеров. Для критичной инфраструктуры сначала проверь совместимость на пилотном роутере.</div>
+<section class="panel">
+<h2>Текущее состояние</h2><p id="running" class="muted">Загрузка…</p>
+<div class="actions"><button id="refresh">Обновить сведения</button><button class="danger" data-action="restart">Перезапустить Xray</button><button class="danger" data-action="rollback">Откатить ядро</button></div>
+</section>
+<section class="panel">
+<h2>Стабильные выпуски</h2>
+<p>Предварительные релизы не предлагаются. Образ скачивается из официального GHCR, проверяется с действующим конфигом и закрепляется по digest.</p>
+<select id="version" aria-label="Стабильная версия Xray"><option value="">Загрузка версий…</option></select>
+<div class="actions" style="margin-top:14px">
+<button data-action="prepare">Подготовить образ</button>
+<button class="danger" data-action="upgrade" disabled id="upgrade">Установить подготовленную версию</button>
+</div>
+</section>
+<section class="panel"><h2>Операция</h2><pre id="job" aria-live="polite">Операций нет.</pre></section>
+<script>
+const csrf=document.body.dataset.csrf, version=document.getElementById('version'),job=document.getElementById('job'),info=document.getElementById('running'),upgrade=document.getElementById('upgrade');
+let currentJob=null, preparedVersion=null;
+async function api(path,options){const r=await fetch(path,Object.assign({credentials:'same-origin'},options||{}));let data;try{data=await r.json()}catch{throw Error('Сервер вернул не-JSON ответ')}if(!r.ok||!data.ok)throw Error(data.error||'Ошибка');return data}
+async function refresh(){
+ try{
+  const status=await api('/api/xray/core/info');
+  info.textContent=(status.active?'Работает':'Недоступен')+' · '+(status.image||'неизвестный образ');
+  const data=await api('/api/xray/core/versions');
+  version.replaceChildren();
+  for(const tag of data.versions){const o=document.createElement('option');o.value=tag;o.textContent=tag;version.appendChild(o)}
+ }catch(e){info.textContent=String(e.message||e)}
+}
+async function watch(id){
+ currentJob=id;
+ for(let i=0;i<120;i++){
+  try{
+   const data=await api('/api/xray/core/job/'+encodeURIComponent(id));
+   const state=data.job;
+   job.textContent=JSON.stringify(state,null,2);
+   if(['success','failed'].includes(state.status)){
+    if(state.status==='success' && state.action==='prepare'){
+     preparedVersion=state.version;upgrade.disabled=version.value!==preparedVersion;
+    }
+    await refreshStatus();return;
+   }
+  }catch(e){job.textContent=String(e.message||e);return}
+  await new Promise(resolve=>setTimeout(resolve,2000));
+ }
+ job.textContent='Задание продолжается. Обнови страницу и проверь его статус позднее.';
+}
+async function refreshStatus(){
+ try{const r=await api('/api/xray/core/info');info.textContent=(r.active?'Работает':'Недоступен')+' · '+(r.image||'неизвестный образ')}catch(e){info.textContent=e.message}
+}
+document.getElementById('refresh').onclick=refresh;
+version.onchange=()=>{upgrade.disabled=version.value!==preparedVersion};
+document.querySelectorAll('[data-action]').forEach(button=>button.onclick=async()=>{
+ const action=button.dataset.action,v=version.value;
+ if((action==='prepare'||action==='upgrade')&&!v)return;
+ if(action==='upgrade' && preparedVersion!==v)return;
+ if(action!=='prepare'&&!confirm('Подтвердить действие: '+action+'? Активные соединения могут прерваться.'))return;
+ for(const el of document.querySelectorAll('button'))el.disabled=true;
+ try{
+  const result=await api('/api/xray/core/start',{method:'POST',headers:{'Content-Type':'application/json','X-Core-Action-CSRF':csrf},body:JSON.stringify({action,version:(action==='prepare'||action==='upgrade')?v:''})});
+  job.textContent='Операция запущена: '+result.job_id;await watch(result.job_id);
+ }catch(e){job.textContent=String(e.message||e)}
+ finally{for(const el of document.querySelectorAll('button'))el.disabled=false;upgrade.disabled=preparedVersion!==version.value}
+});
+refresh();
+</script></body></html>
