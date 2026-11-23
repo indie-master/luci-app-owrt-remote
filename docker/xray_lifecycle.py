@@ -194,7 +194,8 @@ def canary_confirmed(database, baseline, since):
 
 
 def wait_canary(database, baseline, since):
-    for _ in range(120):
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
         if canary_confirmed(database, baseline, since):
             return True
         time.sleep(1)
