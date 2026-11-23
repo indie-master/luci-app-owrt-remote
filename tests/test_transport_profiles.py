@@ -1,9 +1,17 @@
 """Offline tests: no Xray process, Docker daemon or production sockets."""
 import unittest
 
-from docker.transport_profiles import (
-    ProfileError, SUPPORTED, render_stream_settings, validate_profiles,
-)
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+
+module_path = Path(__file__).resolve().parents[1] / "docker" / "transport_profiles.py"
+spec = spec_from_file_location("transport_profiles", module_path)
+module = module_from_spec(spec)
+spec.loader.exec_module(module)
+ProfileError = module.ProfileError
+SUPPORTED = module.SUPPORTED
+render_stream_settings = module.render_stream_settings
+validate_profiles = module.validate_profiles
 
 
 def tls_profile(transport):
