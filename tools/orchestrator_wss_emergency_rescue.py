@@ -69,7 +69,7 @@ def secure_file(path: Path, *, private: bool = False):
     return entry
 
 
-def secure_parent(path: Path, *, private: bool):
+def secure_parent(path: Path, *, private: bool, allow_sticky: bool = False):
     try:
         entry = path.lstat()
     except FileNotFoundError as exc:
@@ -77,8 +77,14 @@ def secure_parent(path: Path, *, private: bool):
     require(stat.S_ISDIR(entry.st_mode) and entry.st_uid == 0,
             "rescue directory is not root-owned or is symlink")
     mode = stat.S_IMODE(entry.st_mode)
-    require((mode & 0o077) == 0 if private else (mode & 0o022) == 0,
-            "rescue directory is writable by an untrusted user")
+    if private:
+        require((mode & 0o077) == 0,
+                "private rescue directory has unsafe permissions")
+    else:
+        require((mode & 0o022) == 0 or
+                (allow_sticky and (mode & stat.S_ISVTX) and
+                 not (mode & 0o020 and not (mode & stat.S_ISVTX))),
+                "rescue directory is writable by an untrusted user")
 
 
 def inspected_journal() -> dict:
@@ -176,9 +182,12 @@ def restart_xray():
 
 @contextlib.contextmanager
 def exclusive():
-    secure_parent(LOCK.parent, private=False)
+    secure_parent(LOCK.parent, private=False, allow_sticky=True)
     fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
+        entry = os.fstat(fd)
+        require(stat.S_ISREG(entry.st_mode) and entry.st_uid == 0,
+                "existing deployment lock is not root-owned")
         os.fchmod(fd, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
