@@ -219,6 +219,8 @@ class PilotTests(unittest.TestCase):
                  patch.object(pilot, "HOLD", hold), \
                  patch.object(pilot, "UNIT", unit), \
                  patch.object(pilot, "JOURNAL", root / "absent"), \
+                 patch.object(pilot, "ensure_rescue_ready",
+                              side_effect=pilot.Blocked("not installed")), \
                  patch.object(pilot, "atomic_write") as write, \
                  patch.object(pilot, "restart_xray") as restart, \
                  patch.object(pilot, "save_journal") as journal:
@@ -226,11 +228,43 @@ class PilotTests(unittest.TestCase):
                 self.assertEqual((report["wss"], report["tcp"]), (5, 1))
                 self.assertEqual(report["active_count"], 6)
                 self.assertEqual(report["transaction"], "NONE")
+                self.assertFalse(report["rescue_ready"])
                 parity.assert_called_once()
                 self.assertTrue(hold.exists())
                 write.assert_not_called()
                 restart.assert_not_called()
                 journal.assert_not_called()
+
+    def test_status_reports_installed_rescue_without_updating_state(self):
+        report = {"active_count": 6, "wss": 5, "tcp": 1}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config, db, hold, unit = (root / name for name in
+                                      ("xray.json", "hub.db", ".hold", "adapter.service"))
+            config.write_text('{"inbounds":[]}')
+            db.touch()
+            hold.write_text("retained")
+            unit.write_text(
+                "ExecStart=python3 host_adapter.py --peer-uid 23088\n"
+                "ProtectSystem=strict\n"
+                "ReadWritePaths=/run/router-orchestrator\n")
+            with patch.object(pilot, "require_root"), \
+                 patch.object(pilot, "checkout"), \
+                 patch.object(pilot, "ensure_services"), \
+                 patch.object(pilot, "CONFIG", config), \
+                 patch.object(pilot, "DB", db), \
+                 patch.object(pilot, "HOLD", hold), \
+                 patch.object(pilot, "UNIT", unit), \
+                 patch.object(pilot, "JOURNAL", root / "absent"), \
+                 patch.object(pilot.gate, "db_inventory",
+                              return_value=report), \
+                 patch.object(pilot.gate, "xray_parity"), \
+                 patch.object(pilot, "ensure_rescue_ready") as rescue_ready, \
+                 patch.object(pilot, "restart_xray") as restart:
+                result = pilot.status("a" * 40)
+                self.assertTrue(result["rescue_ready"])
+                rescue_ready.assert_called_once()
+                restart.assert_not_called()
 
     def test_status_refuses_adapter_write_flags(self):
         import sqlite3
