@@ -134,6 +134,24 @@ def _import_module(path: Path, name: str):
     return module
 
 
+def fleet_identity_digest(path: Path) -> str:
+    """Stable credential/transport fingerprint, ignoring live heartbeat rows.
+
+    A new or modified router after SQLite snapshot invalidates the pilot.
+    No identifiers, UUIDs or tokens are printed.
+    """
+    check_regular(path)
+    with contextlib.closing(sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)) as db:
+        rows = db.execute(
+            "select id,vless_uuid,ssh_vless_uuid,entry_port,ssh_entry_port,"
+            "vps_transport,vless_port,vps_allow_legacy,deleted_at "
+            "from routers order by id"
+        ).fetchall()
+    return sha(json.dumps(rows, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode())
+
+
 def snapshot_inventory(db: Path, tmp: Path):
     """The production database is opened read-only, not mutated."""
     snapshot = tmp / "hub.db"
@@ -239,13 +257,16 @@ def status(expected: str) -> dict:
 def preview(router_id: str, expected: str) -> dict:
     preconditions(expected, router_id)
     original = CONFIG.read_bytes()
+    fleet_before = fleet_identity_digest(DB)
     candidate = build_candidate(router_id, original)
     syntax_test(candidate)
     require(sha(CONFIG.read_bytes()) == sha(original),
             "host Xray changed while building preview")
+    require(fleet_identity_digest(DB) == fleet_before,
+            "HUB router identities changed while building preview")
     return {"router_id": router_id, "current_sha": sha(original),
             "candidate_sha": sha(candidate), "candidate": candidate,
-            "original": original}
+            "fleet_sha": fleet_before, "original": original}
 
 
 def secure_transaction_dir():
@@ -259,6 +280,10 @@ def secure_transaction_dir():
 
 
 def atomic_write(path: Path, data: bytes, *, preserve_from: Path | None = None):
+    if preserve_from is not None:
+        check_regular(preserve_from)
+        require(preserve_from.stat().st_uid == os.geteuid(),
+                "config target must belong to executing root user")
     fd, temp = tempfile.mkstemp(prefix=".pilot-", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -303,6 +328,7 @@ def restart_xray():
 
 
 def rollback_locked(doc: dict):
+    check_regular(CONFIG)
     check_regular(BACKUP)
     original = BACKUP.read_bytes()
     require(sha(original) == doc["original_sha"],
@@ -333,6 +359,8 @@ def apply(router_id: str, expected: str, approved_candidate_sha: str):
                 "candidate differs from reviewed preview SHA256")
         require(sha(CONFIG.read_bytes()) == stage["current_sha"],
                 "Xray config changed before commit")
+        require(fleet_identity_digest(DB) == stage["fleet_sha"],
+                "HUB router fleet changed before commit")
         secure_transaction_dir()
         require(not BACKUP.exists() and not JOURNAL.exists(),
                 "pilot artifacts already exist; refuse overwrite")
@@ -350,6 +378,8 @@ def apply(router_id: str, expected: str, approved_candidate_sha: str):
         try:
             require(sha(CONFIG.read_bytes()) == doc["original_sha"],
                     "Xray config changed during transaction staging")
+            require(fleet_identity_digest(DB) == stage["fleet_sha"],
+                    "HUB router fleet changed during staging")
             doc["state"] = "APPLYING"
             save_journal(doc)
             atomic_write(CONFIG, stage["candidate"], preserve_from=CONFIG)
