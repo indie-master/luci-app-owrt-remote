@@ -19771,9 +19771,12 @@ exit 127
                 status = host_adapter_request("xray.current")
                 result = host_adapter_request(
                     "xray.transport.preview",
-                    {"profiles": profiles, "expected_sha256": status["sha256"]},
+                    {"profiles": profiles, "expected_sha256": status["sha256"],
+                     "router_uuid": payload.get("router_uuid") or "",
+                     "remote_host": payload.get("remote_host") or ""},
                 )
                 self.send_json(200, {"ok": True, "preview": result["preview"],
+                                     "router_outbound": result.get("router_outbound"),
                                      "validated_by_xray": result["validated"],
                                      "applied": False, "restart_performed": False})
             except (ValueError, TypeError, KeyError, RuntimeError) as exc:
