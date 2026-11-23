@@ -1,0 +1,22 @@
+[Unit]
+Description=Router Orchestrator Xray Core Manager job %i
+After=docker.service router-orchestrator-host-adapter.service
+Requires=docker.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/src/docker/core_job_runner.py %i
+RuntimeMaxSec=950
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/xray /opt/router-orchestrator/data /run/docker.sock /var/run/docker.sock
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
