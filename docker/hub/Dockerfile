@@ -11,6 +11,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 COPY docker/hub/requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir -r /tmp/requirements.lock
 COPY vps/owrt-remote-hub.py /opt/owrt-remote/owrt-remote-hub.py
+COPY docker/transport_profiles.py /opt/owrt-remote/transport_profiles.py
 RUN test -n "$HUB_SOURCE_SHA256" && \
     printf '%s  %s\n' "$HUB_SOURCE_SHA256" /opt/owrt-remote/owrt-remote-hub.py | sha256sum -c -
 COPY vps/static/ /opt/owrt-remote/static/
