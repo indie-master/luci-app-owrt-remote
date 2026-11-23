@@ -154,15 +154,22 @@ def main():
                 "Xray container ID changed unexpectedly; refusing cutover")
 
         # The new HUB must access the credential-scoped adapter socket.
-        probe = (
-            "import socket,json;"
-            "s=socket.socket(socket.AF_UNIX);"
-            "s.settimeout(5);s.connect('/run/router-orchestrator/control.sock');"
-            "s.sendall(b'{\\\"op\\\":\\\"xray.core.info\\\"}\\n');"
-            "data=b'';"
-            "\nwhile not data.endswith(b'\\n'):\n data+=s.recv(4096)"
-            "\nr=json.loads(data);assert r.get('ok') and r.get('active')"
-        )
+        probe = r"""
+import json
+import socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.settimeout(5)
+    sock.connect("/run/router-orchestrator/control.sock")
+    sock.sendall((json.dumps({"op": "xray.core.info"}) + "\n").encode())
+    content = b""
+    while not content.endswith(b"\n"):
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("socket connection closed")
+        content += chunk
+reply = json.loads(content)
+assert reply.get("ok") is True and reply.get("active") is True
+"""
         result = run("docker", "exec", "router-orchestrator-hub",
                      "python", "-c", probe, timeout=20)
         require(result.returncode == 0, "new HUB cannot reach Xray host adapter")
