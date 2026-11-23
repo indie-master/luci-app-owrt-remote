@@ -1,26 +1,56 @@
-name: Router transport profiles
+name: Router Orchestrator unified Docker checks
 
 on:
   pull_request:
     paths:
-      - 'docker/transport_profiles.py'
+      - 'docker/**'
+      - 'deploy/**'
+      - 'vps/**'
       - 'tests/test_transport_profiles.py'
       - '.github/workflows/transport-profiles.yml'
+  push:
+    branches:
+      - 'feature/router-orchestrator-unified-docker-transports-20261123'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  offline-tests:
+  offline-validation:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Compile and test pure renderer
+      - name: Syntax check production modules
         run: |
-          python -m py_compile docker/transport_profiles.py tests/test_transport_profiles.py
-          python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
+          python -m py_compile vps/owrt-remote-hub.py docker/host_adapter.py docker/transport_profiles.py docker/xray_lifecycle.py
+          python -m py_compile tests/test_transport_profiles.py
+      - name: Pure transport tests
+        run: python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
+      - name: Validate embedded nginx configuration
+        run: |
+          docker run --rm -v "$PWD/deploy/nginx/embedded.conf:/etc/nginx/nginx.conf:ro" nginx:1.29-alpine nginx -t
+      - name: Validate consolidated Compose
+        env:
+          RO_HUB_IMAGE: router-orchestrator-hub:test
+          RO_XRAY_IMAGE: router-orchestrator-xray:26.3.27-test
+          RO_PUBLIC_URL: https://router.example.org
+          RO_STATE_DIR: /tmp/router-orchestrator-state
+          RO_TERMINAL_KEY_PATH: /tmp/router-orchestrator-key
+          RO_TERMINAL_KNOWN_HOSTS: /tmp/router-orchestrator-known
+          RO_NGINX_CONF: /tmp/router-orchestrator-nginx.conf
+          RO_TLS_DIR: /tmp/router-orchestrator-tls
+        run: |
+          docker compose -f deploy/docker-compose.yml config --quiet
+          test "$(docker compose -f deploy/docker-compose.yml config --services | sort | tr '\n' ' ')" = "hub nginx xray "
+      - name: Build portable HUB image
+        run: |
+          SHA=$(sha256sum vps/owrt-remote-hub.py | awk '{print $1}')
+          docker build --file docker/hub/Dockerfile --build-arg HUB_SOURCE_SHA256="$SHA" -t router-orchestrator-hub:ci .
+      - name: Validate WoL helper in image
+        run: |
+          test "$(docker run --rm --entrypoint /opt/owrt-remote/bin/askpass.sh -e OWRT_REMOTE_SSH_PASSWORD=TEST_TOKEN_ONLY router-orchestrator-hub:ci)" = TEST_TOKEN_ONLY
