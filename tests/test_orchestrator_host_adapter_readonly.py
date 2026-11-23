@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -83,9 +84,17 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
             self.assertTrue(adapter.serve_peer(server))
             self.assertFalse(json.loads(client.recv(4096))["ok"])
         with socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) as (client, server):
+            # The request is larger than the socket buffer; consume it from
+            # another thread to avoid deadlocking the test itself.
+            results = []
+            thread = threading.Thread(
+                target=lambda: results.append(adapter.serve_peer(server)))
+            thread.start()
             client.sendall(b"x" * (host.MAX_REQUEST + 10) + b"\n")
-            self.assertTrue(adapter.serve_peer(server))
             self.assertFalse(json.loads(client.recv(4096))["ok"])
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results, [True])
 
     def test_crash_left_socket_can_be_recovered(self):
         with tempfile.TemporaryDirectory() as td:
@@ -117,6 +126,11 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(host.Rejected, "not an owned UNIX socket"):
                 host.clear_stale_socket(link)
             self.assertEqual(target.read_text(), "do not touch")
+
+    def test_privileged_daemon_executes_from_pinned_path(self):
+        unit = (ROOT / "docker/host_adapter.service").read_text()
+        self.assertIn("/opt/router-orchestrator/host-adapter/host_adapter.py", unit)
+        self.assertNotIn("/opt/router-orchestrator/release/docker/host_adapter.py", unit)
 
     def test_unit_remains_readonly_without_host_xray_write_access(self):
         text = (ROOT / "docker/host_adapter.service").read_text()
