@@ -44,12 +44,11 @@ git cat-file -e "$PREVIOUS:docker/host_adapter.py" ||
   fail "Reviewed previous adapter Git source is not available"
 cmp -s "$PINNED" <(git show "$PREVIOUS:docker/host_adapter.py") ||
   fail "Installed adapter differs from approved previous release"
+[[ "$(sha256sum docker/host_adapter.py | awk '{print $1}')" != \
+   "$(sha256sum "$PINNED" | awk '{print $1}')" ]] ||
+  fail "Candidate adapter already installed; nothing to upgrade"
 
 python3 -m py_compile docker/host_adapter.py
-python3 tools/orchestrator_host_adapter_readonly_acceptance.py \
-  preflight --expect-commit "$EXPECTED" >/dev/null 2>&1 && \
-  fail "New source was already active; refuse ambiguous upgrade" || true
-
 BEFORE="$(sha256sum "$XRAY" | awk '{print $1}')"
 PARENT="$(dirname "$PINNED")"
 BACKUP="$PARENT/host_adapter.py.before-preview-$PREVIOUS"
