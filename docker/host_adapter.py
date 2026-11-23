@@ -475,7 +475,7 @@ class Adapter:
         version = request.get("version") or ""
         if action in ("prepare", "upgrade"):
             require(isinstance(version, str) and
-                    re.fullmatch(r"v[0-9]{1,4}\\.[0-9]{1,3}\\.[0-9]{1,3}", version),
+                    re.fullmatch(r"v[0-9]{1,4}\.[0-9]{1,3}\.[0-9]{1,3}", version),
                     "invalid stable release version")
         else:
             require(not version, "version is not used for this action")
@@ -502,7 +502,7 @@ class Adapter:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(fd, "w") as stream:
             json.dump(record, stream)
-            stream.write("\\n")
+            stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         unit = "router-orchestrator-core-job@" + job_id + ".service"
