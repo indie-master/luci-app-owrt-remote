@@ -3,7 +3,7 @@
 [Unit]
 Description=Router Orchestrator read-only host adapter
 After=network-online.target owrt-remote-xray.service
-ConditionPathExists=/opt/router-orchestrator/release/docker/host_adapter.py
+ConditionPathExists=/opt/router-orchestrator/host-adapter/host_adapter.py
 
 [Service]
 Type=simple
@@ -12,7 +12,7 @@ Group=root
 RuntimeDirectory=router-orchestrator
 RuntimeDirectoryMode=0750
 UMask=0077
-ExecStart=/usr/bin/python3 /opt/router-orchestrator/release/docker/host_adapter.py --peer-uid 23088
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/host-adapter/host_adapter.py --peer-uid 23088
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
