@@ -59,7 +59,8 @@ def import_checked_module(name: str, path: Path):
     return module
 
 
-def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
+def preview(snapshot: Path, expected_commit: str, backup_root: Path,
+            *, live_validator=None) -> dict:
     require(os.geteuid() == 0, "run as root on Belt")
     candidate.verify_private_parent(backup_root)
     candidate.verify_checkout(expected_commit)
@@ -159,6 +160,11 @@ def preview(snapshot: Path, expected_commit: str, backup_root: Path) -> dict:
                 xray, new_rows, expected_new_id=synthetic_id)
         phase = "synthetic.xray.transition"
         adapter.validate_transition(xray, generated)
+        if live_validator is not None:
+            # Optional supervised cross-check through the read-only host
+            # adapter. No host Xray mutation or router enrollment occurs.
+            phase = "synthetic.live.xray-test"
+            live_validator(generated, gate.file_sha(live_xray), synthetic_id)
 
         phase = "synthetic.postcheck"
         after = gate.db_inventory(state / "hub.db")

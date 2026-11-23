@@ -286,6 +286,49 @@ class Adapter:
         require(len(data) <= MAX_REQUEST - 4096, "Xray config exceeds response limit")
         return {"ok": True, "config": json.loads(data), "sha256": sha(data)}
 
+    def xray_preview(self, request):
+        """Validate one WSS addition without changing host Xray or services.
+
+        Xray's own -test runs against a 0600 temporary file under the
+        systemd-confined /run/router-orchestrator directory. The temp file is
+        always removed. No write-enable flag or maintenance-hold removal is
+        necessary for a preview.
+        """
+        original = CONFIG.read_bytes()
+        expected = request.get("expected_sha256")
+        require(isinstance(expected, str) and expected == sha(original),
+                "Xray config changed since candidate was generated")
+        candidate = request.get("config")
+        validate_transition(json.loads(original), candidate)
+        require(json.loads(original) != candidate,
+                "preview requires exactly one new WSS router")
+        data = (json.dumps(candidate, ensure_ascii=False,
+                           separators=(",", ":")) + "\n").encode()
+        require(len(data) < MAX_REQUEST - 4096, "Xray preview exceeds request limit")
+        directory = SOCKET.parent
+        require(directory.is_dir() and not directory.is_symlink(),
+                "host adapter runtime directory missing")
+        fd, temp = tempfile.mkstemp(prefix=".ro-preview-", suffix=".json",
+                                    dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(data)
+                stream.flush()
+            tested = subprocess.run(
+                [BINARY, "run", "-test", "-config", temp],
+                capture_output=True, timeout=25, check=False)
+            require(tested.returncode == 0,
+                    "Xray rejected the new WSS candidate during -test")
+        finally:
+            Path(temp).unlink(missing_ok=True)
+        require(sha(CONFIG.read_bytes()) == expected,
+                "host Xray config changed while preview was running")
+        return {"ok": True, "validated": True, "service": SERVICE,
+                "xray_config_unchanged": True,
+                "restart_performed": False, "apply_performed": False,
+                "candidate_sha256": sha(data)}
+
     def xray_restart(self):
         self.can_mutate(self.allow_restart)
         require(systemctl("restart").returncode == 0 and wait_xray(),
@@ -376,6 +419,8 @@ class Adapter:
             return {"ok": True, "active": active_xray(), "service": SERVICE}
         if op == "xray.current":
             return self.current()
+        if op == "xray.preview":
+            return self.xray_preview(request)
         if op == "xray.restart":
             return self.xray_restart()
         if op == "xray.apply":

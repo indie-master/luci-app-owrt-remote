@@ -73,6 +73,92 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
             service.assert_not_called()
             files.assert_not_called()
 
+    def test_additive_xray_preview_runs_xray_test_without_host_write(self):
+        from test_orchestrator_docker_runtime import DockerRuntimeContracts
+        old, new = DockerRuntimeContracts.sample_new_wss_config()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live = root / "live.json"
+            live.write_text(json.dumps(old))
+            before = live.read_bytes()
+            adapter = host.Adapter(uid=os.geteuid())
+            with patch.object(host, "CONFIG", live), \
+                 patch.object(host, "SOCKET", root / "control.sock"), \
+                 patch.object(host.subprocess, "run") as subprocess_mock, \
+                 patch.object(host, "systemctl") as service, \
+                 patch.object(host, "atomic_replace") as write:
+                subprocess_mock.return_value.returncode = 0
+                response = self.exchange(adapter, {
+                    "op": "xray.preview", "expected_sha256": host.sha(before),
+                    "config": new})
+                self.assertTrue(response["ok"])
+                self.assertTrue(response["validated"])
+                self.assertTrue(response["xray_config_unchanged"])
+                self.assertFalse(response["restart_performed"])
+                self.assertFalse(response["apply_performed"])
+                args = subprocess_mock.call_args.args[0]
+                self.assertEqual(args[:4], [host.BINARY, "run", "-test", "-config"])
+                self.assertEqual(Path(args[4]).parent, root)
+                service.assert_not_called()
+                write.assert_not_called()
+            self.assertEqual(live.read_bytes(), before)
+            self.assertEqual(list(root.glob(".ro-preview-*")), [])
+
+    def test_xray_preview_rejects_stale_hash_before_running_core(self):
+        from test_orchestrator_docker_runtime import DockerRuntimeContracts
+        old, new = DockerRuntimeContracts.sample_new_wss_config()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live = root / "live.json"
+            live.write_text(json.dumps(old))
+            adapter = host.Adapter(uid=os.geteuid())
+            with patch.object(host, "CONFIG", live), \
+                 patch.object(host, "SOCKET", root / "control.sock"), \
+                 patch.object(host.subprocess, "run") as core:
+                result = self.exchange(adapter, {
+                    "op": "xray.preview", "expected_sha256": "0" * 64,
+                    "config": new})
+                self.assertFalse(result["ok"])
+                core.assert_not_called()
+
+    def test_xray_preview_rejects_mutated_existing_uuid(self):
+        from test_orchestrator_docker_runtime import DockerRuntimeContracts
+        old, new = DockerRuntimeContracts.sample_new_wss_config()
+        new["inbounds"][1]["settings"]["clients"][0]["id"] = "tampered"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live = root / "live.json"
+            live.write_text(json.dumps(old))
+            adapter = host.Adapter(uid=os.geteuid())
+            with patch.object(host, "CONFIG", live), \
+                 patch.object(host, "SOCKET", root / "control.sock"), \
+                 patch.object(host.subprocess, "run") as core:
+                result = self.exchange(adapter, {
+                    "op": "xray.preview", "expected_sha256": host.sha(live.read_bytes()),
+                    "config": new})
+                self.assertFalse(result["ok"])
+                core.assert_not_called()
+
+    def test_xray_preview_failure_cleans_temporary_candidate(self):
+        from test_orchestrator_docker_runtime import DockerRuntimeContracts
+        old, new = DockerRuntimeContracts.sample_new_wss_config()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            live = root / "live.json"
+            live.write_text(json.dumps(old))
+            before = live.read_bytes()
+            adapter = host.Adapter(uid=os.geteuid())
+            with patch.object(host, "CONFIG", live), \
+                 patch.object(host, "SOCKET", root / "control.sock"), \
+                 patch.object(host.subprocess, "run") as core:
+                core.return_value.returncode = 1
+                result = self.exchange(adapter, {
+                    "op": "xray.preview", "expected_sha256": host.sha(before),
+                    "config": new})
+            self.assertFalse(result["ok"])
+            self.assertEqual(list(root.glob(".ro-preview-*")), [])
+            self.assertEqual(live.read_bytes(), before)
+
     def test_unknown_operation_rejected(self):
         adapter = host.Adapter(uid=os.geteuid())
         response = self.exchange(adapter, {"op": "shell.exec", "command": "id"})
