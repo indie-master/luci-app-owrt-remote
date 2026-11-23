@@ -137,10 +137,10 @@ def main():
                 "new adapter inactive")
 
         print("===== INSTALL SINGLE COMPOSE =====", flush=True)
+        live_changed = True
         shutil.copy2(STAGE / ".env", ENV)
         os.chmod(ENV, 0o600)
         COMPOSE.symlink_to(SRC / "deploy/docker-compose.yml")
-        live_changed = True
 
         result = run("docker", "compose", "up", "-d",
                      "--no-deps", "--no-build", "hub", "nginx", timeout=180)
