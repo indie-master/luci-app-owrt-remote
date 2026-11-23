@@ -13,6 +13,9 @@ import json
 import os
 from pathlib import Path
 import re
+import math
+import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
@@ -151,6 +154,53 @@ def swap(image, before, *, rollback_image=None):
     require(state and state[1] == image, "new Xray image mismatch")
 
 
+def online_router_baseline(env_content):
+    state_dir = None
+    for line in env_content.decode().splitlines():
+        if line.startswith("RO_STATE_DIR="):
+            state_dir = line.split("=", 1)[1]
+    require(state_dir is not None, "RO_STATE_DIR missing")
+    database = Path(state_dir) / "hub.db"
+    require(database.is_file(), "HUB database unavailable")
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+        rows = db.execute(
+            "select id, last_seen, ssh_entry_port from routers where deleted_at = 0"
+        ).fetchall()
+    now = int(time.time())
+    return database, {row[0]: int(row[2] or 0) for row in rows
+                      if int(row[1] or 0) >= now - 180 and int(row[2] or 0) > 0}
+
+
+def canary_confirmed(database, baseline, since):
+    if not baseline:
+        return False
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+        heartbeat = dict(db.execute(
+            "select id, last_seen from routers where deleted_at = 0"
+        ).fetchall())
+    healthy = 0
+    for router_id, ssh_port in baseline.items():
+        if int(heartbeat.get(router_id) or 0) < since:
+            continue
+        try:
+            with socket.create_connection(("127.0.0.1", ssh_port), timeout=1) as sock:
+                sock.settimeout(2)
+                banner = sock.recv(32)
+                if banner.startswith(b"SSH-"):
+                    healthy += 1
+        except OSError:
+            continue
+    return healthy >= max(1, math.ceil(len(baseline) * 0.8))
+
+
+def wait_canary(database, baseline, since):
+    for _ in range(120):
+        if canary_confirmed(database, baseline, since):
+            return True
+        time.sleep(1)
+    return False
+
+
 def apply(image):
     require(ENV.is_file() and COMPOSE.is_file(), "unified deployment missing")
     require(run("systemctl", "is-active", "--quiet", SERVICE).returncode != 0,
@@ -161,6 +211,16 @@ def apply(image):
     old_id = image_id(old_image)
     new_id = image_id(image)
     require(old_image != image and old_id != new_id, "candidate matches current image")
+    # Reject manually retagged, non-verified or mutable candidates.
+    tag = image.rsplit(":", 1)[1]
+    manifest_path = ROOT / "data" / "xray-candidates" / (tag + ".json")
+    require(manifest_path.is_file(), "stable release manifest is missing")
+    manifest = json.loads(manifest_path.read_text())
+    require(manifest.get("image") == image and manifest.get("image_id") == new_id
+            and manifest.get("validation") == "config-only",
+            "candidate image digest differs from verified release")
+    database, baseline = online_router_baseline(before)
+    require(baseline, "no recently online routers available for canary validation")
     candidate_test(image)
     # Do not silently overwrite an in-progress or crash-interrupted journal.
     if JOURNAL.exists():
@@ -168,8 +228,11 @@ def apply(image):
         require(previous.get("phase") in ("committed", "rolled-back"),
                 "unfinished upgrade; recover from journal first")
     write_journal(old_image, old_id, image, new_id, "switching")
+    started = int(time.time())
     try:
         swap(image, before)
+        require(wait_canary(database, baseline, started),
+                "candidate failed live router heartbeat and SSH canary")
         write_journal(old_image, old_id, image, new_id, "committed")
         print("XRAY UPGRADE: PASS")
         print("RUNNING IMAGE:", image)
