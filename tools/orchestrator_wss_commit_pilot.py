@@ -208,6 +208,34 @@ def ready_xray(attempts: int = 15) -> bool:
     return False
 
 
+def status(expected: str) -> dict:
+    """Read-only approval gate, works before any seventh router is created."""
+    require(os.geteuid() == 0, "root required for Belt fleet status")
+    checkout(expected)
+    for path in (CONFIG, DB, HOLD):
+        check_regular(path)
+    ensure_services()
+    unit = Path("/etc/systemd/system/router-orchestrator-host-adapter.service")
+    check_regular(unit)
+    unit_content = unit.read_text()
+    require("--allow-xray-apply" not in unit_content and
+            "--allow-xray-restart" not in unit_content and
+            "ProtectSystem=strict" in unit_content and
+            "ReadWritePaths=/run/router-orchestrator" in unit_content,
+            "host adapter is no longer in approved read-only mode")
+    with contextlib.closing(sqlite3.connect(DB.resolve().as_uri() + "?mode=ro",
+                                            uri=True, timeout=10)) as conn:
+        tally = {str(row[0]): int(row[1]) for row in conn.execute(
+            "select vps_transport, count(*) from routers "
+            "where deleted_at is null group by vps_transport"
+        )}
+    phase = "NONE"
+    if JOURNAL.exists() or JOURNAL.is_symlink():
+        phase = read_journal()["state"]
+    return {"tcp": tally.get("tcp", 0), "wss": tally.get("ws", 0),
+            "xray_sha": sha(CONFIG.read_bytes()), "transaction": phase}
+
+
 def preview(router_id: str, expected: str) -> dict:
     preconditions(expected, router_id)
     original = CONFIG.read_bytes()
@@ -366,11 +394,21 @@ def main():
         if verb == "apply":
             cmd.add_argument("--expect-candidate-sha256", required=True)
             cmd.add_argument("--approve-maintenance", action="store_true")
+    monitor = modes.add_parser("status")
+    monitor.add_argument("--expect-commit", required=True)
     recover = modes.add_parser("rollback")
     recover.add_argument("--confirm", action="store_true")
     args = p.parse_args()
     try:
-        if args.mode == "preview":
+        if args.mode == "status":
+            result = status(args.expect_commit)
+            print("WSS PILOT STATUS: PASS")
+            print("FLEET: WSS={wss} TCP={tcp}".format(**result))
+            print("XRAY SHA256:", result["xray_sha"])
+            print("TRANSACTION:", result["transaction"])
+            print("HOST: systemd HUB/Xray active; adapter is read-only")
+            print("NO CHANGE: status did not create files or restart services")
+        elif args.mode == "preview":
             result = preview(args.router_id, args.expect_commit)
             print("WSS COMMIT PILOT PREVIEW: PASS")
             print("ROUTER:", result["router_id"])
