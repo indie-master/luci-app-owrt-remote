@@ -131,17 +131,17 @@ def read_one(operation: str) -> dict:
 def peer_summaries() -> dict:
     """Run only in the UID-restricted fork: never return Xray config JSON."""
     health = read_one("health")
-    status = read_one("xray.status")
-    metrics = read_one("host.metrics")
-    current = read_one("xray.current")
     require(health.get("adapter") == "host-control-v1",
             "adapter protocol mismatch")
+    status = read_one("xray.status")
     require(status.get("active") is True and
             status.get("service") == "owrt-remote-xray",
             "dedicated host Xray not healthy")
+    metrics = read_one("host.metrics")
     require(metrics.get("scope") == "host-adapter" and
             isinstance(metrics.get("memory"), dict),
             "host metrics invalid")
+    current = read_one("xray.current")
     require(isinstance(current.get("config"), dict) and
             re.fullmatch(r"[0-9a-f]{64}", str(current.get("sha256"))) is not None,
             "Xray current response invalid")
