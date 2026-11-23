@@ -2,6 +2,7 @@
 import contextlib
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -150,11 +151,31 @@ class PilotTests(unittest.TestCase):
                 "ProtectSystem=strict\n"
                 "ReadWritePaths=/run/router-orchestrator\n")
             with sqlite3.connect(db) as conn:
-                conn.execute("CREATE TABLE routers "
-                             "(vps_transport TEXT, deleted_at TEXT)")
-                conn.executemany("INSERT INTO routers VALUES (?,NULL)",
-                                 [("ws",)] * 5 + [("tcp",)])
-            with patch.object(pilot, "require_root"), \
+                conn.execute(
+                    "CREATE TABLE routers (id TEXT PRIMARY KEY, "
+                    "vless_uuid TEXT, ssh_vless_uuid TEXT, "
+                    "entry_port INTEGER, ssh_entry_port INTEGER, "
+                    "vps_transport TEXT, vless_port INTEGER, "
+                    "vps_allow_legacy INTEGER, deleted_at TEXT)"
+                )
+                for idx in range(5):
+                    conn.execute(
+                        "INSERT INTO routers VALUES (?,?,?,?,?,?,?,?,?)",
+                        (f"router{idx}", f"admin{idx}", f"ssh{idx}",
+                         18090 + idx, 19090 + idx, "ws", 443, 0, "")
+                    )
+                conn.execute(
+                    "INSERT INTO routers VALUES (?,?,?,?,?,?,?,?,?)",
+                    ("legacy", "tcp-admin", "tcp-ssh", 18099, 19099,
+                     "tcp", 18443, 0, None)
+                )
+                conn.execute(
+                    "INSERT INTO routers VALUES (?,?,?,?,?,?,?,?,?)",
+                    ("deleted", "former", "former-ssh", 18199, 19199,
+                     "ws", 443, 0, "2026-01-01")
+                )
+            with patch.object(pilot.gate, "xray_parity") as parity, \
+                 patch.object(pilot, "require_root"), \
                  patch.object(pilot, "checkout"), \
                  patch.object(pilot, "ensure_services"), \
                  patch.object(pilot, "CONFIG", config), \
@@ -167,7 +188,9 @@ class PilotTests(unittest.TestCase):
                  patch.object(pilot, "save_journal") as journal:
                 report = pilot.status("a" * 40)
                 self.assertEqual((report["wss"], report["tcp"]), (5, 1))
+                self.assertEqual(report["active_count"], 6)
                 self.assertEqual(report["transaction"], "NONE")
+                parity.assert_called_once()
                 self.assertTrue(hold.exists())
                 write.assert_not_called()
                 restart.assert_not_called()
@@ -196,10 +219,78 @@ class PilotTests(unittest.TestCase):
                 with self.assertRaisesRegex(pilot.Blocked, "read-only"):
                     pilot.status("a" * 40)
 
+    def test_status_blocks_empty_or_mismatched_active_inventory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config, db, hold, unit = (root / name for name in
+                                      ("xray.json", "hub.db", ".hold", "adapter.service"))
+            config.write_text('{"inbounds":[]}')
+            hold.write_text("keep")
+            unit.write_text(
+                "ExecStart=python3 host_adapter.py --peer-uid 23088\n"
+                "ProtectSystem=strict\n"
+                "ReadWritePaths=/run/router-orchestrator\n")
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE routers (id TEXT PRIMARY KEY, "
+                             "vless_uuid TEXT, ssh_vless_uuid TEXT, "
+                             "entry_port INTEGER, ssh_entry_port INTEGER, "
+                             "vps_transport TEXT, vless_port INTEGER, deleted_at TEXT)")
+                # Empty-string means active; unknown transport must not count.
+                conn.execute(
+                    "INSERT INTO routers VALUES (?,?,?,?,?,?,?,?)",
+                    ("unexpected", "v", "s", 18099, 19099, "grpc", 443, "")
+                )
+            with patch.object(pilot, "require_root"), \
+                 patch.object(pilot, "checkout"), \
+                 patch.object(pilot, "ensure_services"), \
+                 patch.object(pilot, "CONFIG", config), \
+                 patch.object(pilot, "DB", db), \
+                 patch.object(pilot, "HOLD", hold), \
+                 patch.object(pilot, "UNIT", unit), \
+                 patch.object(pilot, "JOURNAL", root / "absent"), \
+                 patch.object(pilot.gate, "xray_parity") as parity:
+                with self.assertRaisesRegex(
+                        pilot.Blocked, "SQLite/Xray router parity failed"):
+                    pilot.status("a" * 40)
+                parity.assert_not_called()
+
+    def test_status_blocks_xray_client_drift_even_when_counts_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config, db, hold, unit = (root / name for name in
+                                      ("xray.json", "hub.db", ".hold", "adapter.service"))
+            config.write_text('{"inbounds":[],"routing":{"rules":[]}}')
+            hold.write_text("keep")
+            unit.write_text(
+                "ExecStart=python3 host_adapter.py --peer-uid 23088\n"
+                "ProtectSystem=strict\n"
+                "ReadWritePaths=/run/router-orchestrator\n")
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE routers (id TEXT PRIMARY KEY, "
+                             "vless_uuid TEXT, ssh_vless_uuid TEXT, "
+                             "entry_port INTEGER, ssh_entry_port INTEGER, "
+                             "vps_transport TEXT, vless_port INTEGER, deleted_at TEXT)")
+                conn.execute(
+                    "INSERT INTO routers VALUES (?,?,?,?,?,?,?,?)",
+                    ("existing", "admin-id", "ssh-id", 18099, 19099, "ws", 443, "")
+                )
+            with patch.object(pilot, "require_root"), \
+                 patch.object(pilot, "checkout"), \
+                 patch.object(pilot, "ensure_services"), \
+                 patch.object(pilot, "CONFIG", config), \
+                 patch.object(pilot, "DB", db), \
+                 patch.object(pilot, "HOLD", hold), \
+                 patch.object(pilot, "UNIT", unit), \
+                 patch.object(pilot, "JOURNAL", root / "absent"):
+                with self.assertRaisesRegex(
+                        pilot.Blocked, "SQLite/Xray router parity failed"):
+                    pilot.status("a" * 40)
+
     def test_status_is_readonly_and_has_no_seventh_router_requirement(self):
         text = (REPO / "tools/orchestrator_wss_commit_pilot.py").read_text()
         fragment = text.split("def status(", 1)[1].split("\ndef preview(", 1)[0]
-        self.assertIn("select vps_transport, count(*)", fragment)
+        self.assertIn("gate.db_inventory(DB)", fragment)
+        self.assertIn("gate.xray_parity(inventory", fragment)
         self.assertNotIn("build_candidate(", fragment)
         self.assertNotIn("atomic_write(", fragment)
         self.assertNotIn("restart_xray(", fragment)
