@@ -28,30 +28,49 @@ def inspect(name):
     return json.loads(result.stdout)[0] if result.returncode == 0 else None
 
 
+def protected_tags():
+    tags = {"router-orchestrator-hub:release"}
+    for name in KEEP_LIVE:
+        item = inspect(name)
+        if item:
+            tags.add(item["Config"].get("Image", ""))
+    root = Path("/opt/router-orchestrator")
+    baseline = root / "unified-candidate/cutover-rollback/images.json"
+    if baseline.is_file():
+        data = json.loads(baseline.read_text())
+        tags.add(data.get("hub", ""))
+    journal = root / "data/xray-lifecycle.json"
+    if journal.is_file():
+        data = json.loads(journal.read_text())
+        tags.add(data.get("old_image", ""))
+        tags.add(data.get("new_image", ""))
+    return tags
+
+
 def plan():
     for name in KEEP_LIVE:
         state = inspect(name)
         if not state or not state["State"]["Running"]:
             raise RuntimeError(f"required production container not running: {name}")
-    # Docker inspect is authoritative; avoid parsing human-formatted columns.
     staging = [name for name in STAGING if inspect(name) is not None]
-    running_images = set()
+    used_after_staging = set()
     for identifier in docker("ps", "-aq").splitlines():
         item = inspect(identifier)
-        if item:
-            running_images.add(item["Image"])
+        if item and item["Name"].lstrip("/") not in STAGING:
+            used_after_staging.add(item["Image"])
+    keep = protected_tags()
     candidates = []
-    for line in docker("images", "--format", "{{.Repository}}:{{.Tag}}|{{.ID}}").splitlines():
-        if "|" not in line:
+    for line in docker("images", "--format",
+                       "{{.Repository}}:{{.Tag}}").splitlines():
+        tag = line.strip()
+        if not (tag.startswith("router-orchestrator-hub:")
+                or tag.startswith("router-orchestrator-xray:")):
             continue
-        name, image_id = line.split("|", 1)
-        if not (name.startswith("router-orchestrator-hub:")
-                or name.startswith("router-orchestrator-xray:")):
+        if tag in keep:
             continue
-        if image_id not in running_images and name not in {
-            "router-orchestrator-hub:release",
-        }:
-            candidates.append(name)
+        image_id = docker("image", "inspect", "--format", "{{.Id}}", tag).strip()
+        if image_id not in used_after_staging:
+            candidates.append(tag)
     return staging, sorted(set(candidates))
 
 
@@ -62,7 +81,7 @@ def main():
     staging, candidates = plan()
     print("STAGING CONTAINERS:", staging)
     print("UNUSED PROJECT IMAGE TAGS:", candidates)
-    print("REMMNAWAVE AND GLOBAL DOCKER PRUNE: NOT TOUCHED")
+    print("REMNAWAVE AND GLOBAL DOCKER PRUNE: NOT TOUCHED")
     if not args.apply:
         print("DRY-RUN ONLY: no Docker objects removed")
         return
@@ -73,11 +92,18 @@ def main():
                 "backup_restorable", "global_logs_verified", "wol_verified")
     if not all(state.get(key) is True for key in required):
         raise RuntimeError("release acceptance gates not passed")
-    # Keep historic tags for rollback until explicitly archived by operator.
     for name in staging:
         docker("rm", "-f", name)
         print("REMOVED STAGING:", name)
-    print("UNUSED IMAGE TAGS RETAINED AS ROLLBACK UNTIL OPERATOR APPROVAL")
+    for tag in candidates:
+        # Recheck live references after staging removal, fail closed on races.
+        current = plan()[1]
+        if tag not in current:
+            print("SKIPPED CHANGED IMAGE:", tag)
+            continue
+        docker("image", "rm", tag)
+        print("REMOVED UNUSED PROJECT IMAGE TAG:", tag)
+    print("KNOWN-GOOD XRAY AND PRE-CUTOVER HUB IMAGES: RETAINED")
 
 
 if __name__ == "__main__":
