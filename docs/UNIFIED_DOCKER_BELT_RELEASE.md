@@ -20,10 +20,11 @@ From a root shell on Belt, after reviewing the PR and its green CI:
 
 ```sh
 git -C /opt/router-orchestrator/release fetch origin \
-  feature/router-orchestrator-unified-docker-transports-20261123
+  refs/heads/feature/router-orchestrator-unified-docker-transports-20261123:refs/remotes/origin/feature/router-orchestrator-unified-docker-transports-20261123
 git -C /opt/router-orchestrator/release worktree add \
+  -b feature/unified-docker-release \
   /opt/router-orchestrator/src \
-  feature/router-orchestrator-unified-docker-transports-20261123
+  refs/remotes/origin/feature/router-orchestrator-unified-docker-transports-20261123
 python3 /opt/router-orchestrator/src/deploy/prepare_belt.py
 ```
 
