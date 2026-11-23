@@ -66,6 +66,10 @@ services:
         source: ${RO_XRAY_ASSET_DIR:-/usr/local/share/xray}
         target: /usr/local/share/xray
         read_only: true
+      - type: bind
+        source: ${RO_TLS_DIR:?Set RO_TLS_DIR}
+        target: /etc/router-orchestrator/tls
+        read_only: true
     command: ["run", "-config", "/etc/xray/owrt-remote.json"]
 
   nginx:
