@@ -19162,6 +19162,13 @@ exit 127
 
     def do_GET(self):
         path = self.parsed().path
+        if path in ("/transport-configurator", "/transport-configurator/"):
+            if not self.require_owner():
+                return
+            source = Path(__file__).resolve().parent / "static" / "transport-configurator.html"
+            self.send_bytes(200, source.read_bytes(), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
         if path == "/health":
             result = {"ok": True}
             if self.query().get('panel-update') == ['1']:
@@ -19746,6 +19753,27 @@ exit 127
                 self.send_json(200, {"ok": True, "removed": removed})
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if path == "/api/transports/preview":
+            if not self.require_owner(json_mode=True):
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                from transport_profiles import ProfileError, validate_profiles
+                payload = self.read_payload()
+                rendered = validate_profiles(payload.get("profiles"))
+                # Never echo a REALITY private key or future authentication
+                # fields to HTML, error logs or persisted state.
+                for item in rendered:
+                    reality = item["streamSettings"].get("realitySettings")
+                    if reality:
+                        reality["privateKey"] = "[REDACTED]"
+                self.send_json(200, {"ok": True, "preview": rendered,
+                                     "applied": False, "restart_performed": False})
+            except (ValueError, TypeError, KeyError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
         if path == "/api/xray/reload":
             if not self.require_owner(json_mode=True):
