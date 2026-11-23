@@ -9,6 +9,8 @@ mode-0660 Unix socket. Mount /run/router-orchestrator read-only in HUB.
 from __future__ import annotations
 import argparse
 import datetime
+import uuid
+import re
 import hashlib
 import json
 import os
@@ -462,6 +464,73 @@ class Adapter:
                 remote_host=request.get("remote_host"))
         return response
 
+    def core_job_start(self, request):
+        action = request.get("action")
+        require(action in ("prepare", "upgrade", "restart", "rollback"),
+                "unsupported core action")
+        if action == "prepare":
+            require(self.allow_apply, "Xray preparation is not authorized")
+        else:
+            self.can_mutate(self.allow_apply if action == "upgrade" else self.allow_restart)
+        version = request.get("version") or ""
+        if action in ("prepare", "upgrade"):
+            require(isinstance(version, str) and
+                    re.fullmatch(r"v[0-9]{1,4}\\.[0-9]{1,3}\\.[0-9]{1,3}", version),
+                    "invalid stable release version")
+        else:
+            require(not version, "version is not used for this action")
+        root = Path("/opt/router-orchestrator/data/core-jobs")
+        require(root.is_dir() and not root.is_symlink(), "core-job directory not provisioned")
+        st = root.stat()
+        require(st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700,
+                "core-job directory permissions unsafe")
+        # Do not queue more work while a core operation is in progress.
+        for path in root.glob("*.json"):
+            if path.is_symlink():
+                raise Rejected("unsafe core-job record")
+            try:
+                item = json.loads(path.read_text())
+            except Exception:
+                raise Rejected("unreadable core-job record")
+            if item.get("status") in ("pending", "running"):
+                raise Rejected("a core operation is already pending/running")
+        job_id = str(uuid.uuid4())
+        path = root / (job_id + ".json")
+        record = {"id": job_id, "status": "pending",
+                  "action": action, "version": version,
+                  "created_unix": int(time.time())}
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream)
+            stream.write("\\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        unit = "router-orchestrator-core-job@" + job_id + ".service"
+        started = subprocess.run(["systemctl", "start", "--no-block", unit],
+                                 capture_output=True, timeout=15, text=True)
+        if started.returncode:
+            path.unlink(missing_ok=True)
+            raise Rejected("core-job systemd unit did not start")
+        if action != "prepare":
+            self.last_restart = time.monotonic()
+        return {"ok": True, "job_id": job_id, "status": "pending",
+                "action": action}
+
+    def core_job_status(self, request):
+        job_id = request.get("job_id")
+        require(isinstance(job_id, str) and
+                re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", job_id),
+                "invalid job ID")
+        path = Path("/opt/router-orchestrator/data/core-jobs") / (job_id + ".json")
+        require(path.is_file() and not path.is_symlink(), "job record absent")
+        st = path.stat()
+        require(st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o600,
+                "unsafe job record")
+        record = json.loads(path.read_text())
+        require(record.get("id") == job_id, "job record mismatch")
+        return {"ok": True, "job": record,
+                "running_image": docker_inspect_image()}
+
     def xray_restart(self):
         self.can_mutate(self.allow_restart)
         require(restart_docker_xray(recovering=True).returncode == 0 and wait_xray(),
@@ -554,6 +623,10 @@ class Adapter:
             return self.xray_preview(request)
         if op == "xray.transport.preview":
             return self.transport_preview(request)
+        if op == "xray.core.start":
+            return self.core_job_start(request)
+        if op == "xray.core.job":
+            return self.core_job_status(request)
         if op == "xray.restart":
             return self.xray_restart()
         if op == "xray.apply":
