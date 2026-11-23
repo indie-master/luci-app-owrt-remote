@@ -283,6 +283,36 @@ def restart_docker_xray(*, recovering=False):
     return result
 
 
+def validate_candidate_with_container(config_path):
+    """Validate using the EXACT running core image, without a writable socket in HUB."""
+    state = docker_inspect_image()
+    require(state is not None, "Docker Xray identity unavailable")
+    require(Path(config_path).parent == CONFIG.parent, "candidate must be inside /etc/xray")
+    args = ["run", "--rm", "--pull", "never", "--network", "none",
+            "--read-only", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges:true",
+            "--pids-limit", "64", "--memory", "256m",
+            "-v", "/etc/xray:/etc/xray:ro",
+            "-v", "/usr/local/share/xray:/usr/local/share/xray:ro"]
+    tls = Path("/opt/router-orchestrator/tls")
+    if tls.is_dir():
+        args += ["-v", str(tls) + ":/etc/router-orchestrator/tls:ro"]
+    args += [state, "run", "-test", "-config", str(config_path)]
+    result = docker(*args, timeout=40)
+    require(result.returncode == 0,
+            "running Docker Xray core rejected the candidate configuration")
+
+
+def docker_inspect_image():
+    result = docker("inspect", "--format", "{{.Config.Image}}", XRAY_CONTAINER, timeout=8)
+    if result.returncode:
+        return None
+    image = result.stdout.strip()
+    if image.startswith(XRAY_IMAGE_PREFIX):
+        return image
+    return None
+
+
 def clear_stale_socket(path):
     """Safely recover a crash-left socket; never remove an active listener.
 
@@ -354,21 +384,14 @@ class Adapter:
         data = (json.dumps(candidate, ensure_ascii=False,
                            separators=(",", ":")) + "\n").encode()
         require(len(data) < MAX_REQUEST - 4096, "Xray preview exceeds request limit")
-        directory = SOCKET.parent
-        require(directory.is_dir() and not directory.is_symlink(),
-                "host adapter runtime directory missing")
         fd, temp = tempfile.mkstemp(prefix=".ro-preview-", suffix=".json",
-                                    dir=directory)
+                                    dir=CONFIG.parent)
         try:
             with os.fdopen(fd, "wb") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(data)
                 stream.flush()
-            tested = subprocess.run(
-                [BINARY, "run", "-test", "-config", temp],
-                capture_output=True, timeout=25, check=False)
-            require(tested.returncode == 0,
-                    "Xray rejected the new WSS candidate during -test")
+            validate_candidate_with_container(Path(temp))
         finally:
             Path(temp).unlink(missing_ok=True)
         require(sha(CONFIG.read_bytes()) == expected,
@@ -378,10 +401,66 @@ class Adapter:
                 "restart_performed": False, "apply_performed": False,
                 "candidate_sha256": sha(data)}
 
+    def transport_preview(self, request):
+        """Pure preview: no config write or live Xray restart.
+
+        Only one candidate listener is accepted. A fixed, empty VLESS inbound
+        is used for syntax validation; actual router enrollment remains a
+        separate guarded transaction.
+        """
+        from transport_profiles import validate_profiles
+        profiles = request.get("profiles")
+        require(isinstance(profiles, list) and len(profiles) == 1,
+                "preview accepts one candidate profile")
+        original = CONFIG.read_bytes()
+        require(request.get("expected_sha256") == sha(original),
+                "Xray configuration changed during preview")
+        config = json.loads(original)
+        generated = validate_profiles(profiles)
+        profile = generated[0]
+        port = profile["port"]
+        reserved = {80, 443, 8088, 18089, 18445}
+        occupied = {int(item["port"]) for item in config.get("inbounds", [])
+                    if isinstance(item, dict) and isinstance(item.get("port"), int)}
+        require(port not in reserved and port not in occupied,
+                "transport listener port conflicts with existing service")
+        tag = "ro-preview-" + profile["name"]
+        require(all(item.get("tag") != tag for item in config.get("inbounds", [])),
+                "candidate listener tag already exists")
+        candidate = json.loads(original)
+        candidate["inbounds"].append({
+            "tag": tag, "listen": "127.0.0.1", "port": port,
+            "protocol": "vless",
+            "settings": {"clients": [], "decryption": "none"},
+            "streamSettings": profile["streamSettings"],
+        })
+        data = (json.dumps(candidate, separators=(",", ":")) + "\n").encode()
+        require(len(data) < MAX_REQUEST - 4096, "Xray candidate exceeds limit")
+        fd, temp = tempfile.mkstemp(prefix=".ro-transport-preview-",
+                                    suffix=".json", dir=CONFIG.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(data)
+                stream.flush()
+            validate_candidate_with_container(Path(temp))
+        finally:
+            Path(temp).unlink(missing_ok=True)
+        require(sha(CONFIG.read_bytes()) == request["expected_sha256"],
+                "Xray configuration changed during preview")
+        safe = json.loads(json.dumps(profile))
+        reality = safe["streamSettings"].get("realitySettings")
+        if reality:
+            reality["privateKey"] = "[REDACTED]"
+        return {"ok": True, "validated": True, "preview": [safe],
+                "xray_config_unchanged": True,
+                "restart_performed": False, "apply_performed": False,
+                "candidate_sha256": sha(data)}
+
     def xray_restart(self):
         self.can_mutate(self.allow_restart)
-        require(restart_docker_xray().returncode == 0 and wait_xray(),
-                "Xray restart/health failed; investigate host service")
+        require(restart_docker_xray(recovering=True).returncode == 0 and wait_xray(),
+                "Docker Xray restart/health failed; investigate container")
         self.last_restart = time.monotonic()
         return {"ok": True, "service": XRAY_CONTAINER, "runtime": "docker"}
 
@@ -401,9 +480,7 @@ class Adapter:
             with os.fdopen(fd, "wb") as out:
                 os.fchmod(out.fileno(), 0o600)
                 out.write(data)
-            test = subprocess.run([BINARY, "run", "-test", "-config", test_path],
-                                  capture_output=True, timeout=25)
-            require(test.returncode == 0, "Xray candidate failed validation")
+            validate_candidate_with_container(Path(test_path))
         finally:
             Path(test_path).unlink(missing_ok=True)
         backup_dir = CONFIG.parent / "owrt-remote-backups"
@@ -470,6 +547,8 @@ class Adapter:
             return self.current()
         if op == "xray.preview":
             return self.xray_preview(request)
+        if op == "xray.transport.preview":
+            return self.transport_preview(request)
         if op == "xray.restart":
             return self.xray_restart()
         if op == "xray.apply":
