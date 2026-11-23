@@ -137,6 +137,64 @@ class PilotTests(unittest.TestCase):
                  self.assertRaisesRegex(pilot.Blocked, "invalid router"):
                 pilot.preconditions("a" * 40, "../unsafe")
 
+    def test_status_on_six_router_fixture_does_not_write_or_restart(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config, db, hold, unit = (root / name for name in
+                                      ("xray.json", "hub.db", ".hold", "adapter.service"))
+            config.write_bytes(b'{"inbounds":[]}\n')
+            hold.write_text("keep hold in place")
+            unit.write_text(
+                "ExecStart=python3 host_adapter.py --peer-uid 23088\n"
+                "ProtectSystem=strict\n"
+                "ReadWritePaths=/run/router-orchestrator\n")
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE routers "
+                             "(vps_transport TEXT, deleted_at TEXT)")
+                conn.executemany("INSERT INTO routers VALUES (?,NULL)",
+                                 [("ws",)] * 5 + [("tcp",)])
+            with patch.object(pilot, "require_root"), \
+                 patch.object(pilot, "checkout"), \
+                 patch.object(pilot, "ensure_services"), \
+                 patch.object(pilot, "CONFIG", config), \
+                 patch.object(pilot, "DB", db), \
+                 patch.object(pilot, "HOLD", hold), \
+                 patch.object(pilot, "UNIT", unit), \
+                 patch.object(pilot, "JOURNAL", root / "absent"), \
+                 patch.object(pilot, "atomic_write") as write, \
+                 patch.object(pilot, "restart_xray") as restart, \
+                 patch.object(pilot, "save_journal") as journal:
+                report = pilot.status("a" * 40)
+                self.assertEqual((report["wss"], report["tcp"]), (5, 1))
+                self.assertEqual(report["transaction"], "NONE")
+                self.assertTrue(hold.exists())
+                write.assert_not_called()
+                restart.assert_not_called()
+                journal.assert_not_called()
+
+    def test_status_refuses_adapter_write_flags(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config, db, hold, unit = (root / name for name in
+                                      ("xray.json", "hub.db", ".hold", "adapter.service"))
+            config.write_bytes(b'{}')
+            hold.write_text("keep")
+            unit.write_text(
+                "ExecStart=python3 host_adapter.py --allow-xray-apply\n"
+                "ProtectSystem=strict\n"
+                "ReadWritePaths=/run/router-orchestrator\n")
+            with patch.object(pilot, "require_root"), \
+                 patch.object(pilot, "checkout"), \
+                 patch.object(pilot, "ensure_services"), \
+                 patch.object(pilot, "CONFIG", config), \
+                 patch.object(pilot, "DB", db), \
+                 patch.object(pilot, "HOLD", hold), \
+                 patch.object(pilot, "UNIT", unit):
+                with self.assertRaisesRegex(pilot.Blocked, "read-only"):
+                    pilot.status("a" * 40)
+
     def test_status_is_readonly_and_has_no_seventh_router_requirement(self):
         text = (REPO / "tools/orchestrator_wss_commit_pilot.py").read_text()
         fragment = text.split("def status(", 1)[1].split("\ndef preview(", 1)[0]
