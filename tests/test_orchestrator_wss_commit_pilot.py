@@ -32,14 +32,15 @@ class PilotTests(unittest.TestCase):
         stack.enter_context(patch.object(pilot, "transaction_lock", return_value=contextlib.nullcontext()))
         stack.enter_context(patch.object(pilot, "secure_transaction_dir"))
         stack.enter_context(patch.object(pilot, "service_active", return_value=True))
+        stack.enter_context(patch.object(pilot, "fleet_identity_digest", return_value="fleet"))
         return stack
 
     def test_apply_creates_private_backup_and_pending_journal(self):
         with tempfile.TemporaryDirectory() as td:
             control, live, original, new = self.workspace(Path(td))
             stage = {"router_id": "new", "current_sha": pilot.sha(original),
-                     "candidate_sha": pilot.sha(new), "original": original,
-                     "candidate": new}
+                     "candidate_sha": pilot.sha(new), "fleet_sha": "fleet",
+                     "original": original, "candidate": new}
             with self.patch_paths(control, live), \
                  patch.object(pilot, "preview", return_value=stage), \
                  patch.object(pilot, "restart_xray") as restart:
@@ -56,8 +57,8 @@ class PilotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             control, live, original, new = self.workspace(Path(td))
             stage = {"router_id": "new", "current_sha": pilot.sha(original),
-                     "candidate_sha": pilot.sha(new), "original": original,
-                     "candidate": new}
+                     "candidate_sha": pilot.sha(new), "fleet_sha": "fleet",
+                     "original": original, "candidate": new}
             with self.patch_paths(control, live), \
                  patch.object(pilot, "preview", return_value=stage), \
                  patch.object(pilot, "restart_xray") as restart:
@@ -71,8 +72,8 @@ class PilotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             control, live, original, new = self.workspace(Path(td))
             stage = {"router_id": "new", "current_sha": pilot.sha(original),
-                     "candidate_sha": pilot.sha(new), "original": original,
-                     "candidate": new}
+                     "candidate_sha": pilot.sha(new), "fleet_sha": "fleet",
+                     "original": original, "candidate": new}
             with self.patch_paths(control, live), \
                  patch.object(pilot, "preview", return_value=stage), \
                  patch.object(pilot, "restart_xray",
@@ -94,7 +95,7 @@ class PilotTests(unittest.TestCase):
             )
             live.write_bytes(new)
             with self.patch_paths(control, live), \
-                 patch.object(pilot.os, "geteuid", return_value=0), \
+                 patch.object(pilot, "require_root"), \
                  patch.object(pilot, "read_journal", side_effect=lambda: json.loads((control / "transaction.json").read_text())), \
                  patch.object(pilot, "restart_xray") as restart:
                 doc = pilot.rollback(confirm=True)
@@ -115,7 +116,7 @@ class PilotTests(unittest.TestCase):
             external = b'{"unrelated":true}'
             live.write_bytes(external)
             with self.patch_paths(control, live), \
-                 patch.object(pilot.os, "geteuid", return_value=0), \
+                 patch.object(pilot, "require_root"), \
                  patch.object(pilot, "read_journal", side_effect=lambda: json.loads((control / "transaction.json").read_text())), \
                  patch.object(pilot, "restart_xray") as restart:
                 with self.assertRaisesRegex(pilot.Blocked, "outside transaction"):
@@ -126,13 +127,13 @@ class PilotTests(unittest.TestCase):
     def test_preconditions_require_maintenance_hold_and_active_services(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            with patch.object(pilot.os, "geteuid", return_value=0), \
+            with patch.object(pilot, "require_root"), \
                  patch.object(pilot, "checkout"), \
                  patch.object(pilot, "CONFIG", root / "not-installed"), \
                  patch.object(pilot, "JOURNAL", root / "journal"):
                 with self.assertRaisesRegex(pilot.Blocked, "required file"):
                     pilot.preconditions("a" * 40, "new")
-            with patch.object(pilot.os, "geteuid", return_value=0), \
+            with patch.object(pilot, "require_root"), \
                  self.assertRaisesRegex(pilot.Blocked, "invalid router"):
                 pilot.preconditions("a" * 40, "../unsafe")
 
