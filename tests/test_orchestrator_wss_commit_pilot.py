@@ -180,6 +180,7 @@ class PilotTests(unittest.TestCase):
             config, db, hold, unit = (root / name for name in
                                       ("xray.json", "hub.db", ".hold", "adapter.service"))
             config.write_bytes(b'{}')
+            db.touch()  # Status must reach the adapter-policy guard first.
             hold.write_text("keep")
             unit.write_text(
                 "ExecStart=python3 host_adapter.py --allow-xray-apply\n"
