@@ -18,6 +18,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 REPO = Path(__file__).resolve().parents[1]
 SOCKET = Path("/run/router-orchestrator/control.sock")
@@ -202,6 +203,12 @@ def probe(expected: str) -> None:
             "DropInPaths=\n" in show.stdout and
             "FragmentPath=" + str(UNIT) in show.stdout,
             "systemd unit has an unexpected override or source")
+    # systemd Type=simple can report active before Python finishes binding.
+    # Readiness is a bounded socket check, not a service restart.
+    for _ in range(30):
+        if SOCKET.is_socket() and not SOCKET.is_symlink():
+            break
+        time.sleep(0.2)
     require(SOCKET.is_socket() and not SOCKET.is_symlink(),
             "read-only adapter UNIX socket is not active")
     require(root_peer_rejected(), "socket incorrectly authorizes root peer")
