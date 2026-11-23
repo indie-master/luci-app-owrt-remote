@@ -148,6 +148,7 @@ NOTIFICATIONS_MAX = 220
 LUCI_ABSOLUTE_ROOTS = ("/ubus", "/cgi-bin/luci", "/luci-static")
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 VPS_TERMINAL_ID = "__vps__"
+XRAY_CORE_ACTION_CSRF = secrets.token_urlsafe(32)
 SSH_HTTP_SESSIONS = {}
 SSH_HTTP_LOCK = threading.Lock()
 ROUTER_PROXY_LOCK = threading.Lock()
@@ -5561,6 +5562,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
           <div class="headerActions">
             <a class="badge" id="vpsTerminalLink" href="/vps-terminal/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Терминал VPS</a>
             <a class="badge" href="/transport-configurator/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Транспорты</a>
+            <a class="badge" href="/xray-core/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Xray Core</a>
             <button class="badge" id="xrayReload" type="button" {'hidden' if not is_owner else ''}>Обновить Xray CFG</button>
             <button class="badge" id="xrayRestart" type="button" {'hidden' if not is_owner else ''}>Рестарт Xray VPS</button>
             <button class="badge authToggle" id="authToggle" type="button">{safe_username}</button>
@@ -5895,6 +5897,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div class="mobileOwnerTools" id="mobileOwnerTools" hidden>
       <a class="badge" href="/vps-terminal/" id="mobileVpsTerminal" target="_blank" rel="noopener noreferrer">Терминал VPS</a>
       <a class="badge" href="/transport-configurator/" target="_blank" rel="noopener noreferrer">Транспорты</a>
+      <a class="badge" href="/xray-core/" target="_blank" rel="noopener noreferrer">Xray Core</a>
       <button class="badge" id="mobileXrayReload" type="button">Обновить Xray CFG</button>
       <button class="badge" id="mobileXrayRestart" type="button">Рестарт Xray VPS</button>
     </div>
@@ -19171,6 +19174,40 @@ exit 127
             self.send_bytes(200, source.read_bytes(), "text/html; charset=utf-8",
                             [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
             return
+        if path in ("/xray-core", "/xray-core/"):
+            if not self.require_owner():
+                return
+            template = (Path(__file__).resolve().parent / "static" / "xray-core-manager.html").read_text(encoding="utf-8")
+            page = template.replace("__CSRF_TOKEN__", html.escape(XRAY_CORE_ACTION_CSRF))
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
+        if path == "/api/xray/core/info":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                self.send_json(200, host_adapter_request("xray.core.info"))
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)[:150]})
+            return
+        if path == "/api/xray/core/versions":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                from xray_releases import stable_release_tags
+                self.send_json(200, {"ok": True, "versions": stable_release_tags()})
+            except Exception:
+                self.send_json(503, {"ok": False, "error": "official stable release lookup unavailable"})
+            return
+        if path.startswith("/api/xray/core/job/"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                job_id = path.rsplit("/", 1)[-1]
+                self.send_json(200, host_adapter_request("xray.core.job", {"job_id": job_id}))
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:150]})
+            return
         if path == "/health":
             result = {"ok": True}
             if self.query().get('panel-update') == ['1']:
@@ -19755,6 +19792,25 @@ exit 127
                 self.send_json(200, {"ok": True, "removed": removed})
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if path == "/api/xray/core/start":
+            if not self.require_owner(json_mode=True):
+                return
+            token = self.headers.get("X-Core-Action-CSRF", "")
+            if not secrets.compare_digest(token, XRAY_CORE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                self.send_json(200, host_adapter_request(
+                    "xray.core.start",
+                    {"action": payload.get("action"), "version": payload.get("version") or ""},
+                ))
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
         if path == "/api/transports/preview":
             if not self.require_owner(json_mode=True):
