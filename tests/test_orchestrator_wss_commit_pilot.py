@@ -34,6 +34,7 @@ class PilotTests(unittest.TestCase):
         stack.enter_context(patch.object(pilot, "secure_transaction_dir"))
         stack.enter_context(patch.object(pilot, "service_active", return_value=True))
         stack.enter_context(patch.object(pilot, "fleet_identity_digest", return_value="fleet"))
+        stack.enter_context(patch.object(pilot, "ensure_rescue_ready"))
         return stack
 
     def test_apply_creates_private_backup_and_pending_journal(self):
@@ -53,6 +54,36 @@ class PilotTests(unittest.TestCase):
                 restart.assert_called_once()
                 self.assertEqual((control / "xray-before.json").stat().st_mode & 0o777,
                                  0o600)
+
+    def test_live_apply_is_blocked_without_independent_rescue(self):
+        with tempfile.TemporaryDirectory() as td:
+            control, live, original, candidate = self.workspace(Path(td))
+            with self.patch_paths(control, live), \
+                 patch.object(pilot, "ensure_rescue_ready",
+                              side_effect=pilot.Blocked("independent rescue missing")), \
+                 patch.object(pilot, "preview") as preview, \
+                 patch.object(pilot, "restart_xray") as restart:
+                with self.assertRaisesRegex(pilot.Blocked, "independent rescue"):
+                    pilot.apply("new", "a" * 40, pilot.sha(candidate))
+                preview.assert_not_called()
+                restart.assert_not_called()
+                self.assertFalse((control / "transaction.json").exists())
+                self.assertEqual(live.read_bytes(), original)
+
+    def test_installed_rescue_must_match_reviewed_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.py"
+            binary = root / "rescue"
+            source.write_text("approved rescue code")
+            binary.write_text("modified rescue code")
+            with patch.object(pilot, "RESCUE_SOURCE", source), \
+                 patch.object(pilot, "RESCUE_BIN", binary), \
+                 patch.object(pilot, "check_regular"), \
+                 patch.object(pilot.os, "geteuid", return_value=binary.stat().st_uid):
+                binary.chmod(0o700)
+                with self.assertRaisesRegex(pilot.Blocked, "differs"):
+                    pilot.ensure_rescue_ready()
 
     def test_reject_wrong_approved_candidate_hash_without_writes(self):
         with tempfile.TemporaryDirectory() as td:
