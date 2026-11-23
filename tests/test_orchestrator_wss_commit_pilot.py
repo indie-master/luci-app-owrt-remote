@@ -71,17 +71,22 @@ class PilotTests(unittest.TestCase):
                 self.assertEqual(live.read_bytes(), original)
 
     def test_installed_rescue_must_match_reviewed_source(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            source = root / "source.py"
-            binary = root / "rescue"
+            source = Path(td) / "approved.py"
             source.write_text("approved rescue code")
-            binary.write_text("modified rescue code")
+            # Fake the metadata of the root-pinned executable; GitHub CI
+            # runs as an unprivileged user, but the production check must
+            # still require UID 0 and exact 0700 permissions.
+            binary = Mock()
+            binary.is_file.return_value = True
+            binary.is_symlink.return_value = False
+            binary.stat.return_value = SimpleNamespace(
+                st_uid=0, st_mode=0o100700)
+            binary.read_bytes.return_value = b"modified rescue code"
             with patch.object(pilot, "RESCUE_SOURCE", source), \
-                 patch.object(pilot, "RESCUE_BIN", binary), \
-                 patch.object(pilot, "check_regular"), \
-                 patch.object(pilot.os, "geteuid", return_value=binary.stat().st_uid):
-                binary.chmod(0o700)
+                 patch.object(pilot, "RESCUE_BIN", binary):
                 with self.assertRaisesRegex(pilot.Blocked, "differs"):
                     pilot.ensure_rescue_ready()
 
