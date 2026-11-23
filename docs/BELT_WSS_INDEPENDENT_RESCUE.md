@@ -61,7 +61,10 @@ sudo python3 tools/orchestrator_wss_commit_pilot.py status \
 Both commands use existing state and do not register a router, restart a
 service, or modify live configuration. Expected before first application:
 `WSS RESCUE STATUS: PASS` with `TRANSACTION: NONE`, and
-`WSS PILOT STATUS: PASS` with six active routers.
+`WSS PILOT STATUS: PASS` with six active routers. The pilot status
+explicitly prints `INDEPENDENT RESCUE: NOT_INSTALLED_OR_UNVERIFIED` until
+a byte-identical root-owned pinned copy is installed, then `PINNED_OK`.
+Fleet health alone never authorizes an Xray apply.
 
 ## Separate opt-in pinned installation, not yet required for the status test
 
