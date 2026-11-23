@@ -130,6 +130,7 @@ def render_stream_settings(profile: dict[str, Any]) -> dict[str, Any]:
             }
         })
     elif transport == "grpc":
+        settings["tlsSettings"]["alpn"] = ["h2"]
         settings.update({
             "network": "grpc",
             "grpcSettings": {
