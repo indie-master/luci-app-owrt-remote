@@ -5560,6 +5560,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
           </div>
           <div class="headerActions">
             <a class="badge" id="vpsTerminalLink" href="/vps-terminal/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Терминал VPS</a>
+            <a class="badge" href="/transport-configurator/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Транспорты</a>
             <button class="badge" id="xrayReload" type="button" {'hidden' if not is_owner else ''}>Обновить Xray CFG</button>
             <button class="badge" id="xrayRestart" type="button" {'hidden' if not is_owner else ''}>Рестарт Xray VPS</button>
             <button class="badge authToggle" id="authToggle" type="button">{safe_username}</button>
@@ -5893,6 +5894,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div id="hubMenuPanelHost"></div>
     <div class="mobileOwnerTools" id="mobileOwnerTools" hidden>
       <a class="badge" href="/vps-terminal/" id="mobileVpsTerminal" target="_blank" rel="noopener noreferrer">Терминал VPS</a>
+      <a class="badge" href="/transport-configurator/" target="_blank" rel="noopener noreferrer">Транспорты</a>
       <button class="badge" id="mobileXrayReload" type="button">Обновить Xray CFG</button>
       <button class="badge" id="mobileXrayRestart" type="button">Рестарт Xray VPS</button>
     </div>
