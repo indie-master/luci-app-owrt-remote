@@ -42,6 +42,7 @@ XRAY = Path("/usr/local/bin/xray")
 XRAY_SERVICE = "owrt-remote-xray.service"
 HUB_SERVICE = "owrt-remote.service"
 ADAPTER_SERVICE = "router-orchestrator-host-adapter.service"
+UNIT = Path("/etc/systemd/system/router-orchestrator-host-adapter.service")
 CONTROL = Path("/var/lib/router-orchestrator-wss-pilot")
 BACKUP = CONTROL / "xray-before.json"
 JOURNAL = CONTROL / "transaction.json"
@@ -237,9 +238,8 @@ def status(expected: str) -> dict:
     for path in (CONFIG, DB, HOLD):
         check_regular(path)
     ensure_services()
-    unit = Path("/etc/systemd/system/router-orchestrator-host-adapter.service")
-    check_regular(unit)
-    unit_content = unit.read_text()
+    check_regular(UNIT)
+    unit_content = UNIT.read_text()
     require("--allow-xray-apply" not in unit_content and
             "--allow-xray-restart" not in unit_content and
             "ProtectSystem=strict" in unit_content and
