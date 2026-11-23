@@ -216,10 +216,32 @@ def atomic_replace(path, data):
         if os.path.exists(temp):
             os.unlink(temp)
 
-def active_xray():
-    if systemctl("is-active", "--quiet", timeout=5).returncode:
-        return False
-    for port in (18443, 18444):
+# The adapter is the sole root-owned Docker lifecycle capability.
+# The HUB is never given docker.sock or container-name selection.
+XRAY_CONTAINER = "router-orchestrator-xray"
+XRAY_IMAGE_PREFIX = "router-orchestrator-xray:"
+PORTS = (18443, 18444)
+
+
+def docker(*args, timeout=45):
+    return subprocess.run(["/usr/bin/docker", *args], capture_output=True,
+                          text=True, timeout=timeout, check=False)
+
+
+def _container_state():
+    result = docker("inspect", "--format",
+                    "{{.State.Running}}|{{.Config.Image}}|{{.HostConfig.NetworkMode}}",
+                    XRAY_CONTAINER, timeout=8)
+    if result.returncode:
+        return None
+    parts = result.stdout.strip().split("|")
+    if len(parts) != 3 or not parts[1].startswith(XRAY_IMAGE_PREFIX) or parts[2] != "host":
+        return None
+    return parts[0] == "true"
+
+
+def _xray_port_ready():
+    for port in PORTS:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=1):
                 pass
@@ -227,12 +249,39 @@ def active_xray():
             return False
     return True
 
-def wait_xray(attempts=15):
+
+def active_xray():
+    # Never consider the Docker instance healthy while a legacy host
+    # systemd instance is also active, even if both reverse ports respond.
+    if systemctl("is-active", "--quiet", timeout=5).returncode == 0:
+        return False
+    return _container_state() is True and _xray_port_ready()
+
+
+def wait_xray(attempts=25):
     for _ in range(attempts):
         if active_xray():
             return True
         time.sleep(1)
     return False
+
+
+def restart_docker_xray(*, recovering=False):
+    """Allow recovery even if the candidate is unhealthy.
+
+    Unlike the original hotfix, rollback never requires an already healthy
+    Docker instance. The fixed container identity is rechecked after restart.
+    """
+    require(systemctl("is-active", "--quiet", timeout=5).returncode != 0,
+            "legacy systemd Xray is running; refusing Docker restart")
+    if not recovering:
+        require(active_xray(), "Docker Xray is unhealthy before restart")
+    state = _container_state()
+    require(state is not None, "unexpected Xray container identity/network")
+    action = ("restart", "--time", "5", XRAY_CONTAINER) if state else ("start", XRAY_CONTAINER)
+    result = docker(*action, timeout=50)
+    return result
+
 
 def clear_stale_socket(path):
     """Safely recover a crash-left socket; never remove an active listener.
@@ -331,10 +380,10 @@ class Adapter:
 
     def xray_restart(self):
         self.can_mutate(self.allow_restart)
-        require(systemctl("restart").returncode == 0 and wait_xray(),
+        require(restart_docker_xray().returncode == 0 and wait_xray(),
                 "Xray restart/health failed; investigate host service")
         self.last_restart = time.monotonic()
-        return {"ok": True, "service": SERVICE}
+        return {"ok": True, "service": XRAY_CONTAINER, "runtime": "docker"}
 
     def xray_apply(self, request):
         self.can_mutate(self.allow_apply)
@@ -345,7 +394,7 @@ class Adapter:
         validate_transition(json.loads(original), candidate)
         data = (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode()
         if json.loads(original) == candidate:
-            return {"ok": True, "unchanged": True, "service": SERVICE}
+            return {"ok": True, "unchanged": True, "service": XRAY_CONTAINER, "runtime": "docker"}
         fd, test_path = tempfile.mkstemp(prefix=".ro-candidate-", suffix=".json",
                                          dir=CONFIG.parent)
         try:
@@ -368,15 +417,15 @@ class Adapter:
             os.fsync(out.fileno())
         try:
             atomic_replace(CONFIG, data)
-            require(systemctl("restart").returncode == 0 and wait_xray(),
+            require(restart_docker_xray().returncode == 0 and wait_xray(),
                     "Xray candidate failed to start")
         except BaseException:
             atomic_replace(CONFIG, original)
-            recovered = systemctl("restart").returncode == 0 and wait_xray()
+            recovered = restart_docker_xray(recovering=True).returncode == 0 and wait_xray()
             require(recovered, "Xray rollback failed; immediate operator recovery required")
             raise Rejected("Xray candidate rejected; original config restored")
         self.last_restart = time.monotonic()
-        return {"ok": True, "unchanged": False, "service": SERVICE,
+        return {"ok": True, "unchanged": False, "service": XRAY_CONTAINER, "runtime": "docker",
                 "backup": str(backup)}
 
     def metrics(self):
@@ -416,7 +465,7 @@ class Adapter:
         if op == "host.metrics":
             return self.metrics()
         if op == "xray.status":
-            return {"ok": True, "active": active_xray(), "service": SERVICE}
+            return {"ok": True, "active": active_xray(), "service": XRAY_CONTAINER, "runtime": "docker"}
         if op == "xray.current":
             return self.current()
         if op == "xray.preview":
