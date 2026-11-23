@@ -25,9 +25,9 @@ cd "$REPO"
   die "Root utility directory missing/unsafe"
 [[ "$(stat -c %u /usr/local/sbin)" == "0" ]] ||
   die "Root utility directory not owned by root"
-[[ "$(stat -c %a /usr/local/sbin)" =~ ^[0-7]+$ ]] ||
-  die "Unexpected sbin permissions"
-[[ ! "$(stat -c %A /usr/local/sbin)" =~ ^d....w|^d.......w ]] ||
+SBIN_MODE="$(stat -c %a /usr/local/sbin)"
+[[ "$SBIN_MODE" =~ ^[0-7]{3,4}$ ]] || die "Unexpected sbin permissions"
+(( (8#$SBIN_MODE & 022) == 0 )) ||
   die "Root utility directory group/world writable"
 python3 -m py_compile "$SOURCE"
 SOURCE_SHA="$(sha256sum "$SOURCE" | awk '{print $1}')"
