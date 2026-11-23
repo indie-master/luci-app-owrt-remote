@@ -29,7 +29,14 @@ SBIN_MODE="$(stat -c %a /usr/local/sbin)"
 [[ "$SBIN_MODE" =~ ^[0-7]{3,4}$ ]] || die "Unexpected sbin permissions"
 (( (8#$SBIN_MODE & 022) == 0 )) ||
   die "Root utility directory group/world writable"
-python3 -m py_compile "$SOURCE"
+# Parse syntax in memory: py_compile would leave __pycache__ in the reviewed
+# checkout and make subsequent pinned Git integrity checks fail.
+python3 - "$SOURCE" <<'PY'
+import ast
+from pathlib import Path
+import sys
+ast.parse(Path(sys.argv[1]).read_text(encoding="utf-8"))
+PY
 SOURCE_SHA="$(sha256sum "$SOURCE" | awk '{print $1}')"
 install -o root -g root -m 0700 "$SOURCE" "$TARGET"
 [[ "$(stat -c %u:%g:%a "$TARGET")" == "0:0:700" ]] ||
