@@ -1,6 +1,6 @@
 # Router Orchestrator: unified Docker and transport manager
 
-Status: **design plus initial pure renderer; NOT production-ready**.
+Status: **implemented release candidate; not deployed, not production-accepted**.
 
 ## Goals and scope
 
@@ -28,10 +28,14 @@ from transports.
 
 ## Transport profiles
 
-Initial pure rendering implemented in `docker/transport_profiles.py`:
-legacy TCP, WSS/TLS, REALITY/TCP, XHTTP/TLS, gRPC/TLS. It is NOT yet wired
-to production routes, the web UI, or the router OpenWrt agent. Additional
-modes (e.g. REALITY with XHTTP or gRPC) require explicit reviewed schemas.
+The owner-only `/transport-configurator/` mini-panel and a strict pure renderer
+in `docker/transport_profiles.py` generate candidate server stream settings and
+OpenWrt client outbound for legacy TCP, WSS/TLS, REALITY/TCP, XHTTP/TLS,
+and gRPC/TLS. A protected Host Adapter validates a candidate listener with
+the deployed Docker Xray binary. **Applying profiles to real OpenWrt routers
+remains intentionally disabled** until the OpenWrt agent supports the extra
+transports and live canary/fallback migration is implemented. Additional
+modes (e.g. REALITY with XHTTP or gRPC) require separately reviewed schemas.
 
 The interactive page must implement:
 
