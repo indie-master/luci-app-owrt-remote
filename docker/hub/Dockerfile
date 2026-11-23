@@ -14,7 +14,9 @@ COPY vps/owrt-remote-hub.py /opt/owrt-remote/owrt-remote-hub.py
 RUN test -n "$HUB_SOURCE_SHA256" && \
     printf '%s  %s\n' "$HUB_SOURCE_SHA256" /opt/owrt-remote/owrt-remote-hub.py | sha256sum -c -
 COPY vps/static/ /opt/owrt-remote/static/
-RUN mkdir -p /var/lib/owrt-remote && \
+COPY --chmod=755 docker/hub/askpass.sh /opt/owrt-remote/bin/askpass.sh
+RUN groupadd --gid 23088 rohub && useradd --uid 23088 --gid 23088 --home-dir /opt/owrt-remote --shell /usr/sbin/nologin rohub && \
+    mkdir -p /var/lib/owrt-remote && \
     chown -R 23088:23088 /opt/owrt-remote /var/lib/owrt-remote
 USER 23088:23088
 CMD ["python", "/opt/owrt-remote/owrt-remote-hub.py", "serve"]
