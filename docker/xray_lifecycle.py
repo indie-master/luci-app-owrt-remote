@@ -190,9 +190,34 @@ def apply(image):
         raise
 
 
+def rollback():
+    """Manual recovery of last committed candidate, including if Xray is down."""
+    require(JOURNAL.is_file(), "no lifecycle journal")
+    previous = json.loads(JOURNAL.read_text())
+    require(previous.get("phase") in ("committed", "rolling-back"),
+            "journal is not in recoverable state")
+    old = previous["old_image"]
+    new = previous["new_image"]
+    require(IMAGE_RE.fullmatch(old) is not None and IMAGE_RE.fullmatch(new) is not None,
+            "invalid journal image name")
+    require(image_id(old) == previous["old_image_id"],
+            "known-good image digest changed")
+    before = ENV.read_bytes()
+    require(env_image(before) == new, "deployed image does not match journal")
+    require(run("systemctl", "is-active", "--quiet", SERVICE).returncode != 0,
+            "legacy systemd Xray is active")
+    write_journal(old, previous["old_image_id"], new,
+                  previous["new_image_id"], "rolling-back")
+    swap(old, before)
+    write_journal(old, previous["old_image_id"], new,
+                  previous["new_image_id"], "rolled-back")
+    print("MANUAL XRAY ROLLBACK: PASS")
+    print("RUNNING IMAGE:", old)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("status", "restart", "upgrade"))
+    parser.add_argument("action", choices=("status", "restart", "upgrade", "rollback"))
     parser.add_argument("--image", help="pre-verified local Xray image for upgrade")
     args = parser.parse_args()
     require(os.geteuid() == 0, "root required")
@@ -208,6 +233,8 @@ def main():
             require(result.returncode == 0 and wait_healthy(),
                     "restart failed; operator should inspect container")
             print("XRAY RESTART: PASS")
+        elif args.action == "rollback":
+            rollback()
         else:
             require(args.image, "--image is required")
             apply(args.image)
