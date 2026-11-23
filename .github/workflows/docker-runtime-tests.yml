@@ -34,7 +34,9 @@ jobs:
       - name: Host adapter systemd unit syntax
         run: systemd-analyze verify docker/host_adapter.service
       - name: Shell syntax
-        run: sh -n docker/install.sh
+        run: |
+          sh -n docker/install.sh
+          bash -n tools/orchestrator_host_adapter_readonly_install.sh
       - name: Unit tests
         run: |
           python -m unittest discover -s tests -p 'test_orchestrator_docker_runtime.py' -v
