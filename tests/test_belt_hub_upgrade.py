@@ -239,7 +239,13 @@ class GuardedUpgradeTests(unittest.TestCase):
         self.assertIn("def assert_xray_mutation_allowed():", source)
         reload_start = source.index("def reload_vps_xray(")
         restart_start = source.index("def restart_vps_xray(")
-        self.assertIn("assert_xray_mutation_allowed()", source[reload_start:reload_start+330])
+        # Require the maintenance guard before the first legacy host Xray
+        # output access, not at a brittle absolute character offset.
+        # Docker's separate host-adapter branch adds a few safe characters
+        # before the unchanged legacy guard.
+        reload_first_host_write = source.index("    out = Path(", reload_start)
+        self.assertIn("assert_xray_mutation_allowed()",
+                      source[reload_start:reload_first_host_write])
         self.assertIn("assert_xray_mutation_allowed()", source[restart_start:restart_start+360])
 
 
