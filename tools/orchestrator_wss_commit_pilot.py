@@ -32,6 +32,8 @@ import tempfile
 import time
 import uuid
 
+import orchestrator_belt_docker_migration_gate as gate
+
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = Path("/etc/xray/owrt-remote.json")
 DB = Path("/var/lib/owrt-remote/hub.db")
@@ -245,16 +247,25 @@ def status(expected: str) -> dict:
             "ProtectSystem=strict" in unit_content and
             "ReadWritePaths=/run/router-orchestrator" in unit_content,
             "host adapter is no longer in approved read-only mode")
-    with contextlib.closing(sqlite3.connect(DB.resolve().as_uri() + "?mode=ro",
-                                            uri=True, timeout=10)) as conn:
-        tally = {str(row[0]): int(row[1]) for row in conn.execute(
-            "select vps_transport, count(*) from routers "
-            "where deleted_at is null group by vps_transport"
-        )}
+    # Use the same canonical active-router semantics as the already
+    # successful six-router Belt rehearsal: SQLite may represent an active
+    # deleted_at as NULL *or* an empty string. The former SQL query treated
+    # all empty-string rows as deleted and incorrectly reported 0/0 PASS.
+    # This check also requires valid transport values and live UUID/portal
+    # parity, so an empty/inconsistent fleet cannot be mistaken for success.
+    try:
+        inventory = gate.db_inventory(DB)
+        gate.xray_parity(inventory, json.loads(CONFIG.read_bytes()))
+    except (gate.GateError, TypeError, AttributeError) as exc:
+        raise Blocked("live HUB SQLite/Xray router parity failed; "
+                      "no registration permitted") from exc
+    require(inventory["active_count"] == inventory["wss"] + inventory["tcp"],
+            "router transport inventory is inconsistent")
     phase = "NONE"
     if JOURNAL.exists() or JOURNAL.is_symlink():
         phase = read_journal()["state"]
-    return {"tcp": tally.get("tcp", 0), "wss": tally.get("ws", 0),
+    return {"tcp": inventory["tcp"], "wss": inventory["wss"],
+            "active_count": inventory["active_count"],
             "xray_sha": sha(CONFIG.read_bytes()), "transaction": phase}
 
 
@@ -437,7 +448,7 @@ def main():
         if args.mode == "status":
             result = status(args.expect_commit)
             print("WSS PILOT STATUS: PASS")
-            print("FLEET: WSS={wss} TCP={tcp}".format(**result))
+            print("FLEET: {active_count} active | WSS={wss} TCP={tcp}".format(**result))
             print("XRAY SHA256:", result["xray_sha"])
             print("TRANSACTION:", result["transaction"])
             print("HOST: systemd HUB/Xray active; adapter is read-only")
