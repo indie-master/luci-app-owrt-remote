@@ -4623,7 +4623,7 @@ def host_adapter_request(operation, payload=None):
     if len(encoded) > 2 * 1024 * 1024:
         raise RuntimeError("Host adapter request exceeds size limit")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-        channel.settimeout(35)
+        channel.settimeout(90)
         channel.connect(path)
         channel.sendall(encoded)
         with channel.makefile("rb") as reader:
@@ -10882,7 +10882,7 @@ function updateNotifyButton() {{
   syncNotificationFlags();
   notifyEnable.textContent = notificationPermissionText();
   if (notifyTest) notifyTest.disabled = hubPushServerReady === false;
-  notifyEnable.classList.toggle('on', Notification.permission === 'granted' && (localStorage.getItem('owrtNotifyEnabled') === '1' || localStorage.getItem('owrtPushEnabled') === '1'));
+  notifyEnable.classList.toggle('on', ('Notification' in window && Notification.permission === 'granted') && (localStorage.getItem('owrtNotifyEnabled') === '1' || localStorage.getItem('owrtPushEnabled') === '1'));
 }}
 
 function setNotifyStatus(text, bad = false) {{
@@ -13274,7 +13274,7 @@ def ssh_terminal_html_v2(row, ws_token, quick_commands_html=""):
     connect_label = "VPS terminal" if is_vps_terminal else "SSH"
     closed_label = "VPS terminal закрыт" if is_vps_terminal else "SSH соединение закрыто"
     silent_label = "VPS terminal молчит больше 3 секунд" if is_vps_terminal else "SSH молчит больше 3 секунд"
-    ready_label = "VPS terminal запущен. Это root shell самого VPS. Команды ниже можно копировать или сразу отправлять в терминал." if is_vps_terminal else ""
+    ready_label = "VPS terminal запущен. Терминал VPS (пользователь roterm; sudo по паролю). Команды ниже можно копировать или сразу отправлять в терминал." if is_vps_terminal else ""
     force_http_only = str(os.environ.get("OWRT_REMOTE_TERMINAL_WS", "")).lower() not in {"1", "yes", "true", "on"}
     if is_vps_terminal:
         header_title = "VPS terminal"
@@ -17782,18 +17782,14 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         except OSError:
             pass
         router_id = self.router_id_from_path("/ssh-ws/")
-        if self.ssh_token_ok(router_id):
-            allowed = True
-        elif is_vps_terminal_id(router_id):
+        if is_vps_terminal_id(router_id):
             allowed = self.owner_ok()
+        elif self.ssh_token_ok(router_id):
+            allowed = True
         else:
             allowed = self.router_access_allowed(router_id, "B")
         if not allowed:
             self.send_response(403 if self.admin_ok() else 401)
-            self.end_headers()
-            return
-        if is_vps_terminal_id(router_id) and DOCKER_RUNTIME:
-            self.send_response(409)
             self.end_headers()
             return
         if not is_vps_terminal_id(router_id):
@@ -17828,20 +17824,17 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         router_id = self.router_id_from_path("/api/ssh/")
         if router_id.endswith("/check"):
             router_id = router_id[:-6].rstrip("/")
-        if self.ssh_token_ok(router_id):
-            allowed = True
-        elif is_vps_terminal_id(router_id):
+        if is_vps_terminal_id(router_id):
             allowed = self.owner_ok()
+        elif self.ssh_token_ok(router_id):
+            allowed = True
         else:
             allowed = self.router_access_allowed(router_id, "B")
         if not allowed:
             self.send_json(403, {"ok": False, "error": "not authorized", "tcp_ok": False})
             return
         if is_vps_terminal_id(router_id):
-            if DOCKER_RUNTIME:
-                self.send_json(409, {"ok": False, "router_id": router_id, "tcp_ok": False, "error": "Host VPS terminal adapter required"})
-                return
-            self.send_json(200, {"ok": True, "router_id": router_id, "tcp_ok": True, "mode": "local-shell"})
+            self.send_json(200, {"ok": True, "router_id": router_id, "tcp_ok": True, "mode": "host-ssh" if DOCKER_RUNTIME else "local-shell"})
             return
         with self.app.conn() as conn:
             row = get_active_router(conn, router_id)
@@ -17926,22 +17919,14 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         password = str(ssh_password or "")
         if not password:
             return None
-        askpass_dir = Path(tempfile.mkdtemp(prefix="owrt-askpass-"))
-        askpass_script = askpass_dir / "askpass.sh"
-        try:
-            askpass_script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$OWRT_REMOTE_SSH_PASSWORD\"\n",
-                encoding="utf-8",
-            )
-            os.chmod(askpass_script, 0o700)
-            env["SSH_ASKPASS"] = str(askpass_script)
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            env["DISPLAY"] = env.get("DISPLAY") or "owrt-remote:0"
-            env["OWRT_REMOTE_SSH_PASSWORD"] = password
-        except BaseException:
-            shutil.rmtree(askpass_dir)
-            raise
-        return askpass_dir
+        helper = "/opt/owrt-remote/bin/askpass.sh"
+        if not os.access(helper, os.X_OK):
+            raise RuntimeError("SSH askpass helper is not executable")
+        env["SSH_ASKPASS"] = helper
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY") or "owrt-remote:0"
+        env["OWRT_REMOTE_SSH_PASSWORD"] = password
+        return None
 
     def normalize_wol_mac(self, value):
         mac = str(value or "").strip().upper().replace("-", ":")
@@ -18696,7 +18681,20 @@ exit 127
 
     def vps_shell_args(self):
         if DOCKER_RUNTIME:
-            raise RuntimeError("VPS host shell is unavailable in Docker without an audited host terminal adapter")
+            env = os.environ.copy()
+            env["TERM"] = "xterm-256color"
+            return env, [
+                "ssh", "-tt",
+                "-i", "/opt/owrt-remote/.host-terminal-key",
+                "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "UserKnownHostsFile=/opt/owrt-remote/.host-terminal-known",
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "ServerAliveInterval=15",
+                "-o", "ConnectTimeout=5",
+                "roterm@127.0.0.1",
+            ]
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         shell = env.get("SHELL", "")
@@ -18814,10 +18812,10 @@ exit 127
 
     def ssh_http_session(self):
         router_id = self.router_id_from_path("/api/ssh/")
-        if self.ssh_token_ok(router_id):
-            allowed = True
-        elif is_vps_terminal_id(router_id):
+        if is_vps_terminal_id(router_id):
             allowed = self.owner_ok()
+        elif self.ssh_token_ok(router_id):
+            allowed = True
         else:
             allowed = self.router_access_allowed(router_id, "B")
         if not allowed:
@@ -18855,6 +18853,14 @@ exit 127
         if not session:
             self.send_json(404, {"ok": False, "error": "terminal session not found", "alive": False, "data": ""})
             return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
+            return
         with session["lock"]:
             data = "".join(session["buffer"])
             session["buffer"].clear()
@@ -18867,6 +18873,14 @@ exit 127
             session = SSH_HTTP_SESSIONS.get(sid)
         if not session:
             self.send_json(404, {"ok": False, "error": "terminal session not found"})
+            return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
             return
         if payload is None:
             payload = self.read_payload()
@@ -18898,6 +18912,14 @@ exit 127
         if not session:
             self.send_json(404, {"ok": False, "error": "terminal session not found"})
             return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
+            return
         if payload is None:
             payload = self.read_payload()
         with session["lock"]:
@@ -18920,10 +18942,20 @@ exit 127
 
     def ssh_http_close(self, sid):
         with SSH_HTTP_LOCK:
-            session = SSH_HTTP_SESSIONS.pop(sid, None)
+            session = SSH_HTTP_SESSIONS.get(sid)
         if not session:
             self.send_json(200, {"ok": True})
             return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
+            return
+        with SSH_HTTP_LOCK:
+            SSH_HTTP_SESSIONS.pop(sid, None)
         with session["lock"]:
             session["alive"] = False
         self.send_json(200, {"ok": True})
