@@ -34,6 +34,7 @@ class XrayDryRunTests(unittest.TestCase):
     def test_refuses_unverified_peer(self):
         with patch.object(dry.acceptance, "preflight"), \
              patch.object(dry.acceptance, "check_systemd"), \
+             patch.object(dry.acceptance, "PINNED", ROOT / "docker/host_adapter.py"), \
              patch.object(dry.acceptance, "root_peer_rejected",
                           return_value=False), \
              patch.object(dry.synthetic, "preview") as preview:
