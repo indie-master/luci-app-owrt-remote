@@ -20,10 +20,13 @@ class DockerRuntimeContracts(unittest.TestCase):
         self.assertIn("OWRT_REMOTE_RUNTIME: docker", compose)
         self.assertNotIn("docker.sock", compose)
 
-    def test_source_disables_systemd_update_and_host_terminal(self):
+    def test_source_disables_systemd_update_and_requires_pinned_host_terminal(self):
         source = (REPO / "vps" / "owrt-remote-hub.py").read_text()
         self.assertIn("if DOCKER_RUNTIME:", source)
-        self.assertIn("Host VPS terminal adapter required", source)
+        self.assertIn("StrictHostKeyChecking=yes", source)
+        self.assertIn("UserKnownHostsFile=/opt/owrt-remote/.host-terminal-known", source)
+        self.assertIn("roterm@127.0.0.1", source)
+        self.assertIn("allowed = self.owner_ok()", source)
         self.assertIn("Docker HUB updates require a reviewed image", source)
         self.assertIn("external_readonly", (REPO / "docker-compose.yml").read_text())
 
