@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Router Orchestrator · Transport Configurator</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui,-apple-system,Segoe UI,sans-serif;background:#10151d;color:#eef1f7}
+*{box-sizing:border-box}body{margin:0 auto;max-width:1040px;padding:24px}header{display:flex;align-items:center;justify-content:space-between;gap:16px}
+h1{font-size:25px}h2{font-size:18px}.muted{color:#9aa8b9}a{color:#95beff}.panel{background:#19222e;border:1px solid #344254;border-radius:12px;padding:20px;margin:18px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:14px}label{display:flex;flex-direction:column;gap:7px;font-size:13px}
+input,select,button{background:#0f1823;color:#f3f6fb;border:1px solid #52647a;padding:11px;border-radius:8px;font:inherit;min-width:0}
+button{cursor:pointer;background:#2a5e9a;border-color:#2a5e9a;font-weight:600}button:disabled{opacity:.4;cursor:default}
+button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c1219;padding:16px;border-radius:8px;min-height:80px}
+.note{border-left:3px solid #c8a661;padding:10px 14px;background:#26251d}.error{color:#ffaaa9}
+</style></head><body>
+<header><div><h1>Конфигуратор транспортов</h1><div class="muted">Router Orchestrator · Preview-only</div></div><a href="/">← HUB</a></header>
+<div class="note">Сейчас генератор только проверяет параметры и показывает безопасный предварительный результат. Применение к роутерам и замена действующих туннелей отключены до появления транзакционного переключения с откатом.</div>
+<form class="panel" id="editor">
+<h2>Новый транспорт управления</h2>
+<div class="grid">
+<label>Название профиля<input name="name" value="pilot-transport" maxlength="64" required></label>
+<label>Транспорт<select name="transport" id="transport"><option value="tcp">TCP Legacy</option><option value="wss">WSS / TLS</option><option value="reality-tcp">TCP / REALITY</option><option value="xhttp">XHTTP / TLS</option><option value="grpc">gRPC / TLS</option></select></label>
+<label>Порт<input name="port" type="number" min="1" max="65535" value="18445" required></label>
+<label data-field="server_name">SNI / домен<input name="server_name" value="router.example.org"></label>
+<label data-field="path">URL path<input name="path" value="/owrt-remote"></label>
+<label data-field="service_name">gRPC service name<input name="service_name" value="owrt_remote"></label>
+<label data-field="certificate_file">Сертификат (путь внутри Xray)<input name="certificate_file" value="/etc/router-orchestrator/tls/fullchain.pem"></label>
+<label data-field="key_file">Ключ TLS (путь внутри Xray)<input name="key_file" value="/etc/router-orchestrator/tls/privkey.pem"></label>
+<label data-field="target_host">REALITY target host<input name="target_host" value="www.example.org"></label>
+<label data-field="target_port">REALITY target port<input name="target_port" type="number" value="443"></label>
+<label data-field="short_ids">REALITY short IDs, через запятую<input name="short_ids" value="aabbccdd"></label>
+<label data-field="private_key">REALITY private key<input name="private_key" type="password" autocomplete="off" placeholder="Вставить только для предварительной проверки"></label>
+</div><p><button type="submit">Проверить и сгенерировать</button> <button type="button" class="secondary" disabled title="Доступно после внедрения транзакционного применения">Применить к роутеру</button></p>
+</form>
+<div class="panel"><h2>Результат проверки</h2><pre id="output" aria-live="polite">Выбери транспорт и нажми «Проверить».</pre></div>
+<script>
+const form=document.getElementById('editor'),output=document.getElementById('output'),choice=document.getElementById('transport');
+const fields={tcp:[],wss:['server_name','path','certificate_file','key_file'],'reality-tcp':['server_name','target_host','target_port','short_ids','private_key'],xhttp:['server_name','path','certificate_file','key_file'],grpc:['server_name','service_name','certificate_file','key_file']};
+function refresh(){const allowed=new Set(fields[choice.value]);for(const label of form.querySelectorAll('[data-field]'))label.hidden=!allowed.has(label.dataset.field)}
+choice.addEventListener('change',refresh);refresh();
+form.addEventListener('submit',async e=>{
+ e.preventDefault();output.classList.remove('error');output.textContent='Проверка…';
+ const values=Object.fromEntries(new FormData(form).entries());
+ const data={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])data[key]=values[key];
+ if(values.transport==='reality-tcp'){data.target_port=Number(values.target_port);data.short_ids=values.short_ids.split(',').map(x=>x.trim());data.server_names=[values.server_name]}
+ try{const response=await fetch('/api/transports/preview',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({profiles:[data]})});const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Ошибка');output.textContent=JSON.stringify(result.preview,null,2)}
+ catch(err){output.classList.add('error');output.textContent=String(err.message||err)}
+});
+</script></body></html>
