@@ -81,9 +81,10 @@ def secure_parent(path: Path, *, private: bool, allow_sticky: bool = False):
         require((mode & 0o077) == 0,
                 "private rescue directory has unsafe permissions")
     else:
+        # /run/lock can be root-owned mode 1777 with sticky bit; that
+        # prevents unprivileged unlinking of a root-owned lock inode.
         require((mode & 0o022) == 0 or
-                (allow_sticky and (mode & stat.S_ISVTX) and
-                 not (mode & 0o020 and not (mode & stat.S_ISVTX))),
+                (allow_sticky and bool(mode & stat.S_ISVTX)),
                 "rescue directory is writable by an untrusted user")
 
 
