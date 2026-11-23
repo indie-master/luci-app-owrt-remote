@@ -27,13 +27,20 @@ jobs:
           python-version: '3.11'
       - name: Syntax check production modules
         run: |
-          python -m py_compile vps/owrt-remote-hub.py docker/host_adapter.py docker/transport_profiles.py docker/xray_lifecycle.py
+          python -m py_compile vps/owrt-remote-hub.py docker/host_adapter.py docker/transport_profiles.py docker/xray_lifecycle.py docker/xray_releases.py docker/core_job_runner.py deploy/prepare_belt.py docker/cleanup.py
           python -m py_compile tests/test_transport_profiles.py
       - name: Pure transport tests
         run: python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
+          python -m unittest discover -s tests -p 'test_xray_core_manager.py' -v
       - name: Validate embedded nginx configuration
         run: |
           docker run --rm -v "$PWD/deploy/nginx/embedded.conf:/etc/nginx/nginx.conf:ro" nginx:1.29-alpine nginx -t
+      - name: Validate embedded TLS stream nginx syntax
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout privkey.pem -out fullchain.pem -days 1 -nodes -subj '/CN=router.example.org' >/dev/null 2>&1
+          mkdir -p /tmp/ro-test-tls
+          cp fullchain.pem privkey.pem /tmp/ro-test-tls/
+          docker run --rm -v "$PWD/deploy/nginx/embedded-stream-tls.conf:/etc/nginx/nginx.conf:ro" -v "/tmp/ro-test-tls:/etc/router-orchestrator/tls:ro" nginx:1.29-alpine nginx -t
       - name: Validate consolidated Compose
         env:
           RO_HUB_IMAGE: router-orchestrator-hub:test
