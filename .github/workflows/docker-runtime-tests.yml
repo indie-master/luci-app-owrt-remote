@@ -23,6 +23,8 @@ on:
       - 'tools/orchestrator_docker_wss_enrollment_preview.py'
       - 'tests/test_orchestrator_wss_preview.py'
       - 'tests/test_wss_transport.py'
+      - 'tools/orchestrator_wss_commit_pilot.py'
+      - 'tests/test_orchestrator_wss_commit_pilot.py'
       - 'tools/orchestrator_belt_cutover.py'
       - 'tests/test_orchestrator_belt_cutover.py'
 jobs:
@@ -34,7 +36,7 @@ jobs:
         with:
           python-version: '3.10'
       - name: Compile source files
-        run: python -m py_compile docker/manager.py docker/host_adapter.py vps/owrt-remote-hub.py tools/orchestrator_belt_rehearsal.py tools/orchestrator_docker_candidate_rehearsal.py tools/orchestrator_belt_cutover.py tools/orchestrator_docker_wss_enrollment_preview.py tools/orchestrator_host_adapter_readonly_acceptance.py tools/orchestrator_host_adapter_xray_dryrun.py
+        run: python -m py_compile docker/manager.py docker/host_adapter.py vps/owrt-remote-hub.py tools/orchestrator_belt_rehearsal.py tools/orchestrator_docker_candidate_rehearsal.py tools/orchestrator_belt_cutover.py tools/orchestrator_docker_wss_enrollment_preview.py tools/orchestrator_host_adapter_readonly_acceptance.py tools/orchestrator_host_adapter_xray_dryrun.py tools/orchestrator_wss_commit_pilot.py
       - name: Host adapter systemd unit syntax
         run: systemd-analyze verify docker/host_adapter.service
       - name: Shell syntax
@@ -53,6 +55,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_orchestrator_belt_cutover.py' -v
           python -m unittest discover -s tests -p 'test_orchestrator_wss_preview.py' -v
           python -m unittest discover -s tests -p 'test_wss_transport.py' -v
+          python -m unittest discover -s tests -p 'test_orchestrator_wss_commit_pilot.py' -v
       - name: Validate compose model
         run: |
           cp .env.example .env
