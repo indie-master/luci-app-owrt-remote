@@ -1,6 +1,7 @@
 """Offline tests of the operator-gated one-router Xray commit transaction."""
 import contextlib
 import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -46,7 +47,7 @@ class PilotTests(unittest.TestCase):
                 self.assertEqual(doc["state"], "APPLIED_PENDING_ROUTER")
                 self.assertEqual(live.read_bytes(), new)
                 self.assertEqual((control / "xray-before.json").read_bytes(), original)
-                self.assertEqual(pilot.read_journal()["state"], "APPLIED_PENDING_ROUTER")
+                self.assertEqual(json.loads((control / "transaction.json").read_text())["state"], "APPLIED_PENDING_ROUTER")
                 restart.assert_called_once()
                 self.assertEqual((control / "xray-before.json").stat().st_mode & 0o777,
                                  0o600)
@@ -79,7 +80,7 @@ class PilotTests(unittest.TestCase):
                 with self.assertRaises(pilot.Blocked):
                     pilot.apply("new", "a" * 40, pilot.sha(new))
                 self.assertEqual(live.read_bytes(), original)
-                self.assertEqual(pilot.read_journal()["state"], "ROLLED_BACK")
+                self.assertEqual(json.loads((control / "transaction.json").read_text())["state"], "ROLLED_BACK")
                 self.assertEqual(restart.call_count, 2)
 
     def test_manual_rollback_after_interrupted_commit(self):
@@ -94,12 +95,13 @@ class PilotTests(unittest.TestCase):
             live.write_bytes(new)
             with self.patch_paths(control, live), \
                  patch.object(pilot.os, "geteuid", return_value=0), \
+                 patch.object(pilot, "read_journal", side_effect=lambda: json.loads((control / "transaction.json").read_text())), \
                  patch.object(pilot, "restart_xray") as restart:
                 doc = pilot.rollback(confirm=True)
                 self.assertEqual(doc["state"], "ROLLED_BACK")
                 self.assertEqual(live.read_bytes(), original)
                 restart.assert_called_once()
-                self.assertEqual(pilot.read_journal()["state"], "ROLLED_BACK")
+                self.assertEqual(json.loads((control / "transaction.json").read_text())["state"], "ROLLED_BACK")
 
     def test_refuses_external_config_drift_during_recovery(self):
         with tempfile.TemporaryDirectory() as td:
@@ -114,6 +116,7 @@ class PilotTests(unittest.TestCase):
             live.write_bytes(external)
             with self.patch_paths(control, live), \
                  patch.object(pilot.os, "geteuid", return_value=0), \
+                 patch.object(pilot, "read_journal", side_effect=lambda: json.loads((control / "transaction.json").read_text())), \
                  patch.object(pilot, "restart_xray") as restart:
                 with self.assertRaisesRegex(pilot.Blocked, "outside transaction"):
                     pilot.rollback(confirm=True)
@@ -129,8 +132,18 @@ class PilotTests(unittest.TestCase):
                  patch.object(pilot, "JOURNAL", root / "journal"):
                 with self.assertRaisesRegex(pilot.Blocked, "required file"):
                     pilot.preconditions("a" * 40, "new")
-            with self.assertRaisesRegex(pilot.Blocked, "invalid router"):
+            with patch.object(pilot.os, "geteuid", return_value=0), \
+                 self.assertRaisesRegex(pilot.Blocked, "invalid router"):
                 pilot.preconditions("a" * 40, "../unsafe")
+
+    def test_status_is_readonly_and_has_no_seventh_router_requirement(self):
+        text = (REPO / "tools/orchestrator_wss_commit_pilot.py").read_text()
+        fragment = text.split("def status(", 1)[1].split("\ndef preview(", 1)[0]
+        self.assertIn("select vps_transport, count(*)", fragment)
+        self.assertNotIn("build_candidate(", fragment)
+        self.assertNotIn("atomic_write(", fragment)
+        self.assertNotIn("restart_xray(", fragment)
+        self.assertNotIn("save_journal(", fragment)
 
     def test_rollback_refuses_unconfirmed(self):
         with self.assertRaisesRegex(pilot.Blocked, "requires --confirm"):
