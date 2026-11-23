@@ -165,3 +165,67 @@ def validate_profiles(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "streamSettings": render_stream_settings(profile)
         })
     return rendered
+
+def render_router_outbound(profile: dict[str, Any], *, router_uuid: str,
+                           remote_host: str) -> dict[str, Any]:
+    """Generate a *candidate* OpenWrt Xray VLESS outbound, never deploy it.
+
+    Bridge/reverse tags must be integrated by a separate canary transaction.
+    Server REALITY private key is never copied into the client structure.
+    """
+    import uuid as uuid_module
+    try:
+        identity = str(uuid_module.UUID(router_uuid))
+    except (ValueError, AttributeError, TypeError):
+        raise ProfileError("invalid router_uuid") from None
+    host = _host(remote_host)
+    port = _port(profile.get("port"))
+    name = _name(_required_string(profile, "name", maximum=64), "name")
+    server = render_stream_settings(profile)
+    transport = profile["transport"]
+    if transport == "reality-tcp":
+        public_key = _required_string(profile, "public_key", maximum=80)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", public_key):
+            raise ProfileError("invalid REALITY public key")
+        stream = {
+            "network": "tcp", "security": "reality",
+            "realitySettings": {
+                "serverName": profile["server_name"],
+                "fingerprint": "chrome",
+                "publicKey": public_key,
+                "shortId": profile["short_ids"][0],
+            },
+        }
+    elif transport == "tcp":
+        stream = {"network": "tcp", "security": "none"}
+    else:
+        stream = {
+            "network": server["network"],
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": profile["server_name"],
+                "allowInsecure": False,
+            }
+        }
+        if transport == "wss":
+            stream["wsSettings"] = {
+                "path": server["wsSettings"]["path"],
+                "headers": {"Host": profile["server_name"]}
+            }
+        elif transport == "xhttp":
+            stream["xhttpSettings"] = dict(server["xhttpSettings"])
+        elif transport == "grpc":
+            stream["grpcSettings"] = dict(server["grpcSettings"])
+            stream["tlsSettings"]["alpn"] = ["h2"]
+    return {
+        "tag": "ro-control-" + name,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": host, "port": port,
+                "users": [{"id": identity, "encryption": "none"}],
+            }]
+        },
+        "streamSettings": stream,
+    }
+
