@@ -623,6 +623,10 @@ class Adapter:
             return self.xray_preview(request)
         if op == "xray.transport.preview":
             return self.transport_preview(request)
+        if op == "xray.core.info":
+            return {"ok": True, "active": active_xray(),
+                    "image": docker_inspect_image(),
+                    "runtime": "docker"}
         if op == "xray.core.start":
             return self.core_job_start(request)
         if op == "xray.core.job":
