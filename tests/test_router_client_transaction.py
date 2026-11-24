@@ -193,5 +193,26 @@ install_recovery() {
             self.assertEqual((self.fixture / rel).read_text(), "# candidate\n")
 
 
+    def test_confirmed_disk_update_can_be_rolled_back_before_activation(self):
+        self.arm()
+        self.start_workers()
+        self.call("apply", self.sha)
+        self.call("confirm", (self.state / "client.nonce").read_text().strip())
+        self.call("rollback-confirmed")
+        self.assert_originals()
+        self.assertIn("ROLLED_BACK", self.call("status").stdout)
+
+    def test_confirmed_rollback_refuses_changed_installed_file(self):
+        self.arm()
+        self.start_workers()
+        self.call("apply", self.sha)
+        self.call("confirm", (self.state / "client.nonce").read_text().strip())
+        changed = self.fixture / builder.FILES[0][0]
+        changed.write_text("# concurrent edit\n")
+        self.call("rollback-confirmed", ok=False)
+        self.assertEqual(changed.read_text(), "# concurrent edit\n")
+        self.assertFalse((self.state / "client.pending").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
