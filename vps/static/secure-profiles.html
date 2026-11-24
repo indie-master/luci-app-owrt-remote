@@ -84,7 +84,7 @@ get('preferences').addEventListener('submit',async e=>{
   const catalog=get('catalog');catalog.replaceChildren();
   for(const p of data.revisions){
    const item=document.createElement('div'),info=document.createElement('div'),name=document.createElement('strong'),detail=document.createElement('div'),state=document.createElement('span');
-   item.className='item';name.textContent=p.label+' · rev '+p.revision;detail.className='muted';detail.textContent=p.transport+' · '+p.hostname+':'+p.public_port;
+   item.className='item';name.textContent=p.label+' · rev '+p.revision;detail.className='muted';detail.textContent=p.transport+' · '+p.hostname+':'+p.public_port+' · backend '+p.backend_port+' · SNI: '+p.server_names.join(', ');
    state.className='state';state.textContent=p.published?'Опубликован':'Черновик';
    info.append(name,detail);item.append(info,state);
    if(!p.published){
@@ -116,7 +116,7 @@ get('preferences').addEventListener('submit',async e=>{
     const approve=document.createElement('button');
     approve.type='button';approve.textContent='Разрешить SNI';
     approve.addEventListener('click',async()=>{
-     if(!confirm('Разрешить точные SNI из этой сохранённой ревизии для будущей публикации? DNS, nginx и роутеры сейчас не изменятся.'))return;
+     if(!confirm('Разрешить SNI: '+p.server_names.join(', ')+'? DNS, nginx и роутеры сейчас не изменятся.'))return;
      approve.disabled=true;plan.disabled=true;
      try{
       const data=await api('/api/secure-profiles/approve',{profile_id:p.profile_id,revision:p.revision,confirmed:true});
