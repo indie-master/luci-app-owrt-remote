@@ -35,6 +35,10 @@ def run():
             print("WATCHDOG: lifecycle in progress, skipped")
             return
 
+        if life.TRANSPORT_HOLD.exists():
+            print("WATCHDOG: configuration transaction pending, skipped")
+            return
+
         if not life.JOURNAL.is_file() or not life.ENV.is_file():
             print("WATCHDOG: no committed core upgrade to monitor")
             return
