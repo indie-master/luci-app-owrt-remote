@@ -148,6 +148,36 @@ REALITY/XHTTP/gRPC should be deployed to customer routers. Do not
 manually paste preview-only client config as if it were a complete
 remote-management config.
 
+## Guarded experimental transport shadow stage (not production promotion)
+
+The transport mini-panel now supports server and router-client preview,
+per-router shadow reverse tags and tests, and a remote OpenWrt
+`transport-preflight`. The agent additionally contains a separate
+`transport-pilot-start` process with a 180-second automatic stop, preserving
+current UCI and the original procd instance.
+
+The root-only server transaction `docker/transport_stage.py` is deliberately
+separate from ordinary Xray config reload. It adds a full new ingress plus
+separate loopback LuCI/SSH reverse portals; it retains original inbounds
+and routes byte-for-byte, validates with the active Docker Xray core,
+backs up the exact original config, and checks that existing routers
+recover after the unavoidable Xray process restart. It will roll
+back on failure or after a 600-second lease; an independent systemd timer
+also expires it after a reboot.
+
+**This is not a complete transport migration.** The CLI currently
+requires an explicitly prepared root-owned profile, a reachable pilot
+ingress port, and a separately installed updated OpenWrt agent. The
+profile must be tested on a noncritical pilot router first. The Web
+button to actually change the primary connection stays disabled until
+automatic confirmation, transport promotion and router-side recovery
+have been demonstrated on real hardware. A temporary pilot must never
+be counted as a persistent migration.
+
+Use `python3 docker/transport_stage.py status` for an existing root-only
+transaction inspection in a test environment. Never run `stage` on
+Belt simply to inspect a configuration: it **restarts production Xray**.
+
 ## Post-cutover acceptance
 
 - HUB owner and delegated-account RBAC; no delegated VPS root shell.
