@@ -17,7 +17,9 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <h2>Новый транспорт управления</h2>
 <div class="grid">
 <label>Название профиля<input name="name" value="pilot-transport" maxlength="64" required></label>
-<label>Транспорт<select name="transport" id="transport"><option value="tcp-tls">TCP / TLS</option><option value="wss">WSS / TLS</option><option value="reality-tcp">TCP / REALITY</option><option value="xhttp">XHTTP / TLS</option><option value="grpc">gRPC / TLS</option><option value="reality-xhttp">XHTTP / REALITY</option><option value="reality-grpc">gRPC / REALITY</option></select></label>
+<label>Транспорт<select id="transportFamily"><option value="tcp">TCP / RAW</option><option value="ws">WebSocket</option><option value="xhttp">XHTTP</option><option value="grpc">gRPC</option></select></label>
+<label>Защита<select id="transportSecurity"><option value="tls">TLS</option><option value="reality">REALITY</option></select></label>
+<input type="hidden" id="transport" name="transport" value="tcp-tls">
 <label>Порт<input name="port" type="number" min="1" max="65535" value="18446" required></label>
 <label>Хост VPS для подключения роутера<input name="remote_host" value="router.example.org" maxlength="255"></label>
 <label>UUID роутера (необязательно; только для клиентского JSON)<input name="router_uuid" autocomplete="off" placeholder="UUID из карточки роутера"></label>
@@ -70,7 +72,18 @@ document.getElementById('generateReality').addEventListener('click',async()=>{
  }catch(error){output.classList.add('error');output.textContent='Браузер не поддерживает генерацию X25519 в этом контексте. Используй HTTPS и современный браузер либо вставь пару из xray x25519.'}
 });
 function refresh(){const allowed=new Set(fields[choice.value]);for(const label of form.querySelectorAll('[data-field]'))label.hidden=!allowed.has(label.dataset.field);document.getElementById('realityActions').hidden=!isReality(choice.value)}
-choice.addEventListener('change',refresh);refresh();
+const family=document.getElementById('transportFamily'),protection=document.getElementById('transportSecurity');
+function selectWireProfile(){
+ const ws=family.value==='ws';
+ protection.querySelector('option[value="reality"]').disabled=ws;
+ if(ws)protection.value='tls';
+ choice.value=protection.value==='reality'?'reality-'+family.value:
+    ({tcp:'tcp-tls',ws:'wss',xhttp:'xhttp',grpc:'grpc'})[family.value];
+ refresh();
+}
+family.addEventListener('change',selectWireProfile);
+protection.addEventListener('change',selectWireProfile);
+selectWireProfile();
 (async()=>{
  try{
   const response=await fetch('/api/transports/routers',{credentials:'same-origin'});
