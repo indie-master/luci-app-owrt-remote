@@ -661,7 +661,7 @@ render_client_config() (
 		fi
 	done
 	case "$vps_host" in *://*|*/*) die "vps_host должен содержать IP или домен без http(s):// и пути" ;; esac
-	case "$vps_transport" in tcp|ws|reality-tcp|xhttp|grpc) ;; *) die "vps_transport: неподдерживаемый транспорт" ;; esac
+	case "$vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc) ;; *) die "vps_transport: неподдерживаемый транспорт" ;; esac
 	stream_fields='"network": "tcp", "security": "none"'
 	admin_rules=''
 	ssh_rules=''
@@ -670,6 +670,9 @@ render_client_config() (
 		case "$vps_sni" in *://*|*/*|*[!a-zA-Z0-9._-]*) die "Некорректный vps_sni" ;; esac
 	fi
 	case "$vps_transport" in
+		tcp-tls)
+			stream_fields="\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false}"
+			;;
 		ws)
 			case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
 			case "$vps_ws_path" in *[!a-zA-Z0-9/._~-]*) die "Недопустимый vps_ws_path" ;; esac
