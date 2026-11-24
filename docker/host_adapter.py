@@ -831,7 +831,7 @@ class Adapter:
         fd = os.open(LIFECYCLE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(fd)
-            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
                     and info.st_nlink == 1 and not info.st_mode & 0o022,
                     "unsafe Xray lifecycle lock")
             try:
