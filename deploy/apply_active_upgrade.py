@@ -22,6 +22,7 @@ sys.path.insert(0,str(REPO/"docker"))
 import xray_lifecycle as life
 from secure_publication_transaction import atomic,read_regular,sync_directory
 from secure_publication_worker import exclusive,capture_fleet,wait_fleet,identity
+from secure_ingress_inventory import nginx_digest
 
 ADAPTER="router-orchestrator-host-adapter.service"
 TIMERS=("router-orchestrator-xray-watchdog.timer","router-orchestrator-transport-expiry.timer",
@@ -90,10 +91,12 @@ def check_files(record):
     for path,expected in ((XRAY,record["xray_sha"]),(NGINX,record["map_sha"]),
                           (EXTERNAL_NGINX,record["nginx_sha"])):
         require(digest(path.read_bytes())==expected,"external configuration changed: "+path.name)
+    require(nginx_digest("external-stream")==record["nginx_full_sha"],"external nginx include tree changed")
 
 
 def unit_exists(name):
-    return run("systemctl","show","-p","LoadState","--value",name,timeout=10).decode().strip() != "not-found"
+    # This deployment installs these fixed units directly in /etc/systemd/system.
+    return (UNITS/name).is_file()
 
 
 def stop_workers():
@@ -229,6 +232,8 @@ def apply(stage):
             "source revision mismatch")
     require(COMPOSE.is_symlink() and COMPOSE.resolve()==SRC/"deploy/docker-compose.yml","unexpected compose entry point")
     clean_source()
+    require(not run("git","-C",str(REPO),"status","--porcelain","--untracked-files=all").strip(),
+            "candidate source not clean")
     require(not life.TRANSPORT_HOLD.exists() and not life.TRANSPORT_HOLD.is_symlink(),"maintenance active")
     check_quiescent()
     require(containers()==manifest["containers"],"running containers changed since staging")
@@ -251,7 +256,8 @@ def apply(stage):
         "old_xray_image":manifest["containers"]["xray"]["image"],
         "old_hub_image":manifest["containers"]["hub"]["image"],
         "xray_sha":digest(XRAY.read_bytes()),"map_sha":digest(NGINX.read_bytes()),
-        "nginx_sha":digest(EXTERNAL_NGINX.read_bytes()),"started":int(time.time()),
+        "nginx_sha":digest(EXTERNAL_NGINX.read_bytes()),"nginx_full_sha":nginx_digest("external-stream"),
+        "started":int(time.time()),
         "fleet":{"database":database,"baseline":baseline},"timers":{}}
     units=stage/"activation-units"
     units.mkdir(mode=0o700)
