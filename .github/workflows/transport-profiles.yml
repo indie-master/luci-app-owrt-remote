@@ -36,6 +36,9 @@ jobs:
           python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
           python -m unittest discover -s tests -p 'test_secure_ingress.py' -v
           python -m unittest discover -s tests -p 'test_secure_certificate_inventory.py' -v
+          python -m unittest discover -s tests -p 'test_secure_certificate_import.py' -v
+          python -m unittest discover -s tests -p 'test_secure_reverse_probe.py' -v
+          python -m py_compile tools/rehearse_secure_reverse.py
           python -m unittest discover -s tests -p 'test_secure_profile_catalog.py' -v
           python -m unittest discover -s tests -p 'test_secure_profile_store.py' -v
           python -m unittest discover -s tests -p 'test_secure_publication.py' -v
