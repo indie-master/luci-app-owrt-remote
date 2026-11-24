@@ -247,11 +247,56 @@ snapshot() {
         cp -p "$old" "$STATE/backup/files/$rel"
         sha_file "$old" >> "$STATE/backup/critical.sha256"
     done
+    if [ "${RO_TEST_MODE:-0}" != 1 ]; then
+        [ "$(sha_file /etc/config/owrtremote)" = "$(cat "$STATE/stage/uci.sha256")" ] || abort 'UCI changed during snapshot'
+        [ "$(sha_file "$config")" = "$(cat "$STATE/stage/xray.sha256")" ] || abort 'Xray JSON changed during snapshot'
+        [ "$(sha_file "$STATE/backup/files/etc/config/owrtremote")" = "$(cat "$STATE/stage/uci.sha256")" ] || abort 'UCI backup digest mismatch'
+        [ "$(sha_file "$STATE/backup/files/etc/xray/owrt-remote-client.json")" = "$(cat "$STATE/stage/xray.sha256")" ] || abort 'Xray backup digest mismatch'
+        sync
+    fi
     trap - EXIT HUP INT TERM
     info 'GUARD: SNAPSHOT READY - original files backed up on persistent overlay; no installation performed.'
 }
 
+
+# No persistent writes. This checks real-device prerequisites before stage.
+inspect() {
+    [ "$#" -eq 0 ] || abort 'usage: inspect'
+    [ "${RO_TEST_MODE:-0}" != 1 ] || abort 'inspect requires real OpenWrt'
+    preflight_live
+    check_router_tree
+    [ -z "$(uci -q changes owrtremote)" ] || abort 'uncommitted UCI changes'
+    for tool in tar sha256sum awk sed cmp df sync ubus; do
+        command -v "$tool" >/dev/null 2>&1 || abort "missing tool: $tool"
+    done
+    [ -x /sbin/procd ] || abort 'procd unavailable'
+    ubus -t 3 list service | grep -qx service || abort 'procd service API unavailable'
+    free_kb="$(df -Pk /etc | awk 'END {print $4}')"
+    ram_kb="$(awk '$1=="MemAvailable:" {print $2}' /proc/meminfo)"
+    case "$free_kb" in ''|*[!0-9]*) abort 'overlay space unavailable' ;; esac
+    case "$ram_kb" in ''|*[!0-9]*) abort 'available RAM unknown' ;; esac
+    info "GUARD: TARGET $rid transport=$tr port=$port"
+    info "GUARD: FREE OVERLAY KiB=$free_kb; AVAILABLE RAM KiB=$ram_kb"
+    [ "$free_kb" -ge 24576 ] || abort 'less than 24 MiB persistent overlay free'
+    [ "$ram_kb" -ge 20480 ] || abort 'less than 20 MiB available RAM'
+    for entry in pending armed stage backup transaction.sh; do
+        [ ! -e "$STATE/$entry" ] && [ ! -L "$STATE/$entry" ] ||
+            abort "existing transaction artifact: $entry; inspect manually"
+    done
+    present_count=0
+    for rel in $FILES; do
+        if [ -f "$(path "$rel")" ]; then
+            present_count=$((present_count + 1))
+        elif [ -e "$(path "$rel")" ]; then
+            abort "unexpected file type: $rel"
+        fi
+    done
+    info "GUARD: EXISTING FILES=$present_count/10"
+    info 'GUARD: INSPECT PASS - no persistent files or services changed.'
+}
+
 case "${1:-}" in
+    inspect) shift; inspect "$@" ;;
     stage) shift; stage "$@" ;;
     snapshot) shift; snapshot "$@" ;;
     *) abort 'supported now: stage bundle.tar SHA256 | snapshot. Apply/confirm/watchdog not yet enabled.' ;;
