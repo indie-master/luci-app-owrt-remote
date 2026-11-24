@@ -1,0 +1,11 @@
+[Unit]
+Description=Router Orchestrator recover interrupted profile publication
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=router-orchestrator-publication-recovery.service
+
+[Install]
+WantedBy=timers.target
