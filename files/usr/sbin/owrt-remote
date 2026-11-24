@@ -615,14 +615,14 @@ render_client_config() (
 	fi
 
 	router_id="$(safe_id "$(uci_get router_id main)")"
-	vps_host="$(uci_get vps_host '')"
-	vps_transport="$(uci_get vps_transport tcp)"
-	vps_sni="$(uci_get vps_sni "$vps_host")"
-	vps_ws_path="$(uci_get vps_ws_path /owrt-ws/)"
-	vps_xhttp_path="$(uci_get vps_xhttp_path /owrt-xhttp/)"
-	vps_grpc_service="$(uci_get vps_grpc_service owrt_remote)"
-	vps_reality_public_key="$(uci_get vps_reality_public_key '')"
-	vps_reality_short_id="$(uci_get vps_reality_short_id '')"
+	vps_host="${OWRT_REMOTE_CANDIDATE_HOST:-$(uci_get vps_host '')}"
+	vps_transport="${OWRT_REMOTE_CANDIDATE_TRANSPORT:-$(uci_get vps_transport tcp)}"
+	vps_sni="${OWRT_REMOTE_CANDIDATE_SNI:-$(uci_get vps_sni "$vps_host")}"
+	vps_ws_path="${OWRT_REMOTE_CANDIDATE_WS_PATH:-$(uci_get vps_ws_path /owrt-ws/)}"
+	vps_xhttp_path="${OWRT_REMOTE_CANDIDATE_XHTTP_PATH:-$(uci_get vps_xhttp_path /owrt-xhttp/)}"
+	vps_grpc_service="${OWRT_REMOTE_CANDIDATE_GRPC_SERVICE:-$(uci_get vps_grpc_service owrt_remote)}"
+	vps_reality_public_key="${OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY:-$(uci_get vps_reality_public_key '')}"
+	vps_reality_short_id="${OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID:-$(uci_get vps_reality_short_id '')}"
 	local wan_sockopt wan_xray_device
 	wan_sockopt=''
 	if truthy "$(uci_get wan_direct 0)"; then
@@ -632,7 +632,7 @@ render_client_config() (
 		wan_xray_device="$(wan_device)" || die "выбранный WAN интерфейс отключился"
 		wan_sockopt=", \"sockopt\": {\"mark\": $((PODKOP_BYPASS_MARK)), \"interface\": \"$(json_escape "$wan_xray_device")\"}"
 	fi
-	vps_port="$(xray_port vps_port "$(uci_get vps_port 8443)")" || return 1
+	vps_port="$(xray_port vps_port "${OWRT_REMOTE_CANDIDATE_PORT:-$(uci_get vps_port 8443)}")" || return 1
 	uuid="$(uci_get vless_uuid '')"
 	ssh_uuid="$(uci_get ssh_vless_uuid '')"
 	encryption="$(uci_get vless_encryption none)"
@@ -804,6 +804,21 @@ EOF
 	mv -f "$out" "$xray_config" || return 1
 	printf '%s\n' "$xray_config"
 )
+
+# Validate candidate using installed router Xray without changing active UCI
+# or the currently active reverse tunnel.
+transport_preflight() (
+	umask 077
+	local directory candidate
+	directory="$(mktemp -d "${TMPDIR:-/tmp}/owrt-transport-candidate.XXXXXX")" || return 1
+	trap 'rm -f "$directory/config.json"; rmdir "$directory" 2>/dev/null || true' EXIT
+	trap 'exit 1' INT TERM
+	candidate="$directory/config.json"
+	render_client_config --stdout >"$candidate" || return $?
+	validate_xray_config "$candidate" || return $?
+	printf 'TRANSPORT PREFLIGHT: PASS (no UCI changes, no Xray restart)\n'
+)
+
 
 run_xray() {
 	local enabled xray_bin xray_config
@@ -2097,6 +2112,9 @@ case "$cmd" in
 		;;
 	stop-xray)
 		stop_xray
+		;;
+	transport-preflight)
+		transport_preflight || exit $?
 		;;
 	render-client)
 		xray_apply_trace render-client
