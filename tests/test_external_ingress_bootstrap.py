@@ -55,6 +55,13 @@ class BootstrapTests(unittest.TestCase):
             with self.subTest(new=new),self.assertRaises(ProfileError):
                 bootstrap.prepare(BASE.replace(old,new))
 
+    def test_multiline_stream_log_format_preserved(self):
+        config = BASE.replace(b"stream {", b"stream {\n    log_format test '$remote_addr {x};'\n        '$ssl_preread_server_name'; # brace }\n")
+        candidate,routes,proxy = bootstrap.prepare(config)
+        self.assertIn(b"log_format test '$remote_addr {x};'",candidate)
+        self.assertEqual(len(routes),2)
+        self.assertTrue(proxy)
+
     def test_http_vhost_names_are_reserved(self):
         _,routes,_ = bootstrap.prepare(BASE)
         names,occupied = bootstrap.approved_names(["fresh.example.org"],BASE,routes)
