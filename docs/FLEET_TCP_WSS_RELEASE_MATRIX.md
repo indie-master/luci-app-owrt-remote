@@ -80,3 +80,27 @@ failure — no blind retry or forced restart of Xray.
 
 No current changes authorize a real client upgrade, a WSS migration,
 the existing legacy fleet “Update all” button, or changes to Belt HOLD.
+
+## Journal locking release gate
+
+The persistent journal now requires the kernel `flock` utility. It locks
+one stable `journal.flock` inode under the private runtime directory,
+not a PID directory. Never unlink that inode while the router is running.
+The journal does not fall back to an unsafe userspace lock if the command
+is absent. Fresh installations install the dependency before replacing
+client files; guarded transactions require it in their preflight.
+
+**Do not run old and new journal helpers concurrently.** The old
+in-memory collector may still use its former directory lock even after
+the file on disk changes. The two lock protocols cannot coordinate.
+The switch must take place after the old journal collector and all old
+journal writers are stopped, or at a guarded cold boot. Do not perform
+an ordinary on-disk bundle replacement across this locking change while
+old writers can still append. Keep the previous journal and its pending
+RAM buffer; flush/export before the transition where possible. This
+change does not alter the persistent journal format, chunk retention,
+acknowledgment protocol or transport configuration.
+
+The new release needs the parallel-writer, lock-owner-death and unchanged
+lock-inode regression tests to pass. Passing a previous release's CI is
+not acceptance of the new client artifact.
