@@ -848,7 +848,10 @@ class Adapter:
             return self.xray_preview(request)
         if op in ("secure.catalog.list", "secure.catalog.draft",
                   "secure.catalog.preferences", "secure.catalog.select"):
-            return self.secure_catalog(request)
+            try:
+                return self.secure_catalog(request)
+            except sqlite3.Error:
+                raise Rejected("profile store unavailable") from None
         if op == "xray.transport.preview":
             return self.transport_preview(request)
         if op == "xray.transport.canary.preview":
