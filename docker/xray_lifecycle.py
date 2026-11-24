@@ -27,6 +27,7 @@ COMPOSE = ROOT / "docker-compose.yml"
 JOURNAL = ROOT / "data" / "xray-lifecycle.json"
 LOCK = ROOT / "data" / "xray-lifecycle.lock"
 SERVICE = "owrt-remote-xray.service"
+TRANSPORT_HOLD = ROOT / "data" / ".xray-maintenance-hold"
 CONTAINER = "router-orchestrator-xray"
 IMAGE_RE = re.compile(r"^router-orchestrator-xray:[0-9A-Za-z][0-9A-Za-z._-]{0,99}$")
 LISTENERS = (18443, 18444)
@@ -204,6 +205,7 @@ def wait_canary(database, baseline, since):
 
 def apply(image):
     require(ENV.is_file() and COMPOSE.is_file(), "unified deployment missing")
+    require(not TRANSPORT_HOLD.exists(), "shadow transport migration active: lifecycle mutation blocked")
     require(run("systemctl", "is-active", "--quiet", SERVICE).returncode != 0,
             "host systemd Xray must remain inactive")
     before = ENV.read_bytes()
@@ -292,12 +294,14 @@ def main():
             print(json.dumps({"running": active(), "container": container_state(),
                               "journal": str(JOURNAL)}, indent=2))
         elif args.action == "restart":
+            require(not TRANSPORT_HOLD.exists(), "shadow transport migration active")
             require(active(), "Xray unhealthy; restart requires manual recovery")
             result = compose("restart", "xray")
             require(result.returncode == 0 and wait_healthy(),
                     "restart failed; operator should inspect container")
             print("XRAY RESTART: PASS")
         elif args.action == "rollback":
+            require(not TRANSPORT_HOLD.exists(), "shadow transport migration active")
             rollback()
         else:
             require(args.image, "--image is required")
