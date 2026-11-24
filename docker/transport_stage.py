@@ -127,6 +127,13 @@ def rollback_impl(record):
     require(sha(original) == record["baseline_sha256"],
             "baseline backup integrity mismatch")
     actual = CONFIG.read_bytes()
+    if sha(actual) == record["baseline_sha256"]:
+        # Crash before the candidate atomic replace: baseline already in place.
+        require(lifecycle.active(), "baseline Xray is not running")
+        journal({**record, "phase": "ROLLED_BACK", "finished_unix": int(time.time())})
+        HOLD.unlink(missing_ok=True)
+        print("SHADOW TRANSPORT ROLLBACK: BASELINE PRESERVED")
+        return
     require(sha(actual) == record["candidate_sha256"],
             "Xray config changed externally; refusing overwrite")
     write_atomic(CONFIG, original)
@@ -143,7 +150,15 @@ def rollback_impl(record):
 
 def stage(router_id, profile_path, entry_port, ssh_port):
     require(not HOLD.exists(), "another Xray maintenance hold is present")
-    require(not STATE.exists(), "previous shadow transaction exists")
+    if STATE.exists():
+        previous_stage = json.loads(STATE.read_text())
+        require(previous_stage.get("phase") == "ROLLED_BACK",
+                "previous shadow transaction is still active")
+        archived = JOURNAL_DIR.with_name(
+            "transport-stage.previous-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        )
+        require(not archived.exists(), "shadow archive path exists")
+        JOURNAL_DIR.rename(archived)
     require(lifecycle.active(), "production Docker Xray unhealthy")
     path = Path(profile_path)
     require(path.is_file() and not path.is_symlink(),
@@ -193,7 +208,7 @@ def stage(router_id, profile_path, entry_port, ssh_port):
         print("PRIMARY ROUTER UCI: UNCHANGED")
         print("WARNING: candidate ingress must be reachable through firewall")
     except BaseException:
-        if sha(CONFIG.read_bytes()) == sha(candidate):
+        if sha(CONFIG.read_bytes()) in (sha(candidate), sha(previous)):
             rollback_impl(record)
         raise
 
@@ -230,6 +245,9 @@ def main():
             require(args.router_id and args.profile, "--router-id and --profile required")
             stage(args.router_id, args.profile, args.entry_port, args.ssh_port)
         else:
+            if args.action == "expire" and not STATE.exists():
+                print("SHADOW TRANSPORT: no active transaction")
+                return
             require(STATE.exists(), "no transaction to recover")
             record = json.loads(STATE.read_text())
             require(record["phase"] in ("STAGING","STAGED","VERIFIED","ROLLBACK_FAILED"),
