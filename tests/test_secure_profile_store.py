@@ -88,6 +88,18 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(catalog.available_profiles(db), [])
             self.assertEqual(catalog.desired_profiles(db, "netis"), [])
 
+    def test_tls_draft_resolves_mounted_certificate(self):
+        selected = {"certificate_file": "/etc/router-orchestrator/tls/cert.pem",
+                    "key_file": "/etc/router-orchestrator/tls/key.pem"}
+        with store.connection(self.root) as db:
+            with patch("secure_certificate_inventory.mounted_certificate", return_value=selected) as choose:
+                store.save_draft(db, profile={"name":"tls", "transport":"tcp-tls",
+                    "port":18551, "server_name":"router.example.org"},
+                    label="TLS", remote_host="router.example.org", public_port=443)
+            artifact, _, _ = store.load_artifact(db, "tls", 1)
+            self.assertEqual(artifact["profile"]["certificate_file"], selected["certificate_file"])
+            choose.assert_called_once_with("router.example.org")
+
     def test_bad_pair_and_plaintext_rejected_without_draft(self):
         with store.connection(self.root) as db:
             pair = profile()
