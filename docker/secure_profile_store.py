@@ -196,7 +196,17 @@ def list_revisions(db):
     rows = db.execute("""SELECT profile_id,revision,label,transport,hostname,public_port,published
                           FROM secure_profile_revisions ORDER BY label,revision DESC""")
     fields = ("profile_id","revision","label","transport","hostname","public_port","published")
-    return [dict(zip(fields, row)) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(zip(fields, row))
+        artifact, _, _ = load_artifact(db, item["profile_id"], item["revision"])
+        profile = artifact["profile"]
+        item["backend_port"] = _port(profile["port"])
+        item["server_names"] = [domain(n) for n in (
+            profile["server_names"] if profile["transport"] in REALITY_PROFILES
+            else [profile["server_name"]])]
+        result.append(item)
+    return result
 
 def load_artifact(db, profile_id, revision):
     """Return sealed private artifact to privileged caller only."""
