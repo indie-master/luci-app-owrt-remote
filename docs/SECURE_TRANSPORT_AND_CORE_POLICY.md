@@ -130,3 +130,32 @@ No fallback to plaintext, no automatic core upgrades, no global rollout.
 Memory-constrained routers must be tested before enabling shadow processes.
 Desired catalog selections are not active assignments until the actual
 transport transaction confirms them.
+
+
+## Catalog integration
+
+The Docker HUB exposes an owner-only catalog at /secure-profiles/ with links
+from router cards. Mutating endpoints require the transport action CSRF
+token and check the request origin. The host adapter stores immutable draft
+artifacts in the systemd-managed root-private StateDirectory
+/var/lib/router-orchestrator-secure-profiles (0700), profiles.db (0600).
+Back up this database as a separate sensitive artifact, using SQLite's
+backup API, alongside the existing HUB state. The HUB does not mount it.
+Catalog responses contain metadata only.
+
+The primary workflow is save draft, then validate the saved revision.
+Empty REALITY key fields generate X25519 on the host using OpenSSL; supplied
+pairs must match, and an empty shortId list generates a random 8-byte ID.
+TLS drafts can automatically select an already-mounted matching certificate
+from the dedicated TLS directory (root or one immediate child); both
+explicit paths must be supplied otherwise. The saved artifact digest is
+checked before validation. Validation checks the active Xray image and,
+for TLS, the certificate name, key and expiration. It does not validate
+external nginx ownership, create DNS records or activate listeners.
+
+Per-router selection records desired primary/fallback revisions only.
+There is intentionally no public publish API until a verified server
+publication transaction exists. A draft cannot be assigned; validation
+does not publish it. Existing router runtime remains untouched.
+The new StateDirectory and host adapter require an approved service upgrade;
+do not change the pinned production worktree to test this UI.
