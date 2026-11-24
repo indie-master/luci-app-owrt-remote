@@ -221,3 +221,40 @@ resolution (including self-referential aliases) before any activation.
 PROXY protocol is emitted only on server inbounds when the reviewed
 external listener sends it. Actual core/transport interoperability remains
 a live acceptance requirement.
+
+
+## Existing certificate import and isolated wire rehearsal
+
+Saving a TLS draft first tries the dedicated TLS mount, then imports an
+existing matching certificate and key from literal nginx -T directives or
+standard Certbot lineages in approved source roots. Browser-supplied source
+paths are not used by the importer. Imported pairs are validated, stored in
+content-addressed immutable subdirectories (directory 0700, key 0600),
+and referenced using the Xray container mount. Existing slots are not
+replaced. No ACME issuance, automatic renewal or deployment restart is
+performed by this importer. A future renewal operation must validate and
+activate a new pair without disrupting unrelated profiles. The host
+adapter service now requires the dedicated TLS directory to exist and
+allows writes there.
+
+The operator-only tools/rehearse_secure_reverse.py performs isolated
+wire tests with the exact locally running Docker Xray image (both server
+and synthetic client), a separate nginx process, temporary loopback
+listeners, independent random test UUIDs and two independent random
+nonce responses. It uses the existing certificate for TLS, and requires
+an explicit target for any REALITY profile. The nginx stream harness
+includes outgoing PROXY protocol by default, matching Belt. It checks
+both reverse channels instead of accepting a TCP connect or TLS handshake
+as proof. It requires at least 512 MiB available RAM and bounds each test
+container to 192 MiB. Normal exit and handled signals clean up temporary
+processes and files. SIGKILL or abrupt host failure may leave test
+containers; remove only specifically identified ro-probe containers.
+An imported certificate slot persists; the production Xray configuration,
+existing nginx routing, HUB and router UCI are not intentionally changed.
+
+This is a rehearsal, not server publication or actual OpenWrt acceptance.
+Core compatibility on MIPS, production ingress/DNS reachability and
+authenticated real LuCI/SSH still require separate acceptance. The
+production publication worker must use the common lifecycle lock,
+independent recovery and validated durable inventory/metadata commit;
+no live publish endpoint is enabled yet.
