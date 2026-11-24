@@ -87,7 +87,13 @@ def normalize_profile(value):
         reality_keys(profile)
     elif not profile.get("certificate_file") and not profile.get("key_file"):
         from secure_certificate_inventory import mounted_certificate
-        profile.update(mounted_certificate(profile.get("server_name")))
+        try:
+            pair = mounted_certificate(profile.get("server_name"))
+        except ProfileError:
+            from secure_certificate_import import import_certificate
+            imported = import_certificate(profile.get("server_name"))
+            pair = {key: imported[key] for key in ("certificate_file", "key_file")}
+        profile.update(pair)
     elif not profile.get("certificate_file") or not profile.get("key_file"):
         raise ProfileError("provide both certificate paths or leave both empty for auto selection")
     return profile
