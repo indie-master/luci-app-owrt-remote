@@ -95,8 +95,9 @@ def build_publication(live, artifact, inventory, *, profile_id, revision):
     if plan["streamSettings"]["security"] == "reality":
         target = domain(profile["target_host"])
         # DNS aliases and local addresses also need a live resolver check
-        # by the privileged worker. Reject obvious recursive target names.
-        if profile["target_port"] == public and target in (allowed | {domain(artifact["remote_host"])}):
+        # by the privileged worker. SNI matching the remote target is normal;
+        # only the dial hostname itself is an obvious recursive target.
+        if profile["target_port"] == public and target == domain(artifact["remote_host"]):
             raise ProfileError("REALITY target may loop into managed ingress")
     tag = f"ro-secure-{profile_id}-r{revision}"
     if len(tag) > 128 or any(i.get("tag") == tag for i in inbounds):
