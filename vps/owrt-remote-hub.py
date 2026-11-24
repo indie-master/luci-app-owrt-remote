@@ -20126,10 +20126,10 @@ exit 127
                     "export OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID=\"$9\"\n"
                     "exec /usr/sbin/owrt-remote transport-preflight\n"
                 )
-                if profile["transport"] == "reality-tcp" and not (profile.get("short_ids") or [""])[0]:
+                if profile["transport"].startswith("reality-") and not (profile.get("short_ids") or [""])[0]:
                     raise ValueError("REALITY pilot requires a nonempty shortId")
                 values = [
-                    profile["transport"], vps_host, str(profile["port"]),
+                    ("ws" if profile["transport"] == "wss" else profile["transport"]), vps_host, str(profile["port"]),
                     profile.get("server_name", vps_host),
                     profile.get("path", "/owrt-ws/"),
                     profile.get("path", "/owrt-xhttp/"),
