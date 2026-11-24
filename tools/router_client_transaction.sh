@@ -184,7 +184,7 @@ EOF
 case "${1:-}" in
 arm)
     [ "$#" = 4 ] || fail 'usage: arm ROUTER_ID SHA256 TIMEOUT'
-    [ ! -e "$S/client.pending" ] && [ ! -e "$S/client.armed" ] && [ ! -e "$S/client.result" ] || fail 'existing transaction'
+    [ ! -e "$S/client.pending" ] && [ ! -e "$S/client.armed" ] && [ ! -e "$S/client.result" ] || fail 'existing transaction; reset rolled-back transaction first'
     [ "$(uci -q get owrtremote.main.router_id)" = "$2" ] || fail 'wrong router'
     transport="$(uci -q get owrtremote.main.vps_transport || true)"
     transport="${transport:-tcp}"
@@ -214,6 +214,7 @@ apply)
         replace_file "$S/stage/unpacked/payload/$rel" "/$rel" "$mode" || { restore; fail "apply: $rel"; }
     done
     sync
+    # Critical failures leave a durable pending marker for the independent monitors.
     critical
     [ "$(xray_identity)" = "$(cat "$S/client.xray")" ] || { restore; fail 'Xray changed during apply'; }
     valid_window || { restore; fail 'deadline elapsed'; }
@@ -255,6 +256,18 @@ confirm)
 rollback|boot-recover)
     restore
     ;;
+reset-rolled-back)
+    [ ! -e "$S/client.pending" ] && [ ! -e "$S/client.armed" ] || fail 'transaction still active'
+    [ "$(cat "$S/client.result" 2>/dev/null || true)" = ROLLED_BACK ] || fail 'only rolled-back transactions may be reset'
+    if ready; then fail 'stop recovery service before reset'; fi
+    verify_backup; verify_originals; critical
+    [ -L "$BOOT" ] && regular "$INIT" || fail 'recovery hook missing'
+    "$INIT" disable
+    [ ! -e "$BOOT" ] && [ ! -L "$BOOT" ] || fail 'boot hook still present'
+    rm -f "$INIT" "$S/client.result" "$S/client.sha" "$S/client.xray" "$S/client.boot" "$S/client.nonce" "$S/client.deadline" "$S/client.primary.ready" "$S/client.secondary.ready"
+    sync
+    say 'RESET: original staged bundle and recovery snapshot retained'
+    ;;
 status)
     if [ -f "$S/client.pending" ]; then say PENDING
     elif [ -f "$S/client.result" ]; then say "$(cat "$S/client.result")"
@@ -262,5 +275,5 @@ status)
     else say PREPARED; fi
     if ready; then say 'TWO WORKERS READY'; fi
     ;;
-*) fail 'arm | apply | confirm | rollback | status | boot-recover | worker';;
+*) fail 'arm | apply | confirm | rollback | reset-rolled-back | status | boot-recover | worker';;
 esac
