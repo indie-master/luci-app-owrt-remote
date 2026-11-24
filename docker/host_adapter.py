@@ -616,11 +616,25 @@ class Adapter:
         require(phase in ("STAGING", "STAGED", "VERIFIED", "ROLLED_BACK",
                           "ROLLBACK_FAILED"), "unrecognized stage state")
         expires = int(entry.get("expires_unix") or 0)
-        return {"ok": True, "active": phase in ("STAGING", "STAGED", "VERIFIED",
-                                                "ROLLBACK_FAILED"),
-                "phase": phase, "router_id": entry.get("router_id"),
-                "expires_unix": expires,
-                "seconds_remaining": max(0, expires - int(time.time()))}
+        response = {"ok": True, "active": phase in ("STAGING", "STAGED", "VERIFIED",
+                                                    "ROLLBACK_FAILED"),
+                    "phase": phase, "router_id": entry.get("router_id"),
+                    "expires_unix": expires,
+                    "seconds_remaining": max(0, expires - int(time.time()))}
+        if phase in ("STAGED", "VERIFIED"):
+            client = entry.get("client")
+            pilot = entry.get("pilot")
+            if isinstance(client, dict) and isinstance(pilot, dict):
+                # No private keys, UUIDs, or server Xray config are returned.
+                allowed = ("transport", "host", "port", "sni", "ws_path",
+                           "xhttp_path", "grpc_service", "reality_public_key",
+                           "reality_short_id", "reverse_tag", "ssh_reverse_tag")
+                response["client"] = {k: client[k] for k in allowed if k in client}
+                response["test_ports"] = {
+                    "ssh": pilot.get("ssh_test_port"),
+                    "admin": pilot.get("admin_test_port"),
+                }
+        return response
 
     def transport_stage_rollback(self, request):
         """Request an immediate fixed-unit rollback; never execute web input.
