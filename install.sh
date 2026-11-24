@@ -257,6 +257,14 @@ install_xray_runtime() {
 # Abort before changing any installed component if transport state is unsafe.
 transport_preflight
 
+# The journal requires a kernel lock. Do not replace the installed agent
+# on systems without the necessary command or silently use unsafe PID locks.
+if [ "${ROOT%/}" = "" ] && ! command -v flock >/dev/null 2>&1; then
+	info "Installing required journal lock utility: flock"
+	install_packages flock || die "failed to install flock; existing client retained"
+	command -v flock >/dev/null 2>&1 || die "flock unavailable; existing client retained"
+fi
+
 # Stop the old log writer before replacing its storage code. Its bounded legacy
 # archive is migrated by the new log service, without moving any other /tmp data.
 if [ "${ROOT%/}" = "" ] && [ -x /etc/init.d/owrt-remote-logs ]; then
