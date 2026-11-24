@@ -143,6 +143,54 @@ def save_draft(db, *, profile, label, remote_host, public_port, occupied_ports=(
             "published": False, "applied": False}
 
 
+# Keep automatic allocation away from the established reverse admin/SSH and
+# legacy listener ranges. This is a catalog reservation, not a bound socket.
+AUTO_PORTS = range(24000, 25000)
+
+
+def reserved_backend_ports(db):
+    rows = db.execute("""SELECT profile_id, revision FROM secure_profile_artifacts""").fetchall()
+    ports = set()
+    for profile_id, revision in rows:
+        artifact, _, _ = load_artifact(db, profile_id, revision)
+        ports.add(_port(artifact["profile"]["port"]))
+    return ports
+
+
+def save_allocated_draft(db, *, profile, label, remote_host, public_port, occupied_ports=()):
+    """Serialize port selection and artifact insertion across catalog writers.
+
+    Port 0 or omission means automatic allocation. Explicit ports must not
+    collide with other saved revisions. Socket occupancy must be rechecked
+    immediately before publication; external processes are not reserved here.
+    """
+    require_secure_profile(profile)
+    if db.in_transaction:
+        raise ProfileError("allocation requires an independent write transaction")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        profile = dict(profile)
+        blocked = set(occupied_ports) | reserved_backend_ports(db) | {public_port}
+        requested = profile.get("port", 0)
+        if type(requested) is not int:
+            raise ProfileError("invalid backend port")
+        if requested == 0:
+            selected = next((p for p in AUTO_PORTS if p not in blocked), None)
+            if selected is None:
+                raise ProfileError("automatic backend port pool exhausted")
+            profile["port"] = selected
+        elif requested in blocked:
+            raise ProfileError("backend port already reserved or occupied")
+        result = save_draft(db, profile=profile, label=label, remote_host=remote_host,
+                            public_port=public_port, occupied_ports=blocked)
+    except BaseException:
+        db.rollback()
+        raise
+    else:
+        db.commit()
+        return result
+
+
 def list_revisions(db):
     rows = db.execute("""SELECT profile_id,revision,label,transport,hostname,public_port,published
                           FROM secure_profile_revisions ORDER BY label,revision DESC""")
