@@ -16,11 +16,13 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <form class="panel" id="editor">
 <h2>Новый транспорт управления</h2>
 <div class="grid">
-<label>Название профиля<input name="name" value="pilot-transport" maxlength="64" required></label>
+<label>Идентификатор профиля<input name="name" value="pilot-transport" maxlength="64" pattern="[A-Za-z0-9_-]{1,64}" required></label>
+<label>Название в каталоге<input name="label" value="Management" maxlength="100" required></label>
+<label>Публичный порт (для каталога)<input name="public_port" type="number" min="1" max="65535" value="443" required></label>
 <label>Транспорт<select id="transportFamily"><option value="tcp">TCP / RAW</option><option value="ws">WebSocket</option><option value="xhttp">XHTTP</option><option value="grpc">gRPC</option></select></label>
 <label>Защита<select id="transportSecurity"><option value="tls">TLS</option><option value="reality">REALITY</option></select></label>
 <input type="hidden" id="transport" name="transport" value="tcp-tls">
-<label>Порт<input name="port" type="number" min="1" max="65535" value="18446" required></label>
+<label>Внутренний порт Xray<input name="port" type="number" min="1" max="65535" value="18446" required></label>
 <label>Хост VPS для подключения роутера<input name="remote_host" value="router.example.org" maxlength="255"></label>
 <label>UUID роутера (необязательно; только для клиентского JSON)<input name="router_uuid" autocomplete="off" placeholder="UUID из карточки роутера"></label>
 <label>Роутер для теневого reverse-пилота<select name="router_id" id="router_id"><option value="">Без роутера — проверка схемы</option></select></label>
@@ -38,7 +40,7 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <label data-field="short_ids">REALITY short IDs, через запятую<input name="short_ids" placeholder="Генерируется автоматически"></label>
 <label data-field="private_key">REALITY private key<input name="private_key" type="password" autocomplete="off" placeholder="Вставить только для предварительной проверки"></label>
 <label data-field="public_key">REALITY public key (для роутера)<input name="public_key" autocomplete="off" placeholder="Публичный ключ из Xray"></label>
-</div><p id="realityActions" hidden><button type="button" class="secondary" id="generateReality">Создать пару ключей и Short ID</button> <button type="button" class="secondary" id="generateShortId">Новый Short ID</button></p><p><button type="submit">Проверить и сгенерировать</button> <button type="button" class="secondary" id="routerPreflight" disabled>Проверить на OpenWrt без изменений</button> <button type="button" class="secondary" id="stagePilot" disabled title="Тестовый серверный Xray будет перезапущен и автоматически восстановлен через 10 минут">Запустить тестовый серверный вход (10 мин)</button> <button type="button" class="secondary" disabled title="Доступно после внедрения транзакционного применения">Применить к роутеру</button></p>
+</div><p id="realityActions" hidden><button type="button" class="secondary" id="generateReality">Создать пару ключей и Short ID</button> <button type="button" class="secondary" id="generateShortId">Новый Short ID</button></p><p><button type="submit">Проверить и сгенерировать</button> <button type="button" class="secondary" id="saveDraft">Сохранить черновик</button> <a href="/secure-profiles/">Каталог профилей</a> <button type="button" class="secondary" id="routerPreflight" disabled>Проверить на OpenWrt без изменений</button> <button type="button" class="secondary" id="stagePilot" disabled title="Тестовый серверный Xray будет перезапущен и автоматически восстановлен через 10 минут">Запустить тестовый серверный вход (10 мин)</button> <button type="button" class="secondary" disabled title="Доступно после внедрения транзакционного применения">Применить к роутеру</button></p>
 </form>
 <div class="panel">
 <h2>Активный серверный пилот</h2>
@@ -207,6 +209,30 @@ stageButton.addEventListener('click',async()=>{
   }
  }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
  finally{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value;refreshPilotStatus()}
+});
+document.getElementById('saveDraft').addEventListener('click',async()=>{
+ if(!form.reportValidity())return;
+ const button=document.getElementById('saveDraft');
+ const values=Object.fromEntries(new FormData(form).entries());
+ const profile={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])profile[key]=values[key];
+ if(isReality(values.transport)){
+  profile.target_port=Number(values.target_port);
+  profile.short_ids=values.short_ids.split(',').map(x=>x.trim()).filter(Boolean);
+  profile.server_names=names(values);
+ }
+ button.disabled=true;output.classList.remove('error');output.textContent='Сохранение приватного черновика…';
+ try{
+  const response=await fetch('/api/secure-profiles/draft',{method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+   body:JSON.stringify({profile,label:values.label,remote_host:values.remote_host,public_port:Number(values.public_port)})});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Не удалось сохранить');
+  output.textContent='Черновик '+result.draft.profile_id+' · ревизия '+result.draft.revision+
+   '\nСохранён на сервере. Если поля ключей оставлены пустыми, REALITY-ключи созданы сервером.'+
+   '\nСерверный вход не опубликован, роутеры не изменены.';
+ }catch(err){output.classList.add('error');output.textContent=String(err.message||err)}
+ finally{button.disabled=false}
 });
 form.addEventListener('submit',async e=>{
  e.preventDefault();output.classList.remove('error');output.textContent='Проверка…';
