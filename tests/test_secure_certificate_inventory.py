@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docker"))
-from secure_certificate_inventory import inspect_pair, find_certificate
+from secure_certificate_inventory import inspect_pair, find_certificate, mounted_certificate
 from transport_profiles import ProfileError
 
 
@@ -32,6 +32,13 @@ class CertificateInventoryTests(unittest.TestCase):
         for name in ("other.example.org", "deep.node.lab.example.org"):
             with self.assertRaises(ProfileError):
                 inspect_pair(name, self.cert, self.key, roots=[self.root])
+
+    def test_mounted_inventory_auto_selection(self):
+        selected = mounted_certificate("node.lab.example.org", root=self.root)
+        self.assertEqual(selected["certificate_file"], "/etc/router-orchestrator/tls/cert.pem")
+        self.assertEqual(selected["key_file"], "/etc/router-orchestrator/tls/key.pem")
+        with self.assertRaises(ProfileError):
+            mounted_certificate("uncovered.example.org", root=self.root)
 
     def test_expiry_root_and_mismatched_key(self):
         with self.assertRaises(ProfileError):
