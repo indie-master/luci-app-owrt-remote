@@ -405,7 +405,7 @@ class Adapter:
                 "candidate_sha256": sha(data)}
 
     def secure_catalog(self, request):
-        from secure_profile_store import connection, save_draft, list_revisions
+        from secure_profile_store import connection, save_allocated_draft, list_revisions
         from secure_profile_catalog import available_profiles, desired_profiles, set_desired_profiles
         op = request["op"]
         with connection() as db:
@@ -416,10 +416,19 @@ class Adapter:
                 config = json.loads(CONFIG.read_bytes())
                 occupied = [item.get("port") for item in config.get("inbounds", [])
                             if isinstance(item, dict) and type(item.get("port")) is int]
-                draft = save_draft(db, profile=request.get("profile"),
+                from secure_ingress_inventory import live_tcp_ports
+                occupied = set(occupied) | live_tcp_ports()
+                draft = save_allocated_draft(db, profile=request.get("profile"),
                                    label=request.get("label"), remote_host=request.get("remote_host"),
                                    public_port=request.get("public_port"), occupied_ports=occupied)
                 return {"ok": True, "draft": draft}
+            if op == "secure.catalog.approve":
+                from secure_profile_store import load_artifact
+                from secure_ingress_inventory import approve_draft_names
+                require(request.get("confirmed") is True, "explicit SNI approval required")
+                artifact, digest, published = load_artifact(db, request.get("profile_id"), request.get("revision"))
+                require(not published, "revision already published")
+                return {"ok": True, **approve_draft_names(artifact)}
             if op in ("secure.catalog.validate", "secure.catalog.plan"):
                 from secure_profile_store import load_artifact
                 from secure_certificate_inventory import inspect_pair
@@ -440,12 +449,13 @@ class Adapter:
                     key = host / Path(profile["key_file"]).relative_to(mount)
                     inspect_pair(profile["server_name"], cert, key, roots=[host])
                 if op == "secure.catalog.plan":
-                    from secure_ingress_inventory import reviewed_inventory
+                    from secure_ingress_inventory import reviewed_inventory, live_tcp_ports
                     from secure_publication import build_publication, public_summary
                     if published:
                         raise Rejected("revision already published")
                     inventory = reviewed_inventory()
-                    publication = build_publication(config, artifact, inventory,
+                    planning_inventory = dict(inventory, occupied_ports=sorted(set(inventory["occupied_ports"]) | live_tcp_ports()))
+                    publication = build_publication(config, artifact, planning_inventory,
                         profile_id=request["profile_id"], revision=request["revision"])
                     data = (json.dumps(publication["candidate"], ensure_ascii=False,
                                        separators=(",", ":")) + "\n").encode()
@@ -461,6 +471,7 @@ class Adapter:
                         Path(temp).unlink(missing_ok=True)
                     require(CONFIG.read_bytes() == original,
                             "Xray changed during publication planning")
+                    require(publication["backend_port"] not in live_tcp_ports(), "backend port became occupied during planning")
                     require(reviewed_inventory() == inventory,
                             "nginx inventory changed during publication planning")
                     return {"ok": True, **public_summary(publication),
@@ -902,7 +913,7 @@ class Adapter:
         if op == "xray.preview":
             return self.xray_preview(request)
         if op in ("secure.catalog.list", "secure.catalog.draft",
-                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate", "secure.catalog.plan"):
+                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate", "secure.catalog.plan", "secure.catalog.approve"):
             try:
                 return self.secure_catalog(request)
             except sqlite3.Error:
