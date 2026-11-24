@@ -56,6 +56,27 @@ class CoreManagerTests(unittest.TestCase):
                 b"RO_XRAY_IMAGE=router-orchestrator-xray:old\n",
                 "evil.example/xray:latest")
 
+    def test_release_pages_are_bounded_and_prereleases_skipped(self):
+        class Response:
+            status=200
+            def __init__(self,items): self.items=items
+            def __enter__(self): return self
+            def __exit__(self,*args): pass
+            def read(self,size): return json.dumps(self.items).encode()
+        first=[{"tag_name":f"v26.11.{i}","draft":False,"prerelease":True} for i in range(10)]
+        second=[{"tag_name":"v26.7.28","draft":False,"prerelease":False}]
+        with patch.object(releases.urllib.request,"urlopen",side_effect=[Response(first),Response(second)]) as fetch:
+            self.assertEqual(releases.stable_release_tags(),["v26.7.28"])
+            self.assertEqual(fetch.call_count,2)
+            self.assertIn("per_page=10&page=2",fetch.call_args.args[0].full_url)
+
+    def test_rate_limit_returns_specific_error(self):
+        from urllib.error import HTTPError
+        with patch.object(releases.urllib.request,"urlopen",side_effect=HTTPError(
+                releases.RELEASES,429,"too many requests",None,None)):
+            with self.assertRaisesRegex(RuntimeError,"rate limit.*429"):
+                releases.stable_release_tags()
+
     def test_stable_releases_exclude_prereleases(self):
         entries = [
             {"tag_name": "v26.11.9", "prerelease": True, "draft": False},
