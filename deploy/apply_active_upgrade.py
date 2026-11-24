@@ -17,7 +17,7 @@ import sys
 import time
 
 from prepare_active_upgrade import (ROOT,SRC,REPO,ENV,COMPOSE,STORE,UNITS,
-    require,run,head,digest,parse_env,replace_hub,snapshot_db,containers,private_write)
+    require,run,head,digest,parse_env,replace_hub,snapshot_db,containers,private_write,hold_snapshot)
 sys.path.insert(0,str(REPO/"docker"))
 import xray_lifecycle as life
 from secure_publication_transaction import atomic,read_regular,sync_directory
@@ -35,6 +35,9 @@ UNIT_NAMES=(ADAPTER,"router-orchestrator-core-job@.service",
     "router-orchestrator-publication-recovery.service",TIMERS[2],
     "router-orchestrator-publication-job.service")
 HOLD=b"active stack upgrade v1\n"
+LEGACY_HOLD=Path("/var/lib/owrt-remote/.xray-maintenance-hold")
+LEGACY_SHA="1eeebf5600bf8b8abe5aa45fa66aed90376882fb4c400e27cea75a4b053112c5"
+INSTALLER_ONLY={"deploy/apply_active_upgrade.py","tests/test_active_upgrade_apply.py","docs/SECURE_TRANSPORT_AND_CORE_POLICY.md"}
 XRAY=Path("/etc/xray/owrt-remote.json")
 NGINX=Path("/etc/nginx/router-orchestrator-managed.map")
 EXTERNAL_NGINX=Path("/etc/nginx/nginx.conf")
@@ -70,6 +73,35 @@ def compose(*args):
 def clean_source():
     require(not run("git","-C",str(SRC),"status","--porcelain","--untracked-files=all").strip(),
             "active source not clean")
+
+
+def check_installer_revision(commit):
+    """Allow reuse of a built image only for installer/test/docs-only fixes."""
+    require(re.fullmatch(r"[0-9a-f]{40}",commit) is not None,"invalid staged commit")
+    if head(REPO)==commit:
+        return
+    run("git","-C",str(REPO),"merge-base","--is-ancestor",commit,head(REPO))
+    changes=set(run("git","-C",str(REPO),"diff","--name-only","--no-renames",commit,head(REPO)).decode().splitlines())
+    require(changes <= INSTALLER_ONLY,"runtime source differs from staged image")
+
+
+def legacy_hold():
+    current=hold_snapshot(life.TRANSPORT_HOLD)
+    original=hold_snapshot(LEGACY_HOLD)
+    require(current is not None and original is not None,"legacy hold pair missing")
+    require(current[2:]==(23088,23088,0o600,1,LEGACY_SHA)
+            and original[2:]==(0,0,0o600,1,LEGACY_SHA),
+            "legacy hold differs from audited Belt marker")
+    for path in (life.JOURNAL,ROOT/"data/transport-stage/stage.json",STORE/"publication/pending.json"):
+        require(not path.exists() and not path.is_symlink(),"unexpected maintenance journal: "+path.name)
+    return list(current)
+
+
+def check_upgrade_hold(record):
+    if record.get("legacy_hold") is not None:
+        require(legacy_hold()==record["legacy_hold"],"legacy hold changed")
+    else:
+        require(read_regular(life.TRANSPORT_HOLD)[0]==HOLD,"upgrade hold ownership changed")
 
 
 def check_quiescent():
@@ -186,6 +218,7 @@ def rollback(stage,record):
     require(ENV.read_bytes() in ((stage/"previous.env").read_bytes(),(stage/"candidate.env").read_bytes()),
             "active env changed externally")
     check_files(record)
+    check_upgrade_hold(record)
     write_state(stage,record,"RESTORING")
     stop_workers()
     stop_hub()
@@ -214,27 +247,35 @@ def rollback(stage,record):
     wait_ready(record)
     restart_timers(record,restore=True)
     write_state(stage,record,"ROLLED_BACK")
-    release_hold()
+    release_hold(record)
     print("ACTIVE UPGRADE ROLLBACK: VERIFIED",flush=True)
 
 
-def release_hold():
-    require(read_regular(life.TRANSPORT_HOLD)[0]==HOLD,"upgrade hold ownership changed")
+def release_hold(record=None):
+    check_upgrade_hold(record or {})
+    if (record or {}).get("legacy_hold") is not None:
+        print("LEGACY HOLD: PRESERVED",flush=True)
+        return
     life.TRANSPORT_HOLD.unlink()
     sync_directory(life.TRANSPORT_HOLD.parent)
 
 
-def apply(stage):
+def apply(stage, preserve_legacy_hold=False):
     manifest=read_json(stage/"manifest.json")
     require(manifest["phase"]=="STAGED_ONLY" and not (stage/"upgrade-state.json").exists(),
             "candidate was already used")
-    require(head(REPO)==manifest["new_commit"] and head(SRC)==manifest["old_commit"],
-            "source revision mismatch")
+    check_installer_revision(manifest["new_commit"])
+    require(head(SRC)==manifest["old_commit"],"source revision mismatch")
     require(COMPOSE.is_symlink() and COMPOSE.resolve()==SRC/"deploy/docker-compose.yml","unexpected compose entry point")
     clean_source()
     require(not run("git","-C",str(REPO),"status","--porcelain","--untracked-files=all").strip(),
             "candidate source not clean")
-    require(not life.TRANSPORT_HOLD.exists() and not life.TRANSPORT_HOLD.is_symlink(),"maintenance active")
+    preserved=None
+    if preserve_legacy_hold:
+        require(manifest.get("preserved_hold") is True,"candidate not prepared with preserved hold")
+        preserved=legacy_hold()
+    else:
+        require(not life.TRANSPORT_HOLD.exists() and not life.TRANSPORT_HOLD.is_symlink(),"maintenance active")
     check_quiescent()
     require(containers()==manifest["containers"],"running containers changed since staging")
     require(digest(ENV.read_bytes())==manifest["old_env_sha256"] and
@@ -258,7 +299,7 @@ def apply(stage):
         "xray_sha":digest(XRAY.read_bytes()),"map_sha":digest(NGINX.read_bytes()),
         "nginx_sha":digest(EXTERNAL_NGINX.read_bytes()),"nginx_full_sha":nginx_digest("external-stream"),
         "started":int(time.time()),
-        "fleet":{"database":database,"baseline":baseline},"timers":{}}
+        "fleet":{"database":database,"baseline":baseline},"timers":{}, "legacy_hold":preserved}
     units=stage/"activation-units"
     units.mkdir(mode=0o700)
     for name in UNIT_NAMES:
@@ -271,10 +312,13 @@ def apply(stage):
         record["timers"][timer]={"present":present,"active":present and service_state(timer)=="active"}
     require(all(record["timers"][t]["active"] for t in TIMERS[:2]),"legacy recovery timers inactive")
     write_state(stage,record,"PREPARED")
-    atomic(life.TRANSPORT_HOLD,HOLD)
+    if preserved is None:
+        atomic(life.TRANSPORT_HOLD,HOLD)
+    check_upgrade_hold(record)
     try:
         stop_workers()
         stop_hub()
+        check_upgrade_hold(record)
         snapshot_db(Path(database),stage/"hub-at-cutover.db")
         write_state(stage,record,"SWITCHING")
         clean_source()
@@ -291,9 +335,11 @@ def apply(stage):
         probe_adapter()
         require(containers()["hub"]["image"]==manifest["hub_image_id"],"wrong HUB image")
         require(containers()["nginx"]==manifest["containers"]["nginx"],"project nginx changed")
+        check_upgrade_hold(record)
         restart_timers(record)
+        check_upgrade_hold(record)
         write_state(stage,record,"ACCEPTED")
-        release_hold()
+        release_hold(record)
         print("ACTIVE STACK UPGRADE: VERIFIED; WEB PUBLICATION DISABLED",flush=True)
     except BaseException:
         if record["phase"] not in TERMINAL:
@@ -306,20 +352,21 @@ def main():
     parser.add_argument("action",choices=("apply","recover"))
     parser.add_argument("--stage",required=True)
     parser.add_argument("--confirm-maintenance",action="store_true")
+    parser.add_argument("--preserve-legacy-hold",action="store_true")
     args=parser.parse_args()
     os.umask(0o077)
     require(os.geteuid()==0 and args.confirm_maintenance,"root and explicit maintenance confirmation required")
     stage=checked_stage(args.stage)
     with exclusive(life.LOCK):
         if args.action=="apply":
-            apply(stage)
+            apply(stage,args.preserve_legacy_hold)
         else:
             record=read_json(stage/"upgrade-state.json")
-            require(head(REPO)==record["new_commit"],"use exact candidate checkout")
-            require(read_regular(life.TRANSPORT_HOLD)[0]==HOLD,"upgrade hold absent or foreign")
+            check_installer_revision(record["new_commit"])
+            check_upgrade_hold(record)
             if record["phase"] in TERMINAL:
                 check_files(record)
-                release_hold()
+                release_hold(record)
             else:
                 rollback(stage,record)
 
