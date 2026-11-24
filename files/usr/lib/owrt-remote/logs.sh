@@ -108,20 +108,20 @@ EOF
 	fi
 }
 log_lock() {
-	local attempt owner
+	local attempt
 	log_runtime_init || return 1
+	# All journal writers use the SAME inode for the lifetime of this boot.
+	# Never unlink it: the kernel releases flock when the last owning FD closes,
+	# including on SIGKILL. No PID-file inspection or stale-owner reaping.
+	command -v flock >/dev/null 2>&1 || { log_diag flock-unavailable; return 1; }
+	[ ! -L "$RUN_DIR/journal.flock" ] || return 1
+	exec 9>>"$RUN_DIR/journal.flock" || return 1
 	attempt=0
-	while ! mkdir "$RUN_DIR/lock" 2>/dev/null; do
-		owner="$(cat "$RUN_DIR/lock/pid" 2>/dev/null)"
-		case "$owner" in
-			''|*[!0-9]*)
-				[ "$attempt" -lt 20 ] || log_reap_lock "$RUN_DIR/lock" "$attempt" ;;
-			*) kill -0 "$owner" 2>/dev/null || log_reap_lock "$RUN_DIR/lock" "$attempt" ;;
-		esac
+	while ! flock -n -x 9; do
 		log_pause
-		attempt=$((attempt + LOG_PAUSE_TENTHS)); [ "$attempt" -lt 100 ] || { log_diag lock-timeout; return 1; }
+		attempt=$((attempt + LOG_PAUSE_TENTHS))
+		[ "$attempt" -lt 100 ] || { exec 9>&-; log_diag lock-timeout; return 1; }
 	done
-	log_self_pid >"$RUN_DIR/lock/pid"
 	# Initialize storage and all associated limits together under the lock.
 	# A losing first writer must never carry a stale RAM-fallback flag.
 	log_init || { log_unlock; return 1; }
@@ -137,6 +137,8 @@ log_lock() {
 	fi
 }
 log_reap_lock() {
+	# Collector lifecycle only. Never reap the kernel journal lock.
+	[ "$1" = "$RUN_DIR/collector-lock" ] || return 1
 	local owner reap_owner
 	# Serialize stale-lock removal itself, so two contenders cannot remove a
 	# freshly acquired lock after observing the same previous dead owner.
@@ -180,7 +182,10 @@ log_fallback_locked() {
 		mv -f "$RUN_DIR/storage.new" "$RUN_DIR/storage" || return 1
 	rm -f "$RUN_DIR/recovered" "$RUN_DIR/recovered-v2" "$RUN_DIR/ack"
 }
-log_unlock() { rm -f "$RUN_DIR/lock/pid"; rmdir "$RUN_DIR/lock" 2>/dev/null || true; }
+log_unlock() {
+	flock -u 9 || true
+	exec 9>&-
+}
 log_warn_locked() {
 	# One warning until successful recovery; never feed our own collector a loop.
 	if [ ! -f "$RUN_DIR/$1" ]; then
@@ -533,8 +538,7 @@ log_event_health_locked() {
 		suppressed) [ "$suppressed" -ge 2147483647 ] || suppressed=$((suppressed + 1)) ;;
 		failed) [ "$failed" -ge 2147483647 ] || failed=$((failed + 1)) ;;
 	esac
-	# Separate concurrent candidates even if a stale-lock recovery races a
-	# writer. BusyBox mktemp uses randomized names and honors umask 077.
+	# Randomized temp file; publication is protected by the kernel journal lock.
 	temp="$(mktemp "$RUN_DIR/.event-health.XXXXXX")" || return 1
 	if ! printf '%s %s %s %s %s %s %s\n' "$epoch" "$uptime" "$accepted_epoch" "$accepted_up" "$accepted" "$suppressed" "$failed" >"$temp"; then
 		rm -f "$temp"; return 1
