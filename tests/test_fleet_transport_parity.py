@@ -92,7 +92,7 @@ class FleetTransportParityTests(unittest.TestCase):
 class FleetReleaseContracts(unittest.TestCase):
     def test_agent_retains_legacy_tcp_wss_and_opt_in_transport_renderers(self):
         s=CLIENT.read_text()
-        self.assertIn('case "$vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc)',s)
+        self.assertIn('case "$vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc|reality-xhttp|reality-grpc)',s)
         self.assertIn('stream_fields=\'"network": "tcp", "security": "none"\'',s)
         self.assertIn('transport_preflight() (',s)
         self.assertIn('tlsSettings',s)
