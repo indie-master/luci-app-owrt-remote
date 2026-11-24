@@ -19550,7 +19550,7 @@ exit 127
 
     def do_POST(self):
         path = self.parsed().path
-        if path in ("/api/secure-profiles/draft", "/api/secure-profiles/select"):
+        if path in ("/api/secure-profiles/draft", "/api/secure-profiles/select", "/api/secure-profiles/validate"):
             if not self.require_owner(json_mode=True):
                 return
             if not secrets.compare_digest(self.headers.get("X-Transport-Action-CSRF", ""),
@@ -19566,6 +19566,9 @@ exit 127
                     result = host_adapter_request("secure.catalog.draft", {
                         "profile": payload.get("profile"), "label": payload.get("label"),
                         "remote_host": payload.get("remote_host"), "public_port": payload.get("public_port")})
+                elif path.endswith("/validate"):
+                    result = host_adapter_request("secure.catalog.validate", {
+                        "profile_id": payload.get("profile_id"), "revision": payload.get("revision")})
                 else:
                     router_id = payload.get("router_id")
                     if not isinstance(router_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", router_id):
