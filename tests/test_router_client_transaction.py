@@ -93,6 +93,7 @@ uci() {
 }
 xray_identity() { echo '123:456'; }
 sync() { :; }
+supervised() { ready; }
 install_recovery() {
     printf '# fixture\\n' > "$INIT"
     ln -s "$INIT" "$BOOT"
