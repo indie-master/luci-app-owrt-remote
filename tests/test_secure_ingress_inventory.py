@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docker"))
-from secure_ingress_inventory import reviewed_inventory, read_inventory
+from secure_ingress_inventory import reviewed_inventory, read_inventory, approve_draft_names, live_tcp_ports
 from transport_profiles import ProfileError
 
 
@@ -21,6 +21,33 @@ class InventoryTests(unittest.TestCase):
                           "nginx_config_sha256":"a"*64}
         self.path.write_text(json.dumps(self.inventory))
         self.path.chmod(0o600)
+
+    def test_approve_names_only_changes_inventory_not_runtime(self):
+        artifact = {"profile":{"name":"test","transport":"reality-tcp","port":24001,
+                   "server_name":"new.example.org","server_names":["new.example.org"],
+                   "target_host":"new.example.org","target_port":443,
+                   "private_key":"fixture","short_ids":["aabb"]},
+                   "public_port":443,"remote_host":"dial.example.org"}
+        with patch("secure_ingress_inventory.nginx_digest",return_value="a"*64), \
+                patch("secure_ingress_inventory.live_tcp_ports",return_value={443}):
+            result = approve_draft_names(artifact,path=self.path)
+            self.assertEqual(result["approved_names"],["new.example.org"])
+            self.assertFalse(result["applied"])
+            current = read_inventory(self.path)
+            self.assertEqual(current["allowed_names"],["new.example.org","remote.example.org"])
+            self.assertEqual(current["managed_routes"],[])
+            current["existing_routes"]=[{"sni":"other.example.org","public_port":443}]
+            self.path.write_text(json.dumps(current))
+            artifact["profile"].update(server_name="other.example.org",server_names=["other.example.org"])
+            with self.assertRaises(ProfileError):
+                approve_draft_names(artifact,path=self.path)
+            self.assertEqual(read_inventory(self.path),current)
+
+    def test_live_socket_ports(self):
+        import subprocess
+        response = subprocess.CompletedProcess([],0,"LISTEN 0 128 127.0.0.1:24001 0.0.0.0:*\nLISTEN 0 128 [::]:443 [::]:*\n","")
+        with patch("secure_ingress_inventory.subprocess.run",return_value=response):
+            self.assertEqual(live_tcp_ports(),{24001,443})
 
     def test_current_disk_inventory_required(self):
         with patch("secure_ingress_inventory.nginx_digest", return_value="a"*64):
