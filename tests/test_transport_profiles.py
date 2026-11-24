@@ -32,14 +32,14 @@ def tls_profile(transport):
 class TransportProfilesTest(unittest.TestCase):
     def test_supported(self):
         self.assertEqual(set(SUPPORTED),
-                         {"tcp", "wss", "reality-tcp", "xhttp", "grpc"})
+                         {"tcp", "tcp-tls", "wss", "reality-tcp", "xhttp", "grpc"})
 
     def test_legacy_tcp(self):
         self.assertEqual(render_stream_settings({"transport": "tcp"}),
                          {"network": "tcp", "security": "none"})
 
     def test_tls_transports(self):
-        for transport, network in (("wss", "ws"), ("xhttp", "xhttp"),
+        for transport, network in (("tcp-tls", "tcp"), ("wss", "ws"), ("xhttp", "xhttp"),
                                    ("grpc", "grpc")):
             with self.subTest(transport=transport):
                 actual = render_stream_settings(tls_profile(transport))
@@ -58,6 +58,29 @@ class TransportProfilesTest(unittest.TestCase):
         })
         self.assertEqual(settings["security"], "reality")
         self.assertEqual(settings["network"], "tcp")
+
+    def test_new_profiles_never_allow_plaintext(self):
+        self.assertEqual(set(module.SECURE_PROFILES), {"tcp-tls", "wss", "reality-tcp", "xhttp", "grpc"})
+        for name in module.SECURE_PROFILES:
+            module.require_secure_profile({"transport": name})
+        for name in ("tcp", "none", "unknown"):
+            with self.assertRaises(ProfileError):
+                module.require_secure_profile({"transport": name})
+
+    def test_tcp_tls_and_wss_validate_certificate(self):
+        for name in ("tcp-tls", "wss"):
+            p = dict(tls_profile(name), name="candidate", port=18550)
+            outbound = render_router_outbound(p, router_uuid="550e8400-e29b-41d4-a716-446655440000",
+                                              remote_host="router.example.org")
+            stream = outbound["streamSettings"]
+            self.assertEqual(stream["security"], "tls")
+            self.assertIs(stream["tlsSettings"]["allowInsecure"], False)
+            self.assertEqual(stream["tlsSettings"]["serverName"], "router.example.org")
+            if name == "wss":
+                self.assertEqual(stream["tlsSettings"]["alpn"], ["http/1.1"])
+                self.assertEqual(stream["wsSettings"]["host"], "router.example.org")
+        with self.assertRaises(ProfileError):
+            render_stream_settings({"transport": "tcp-tls"})
 
     def test_reject_unknown(self):
         with self.assertRaises(ProfileError):
@@ -84,7 +107,7 @@ class TransportProfilesTest(unittest.TestCase):
     def test_client_outbound_for_each_transport(self):
         uid = "550e8400-e29b-41d4-a716-446655440000"
         profiles = [{"transport": "tcp"}]
-        for transport in ("wss", "xhttp", "grpc"):
+        for transport in ("tcp-tls", "wss", "xhttp", "grpc"):
             profiles.append(tls_profile(transport))
         reality = {
             "transport": "reality-tcp",
