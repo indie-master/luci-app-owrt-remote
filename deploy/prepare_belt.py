@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import tarfile
 
 ROOT = Path("/opt/router-orchestrator")
 REPO = Path(__file__).resolve().parents[1]
@@ -119,6 +120,34 @@ def main():
             str(backup_dir / "hub.db")) as copy:
         live.backup(copy)
     os.chmod(backup_dir / "hub.db", 0o600)
+    # Preserve the remaining durable HUB state as well: authorization,
+    # agent tokens, notification history, router logs and UI preferences.
+    # SQLite's online copy above replaces potentially inconsistent WAL files.
+    state_root = db.parent.resolve(strict=True)
+    archive = backup_dir / "hub-state-excluding-db.tar.gz"
+    total_bytes = 0
+    file_count = 0
+    with tarfile.open(archive, "w:gz") as tar:
+        for item in sorted(state_root.rglob("*")):
+            check(not item.is_symlink(), "symlink in HUB state: " + str(item))
+            if not item.is_file():
+                continue
+            relative = item.relative_to(state_root)
+            if item.name in ("hub.db", "hub.db-wal", "hub.db-shm"):
+                continue
+            size = item.stat().st_size
+            check(size <= 64 * 1024 * 1024,
+                  "HUB state file exceeds safe backup size limit")
+            total_bytes += size
+            check(total_bytes <= 256 * 1024 * 1024,
+                  "HUB state exceeds safe migration backup limit")
+            tar.add(item, arcname="state/" + str(relative), recursive=False)
+            file_count += 1
+    os.chmod(archive, 0o600)
+    with tarfile.open(archive, "r:gz") as tar:
+        check(len(tar.getmembers()) == file_count,
+              "state archive integrity/membership check failed")
+
     (backup_dir / "live-images.json").write_text(
         json.dumps({"hub": hub, "xray": xray,
                     "router_count": router_count,
@@ -137,6 +166,7 @@ def main():
     print("Xray IMAGE PRESERVED:", xray)
     print("ROUTERS IN DB:", router_count)
     print("SQLITE BACKUP: PASS")
+    print("OTHER HUB STATE BACKUP: PASS, files=", file_count)
     print("CANDIDATE:", str(CANDIDATE))
     print("LIVE HUB, XRAY, NGINX, SYSTEMD: UNCHANGED")
     print("DEPLOYMENT: NOT STARTED")
