@@ -50,6 +50,10 @@ ADMIN_CODES = {200,301,302,303,307,308,401,403}
 DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
+class MaintenanceBusy(ProfileError):
+    pass
+
+
 def require(ok,message):
     if not ok:
         raise ProfileError(message)
@@ -75,7 +79,7 @@ def exclusive(path):
         try:
             fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ProfileError("another maintenance transaction is running") from None
+            raise MaintenanceBusy("another maintenance transaction is running") from None
         yield
     finally:
         os.close(fd)
@@ -225,14 +229,19 @@ def validate_config(data,context):
 
 def activate(context):
     check_identity(context,running=False)
-    expected=context["original_nginx_digest"] if sha(MANAGED.read_bytes())==context["original_map_sha"] else context["candidate_nginx_digest"]
-    require(nginx_digest("external-stream")==expected,"external nginx changed during activation")
+    restoring=sha(MANAGED.read_bytes())==context["original_map_sha"]
+    expected=context["original_nginx_digest"] if restoring else context["candidate_nginx_digest"]
+    if not restoring:
+        require(nginx_digest("external-stream")==expected,"external nginx changed before activation")
     require(life.run("systemctl","is-active","--quiet",life.SERVICE).returncode!=0,
             "legacy Xray service is active")
     since=int(time.time())
     docker("restart","--time","5",life.CONTAINER,timeout=55)
     require(life.wait_healthy(),"Xray legacy listeners did not recover")
     check_identity(context)
+    # Even if unrelated nginx files were edited, restore the old Xray first
+    # and retain the hold rather than reloading unreviewed nginx files.
+    require(nginx_digest("external-stream")==expected,"external nginx changed during activation")
     run("/usr/bin/systemctl","reload","nginx",timeout=30)
     require(wait_fleet(context,since),"existing reverse access did not fully recover")
 
@@ -322,6 +331,9 @@ def publish(profile_id,revision,expected):
             "publication requires the installed production revision")
     run("/usr/bin/systemctl","is-active","--quiet",TIMER,timeout=5)
     require(not life.TRANSPORT_HOLD.exists(),"another maintenance transaction is active")
+    if life.JOURNAL.exists():
+        require(json.loads(life.JOURNAL.read_text()).get("phase") in ("committed","rolled-back"),
+                "unfinished Xray core lifecycle journal")
     archive_previous()
     inventory=reviewed_inventory()
     require(inventory["mode"]=="external-stream","only reviewed external stream is enabled")
@@ -361,12 +373,11 @@ def publish(profile_id,revision,expected):
             "original_xray_sha":sha(original),"original_map_sha":sha(fragment),
             "original_nginx_digest":inventory["nginx_config_sha256"],"candidate_nginx_digest":stamp}
         atomic(STATE/"context.json",encode(context))
-        fd=os.open(life.TRANSPORT_HOLD,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
-        with os.fdopen(fd,"wb") as stream:
-            stream.write(HOLD_BYTES)
-            stream.flush()
-            os.fsync(stream.fileno())
-        sync_directory(life.TRANSPORT_HOLD.parent)
+        require(not life.TRANSPORT_HOLD.exists() and not life.TRANSPORT_HOLD.is_symlink(),
+                "maintenance hold appeared during preflight")
+        # All internal writers own the shared lifecycle lock. Atomic
+        # replacement prevents a crash leaving a zero-byte marker.
+        atomic(life.TRANSPORT_HOLD,HOLD_BYTES)
 
         def validate(data,nginx):
             require(nginx==candidate_map and reviewed_inventory()==inventory,
@@ -437,11 +448,16 @@ def main():
     parser.add_argument("--confirm-maintenance",action="store_true")
     args=parser.parse_args()
     require(os.geteuid()==0,"root required")
+    if args.action=="recover":
+        try:
+            with locks():
+                print("PUBLICATION RECOVERY:",recover_locked())
+        except MaintenanceBusy:
+            print("PUBLICATION RECOVERY: active maintenance, skipped")
+        return
     with locks():
         if args.action=="status":
             print("PUBLICATION:",tx()._record()["phase"] if (STATE/"pending.json").exists() else "NONE")
-        elif args.action=="recover":
-            print("PUBLICATION RECOVERY:",recover_locked())
         else:
             require(args.confirm_maintenance and args.profile_id and args.revision
                     and DIGEST.fullmatch(args.artifact_sha256 or ""),
