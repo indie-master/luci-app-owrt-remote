@@ -99,14 +99,21 @@ def hold_snapshot(path):
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     except FileNotFoundError:
         return None
-    with os.fdopen(fd,"rb") as stream:
-        info=os.fstat(stream.fileno())
+    try:
+        info=os.fstat(fd)
         require(stat.S_ISREG(info.st_mode) and info.st_size<=4096,
                 "maintenance hold is not a small regular file")
-        data=stream.read(4097)
+        data=b""
+        while len(data)<4097:
+            chunk=os.read(fd,4097-len(data))
+            if not chunk:
+                break
+            data+=chunk
         require(len(data)<=4096,"maintenance hold exceeds limit")
         return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,
                 stat.S_IMODE(info.st_mode),info.st_nlink,digest(data))
+    finally:
+        os.close(fd)
 
 
 def prepare(allow_preserved_hold=False):
