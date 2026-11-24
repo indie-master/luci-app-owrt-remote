@@ -26,8 +26,9 @@ WATCHDOG_SERVICE = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.s
 WATCHDOG_TIMER = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.timer")
 TRANSPORT_SERVICE = Path("/etc/systemd/system/router-orchestrator-transport-expiry.service")
 TRANSPORT_TIMER = Path("/etc/systemd/system/router-orchestrator-transport-expiry.timer")
+TRANSPORT_JOB_UNIT = Path("/etc/systemd/system/router-orchestrator-transport-stage@.service")
 MANAGED_RECOVERY_UNITS = (WATCHDOG_SERVICE, WATCHDOG_TIMER,
-                          TRANSPORT_SERVICE, TRANSPORT_TIMER)
+                          TRANSPORT_SERVICE, TRANSPORT_TIMER, TRANSPORT_JOB_UNIT)
 BACKUP = STAGE / "cutover-rollback"
 SYSTEMD = "router-orchestrator-host-adapter.service"
 
@@ -160,6 +161,10 @@ def main():
         jobs.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(jobs, 0, 0)
         os.chmod(jobs, 0o700)
+        stage_queue = ROOT / "data/transport-stage-queue"
+        stage_queue.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(stage_queue, 0, 0)
+        os.chmod(stage_queue, 0o700)
         require(run("systemctl", "daemon-reload").returncode == 0,
                 "systemd reload failed")
         require(run("systemctl", "restart", SYSTEMD).returncode == 0,
