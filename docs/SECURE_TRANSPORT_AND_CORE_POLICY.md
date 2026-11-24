@@ -258,3 +258,22 @@ authenticated real LuCI/SSH still require separate acceptance. The
 production publication worker must use the common lifecycle lock,
 independent recovery and validated durable inventory/metadata commit;
 no live publish endpoint is enabled yet.
+
+
+## Belt TLS wire rehearsal acceptance (2026-11-24)
+
+Operator output for c50d804 confirms 30 local regression tests passed.
+The production image Xray 26.3.27 (d2758a0, linux/amd64) completed both
+reverse nonce proofs on each of TCP/TLS, WS/TLS, XHTTP/TLS and gRPC/TLS,
+through isolated nginx with outgoing PROXY protocol. Existing certificate
+import for sprt-wrt.cdnvc.xyz succeeded. Production HUB/Xray IDs and
+configuration hashes were unchanged, nginx syntax and HUB health passed,
+and no probe containers remained. Production Xray currently has no TLS
+mount; the isolated tests mounted TLS independently. The production mount
+must be included in the eventual controlled server upgrade.
+
+REALITY trials now preflight the explicit target using verified TLS 1.3
+and h2, with the selected SNI. This is a deliberately conservative gate
+for the three REALITY profiles, not proof of REALITY compatibility.
+REALITY wire tests and OpenWrt hardware acceptance remain outstanding.
+No profile is published or assigned by these tests.
