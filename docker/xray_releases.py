@@ -14,8 +14,9 @@ import re
 import subprocess
 import sys
 import urllib.request
+import urllib.error
 
-RELEASES = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=60"
+RELEASES = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10"
 VERSION = re.compile(r"^v([0-9]{1,4}\.[0-9]{1,3}\.[0-9]{1,3})$")
 REGISTRY = "ghcr.io/xtls/xray-core"
 STAGED = Path("/opt/router-orchestrator/data/xray-candidates")
@@ -28,19 +29,39 @@ def require(ok, reason):
 
 
 def stable_release_tags():
-    request = urllib.request.Request(
-        RELEASES, headers={"Accept": "application/vnd.github+json",
-                           "User-Agent": "Router-Orchestrator-release-checker"})
-    with urllib.request.urlopen(request, timeout=12) as response:
-        require(response.status == 200, "GitHub releases unavailable")
-        raw = response.read(MAX_BYTES + 1)
-        require(len(raw) <= MAX_BYTES, "GitHub response exceeds limit")
-    items = json.loads(raw)
-    require(isinstance(items, list), "invalid releases document")
-    return [item["tag_name"] for item in items if isinstance(item, dict)
-            and not item.get("draft") and not item.get("prerelease")
-            and isinstance(item.get("tag_name"), str)
-            and VERSION.fullmatch(item["tag_name"])]
+    # Bound each page independently: release documents can contain large
+    # asset lists. Fetch only as many pages as needed for the stable choices.
+    tags = []
+    for page in range(1, 4):
+        request = urllib.request.Request(
+            RELEASES + "&page=" + str(page),
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "Router-Orchestrator-release-checker"})
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                require(response.status == 200, "GitHub releases unavailable")
+                raw = response.read(MAX_BYTES + 1)
+                require(len(raw) <= MAX_BYTES, "GitHub release page exceeds limit")
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 429):
+                raise RuntimeError("GitHub API denied request or rate limit reached (HTTP "+str(exc.code)+")") from None
+            raise RuntimeError("GitHub release API HTTP "+str(exc.code)) from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise RuntimeError("GitHub release API connection failed or timed out") from None
+        try:
+            items = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise RuntimeError("GitHub release API returned invalid JSON") from None
+        require(isinstance(items, list), "invalid releases document")
+        for item in items:
+            if (isinstance(item,dict) and not item.get("draft") and not item.get("prerelease")
+                    and isinstance(item.get("tag_name"),str) and VERSION.fullmatch(item["tag_name"])
+                    and item["tag_name"] not in tags):
+                tags.append(item["tag_name"])
+        if len(items)<10 or len(tags)>=8:
+            break
+    require(tags,"no stable releases in reviewed GitHub pages")
+    return tags
 
 
 def command(*args, timeout=180):
