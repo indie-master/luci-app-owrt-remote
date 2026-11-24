@@ -28,7 +28,7 @@ SOCKET = Path("/run/router-orchestrator/control.sock")
 CONFIG = Path("/etc/xray/owrt-remote.json")
 BINARY = "/usr/local/bin/xray"
 SERVICE = "owrt-remote-xray"
-HOLD = Path("/var/lib/owrt-remote/.xray-maintenance-hold")
+HOLD = Path("/opt/router-orchestrator/data/.xray-maintenance-hold")
 MAX_REQUEST = 2 * 1024 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
 
