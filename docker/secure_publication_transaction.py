@@ -94,7 +94,10 @@ class PublicationTransaction:
         if sha(data) != entry["before"]:
             raise ProfileError("publication backup digest mismatch")
         current = read_regular(self.paths[name])[0]
-        if sha(current) not in (entry["before"], entry["after"]):
+        allowed = {entry["before"], entry["after"]}
+        if "trial" in entry:
+            allowed.add(entry["trial"])
+        if sha(current) not in allowed:
             raise ProfileError("publication target changed externally; manual recovery required")
         return data, entry
 
@@ -124,7 +127,7 @@ class PublicationTransaction:
 
     def apply(self, *, candidate_xray, candidate_nginx, expected_xray_sha,
               expected_nginx_sha, validate, activate, accept, verify_baseline,
-              binding=None, finalize=None):
+              binding=None, finalize=None, trial_xray=None, trial_accept=None):
         """Accept only after explicit runtime evidence; optional metadata finalizer.
 
         The caller must hold the common Xray lifecycle lock, prevent unrelated
@@ -136,6 +139,10 @@ class PublicationTransaction:
         with self.locked():
             if self.journal.exists() or self.journal.is_symlink():
                 raise ProfileError("transaction journal already exists; archive or recover it")
+            if (trial_xray is None) != (trial_accept is None):
+                raise ProfileError("trial configuration and acceptance must be supplied together")
+            if trial_xray is not None and (not isinstance(trial_xray, bytes) or trial_xray == candidate_xray):
+                raise ProfileError("invalid distinct trial configuration")
             candidates = {"xray": candidate_xray, "nginx": candidate_nginx}
             expected = {"xray": expected_xray_sha, "nginx": expected_nginx_sha}
             originals = {name: read_regular(path) for name, path in self.paths.items()}
@@ -153,6 +160,9 @@ class PublicationTransaction:
                                          "mode": mode, "uid": uid, "gid": gid}
             # Preflight may not mutate live targets. Recheck immediately after.
             validate(candidate_xray, candidate_nginx)
+            if trial_xray is not None:
+                record["files"]["xray"]["trial"] = sha(trial_xray)
+                validate(trial_xray, candidate_nginx)
             for name, path in self.paths.items():
                 if sha(read_regular(path)[0]) != expected[name]:
                     raise ProfileError("publication baseline changed during validation")
@@ -166,10 +176,21 @@ class PublicationTransaction:
                     entry = record["files"][name]
                     if sha(read_regular(path)[0]) != entry["before"]:
                         raise ProfileError("publication target changed before replacement")
-                    atomic(path, candidates[name], entry["mode"], (entry["uid"], entry["gid"]))
+                    data = trial_xray if name == "xray" and trial_xray is not None else candidates[name]
+                    atomic(path, data, entry["mode"], (entry["uid"], entry["gid"]))
                 record["phase"] = "VERIFYING"
                 self._write_journal(record)
                 activate()
+                if trial_xray is not None:
+                    if not trial_accept():
+                        raise ProfileError("authenticated trial acceptance failed")
+                    entry = record["files"]["xray"]
+                    if sha(read_regular(self.paths["xray"])[0]) != entry["trial"] or sha(read_regular(self.paths["nginx"])[0]) != record["files"]["nginx"]["after"]:
+                        raise ProfileError("publication files changed during authenticated trial")
+                    record["phase"] = "REMOVING_TRIAL"
+                    self._write_journal(record)
+                    atomic(self.paths["xray"], candidate_xray, entry["mode"], (entry["uid"], entry["gid"]))
+                    activate()
                 if not accept():
                     raise ProfileError("publication runtime acceptance failed")
                 for name, path in self.paths.items():
@@ -198,7 +219,7 @@ class PublicationTransaction:
                 return record
             if record["phase"] == "FILES_ACCEPTED":
                 return self._finalize(record, finalize)
-            if record["phase"] not in ("PREPARED", "APPLYING", "VERIFYING", "RESTORING"):
+            if record["phase"] not in ("PREPARED", "APPLYING", "VERIFYING", "REMOVING_TRIAL", "RESTORING"):
                 raise ProfileError("unknown publication journal phase")
             self._restore(record, activate, verify_baseline)
             return record
