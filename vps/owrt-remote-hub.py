@@ -19212,6 +19212,17 @@ exit 127
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:150]})
             return
+        if path == "/api/transports/routers":
+            if not self.require_owner(json_mode=True):
+                return
+            with self.app.conn() as conn:
+                rows = list_router_rows(conn)
+            routers = [{"id": row_str_value(row, "id"),
+                        "name": row_str_value(row, "name"),
+                        "transport": row_str_value(row, "vps_transport", "tcp")}
+                       for row in rows if not router_deleted(row)]
+            self.send_json(200, {"ok": True, "routers": routers})
+            return
         if path == "/health":
             result = {"ok": True}
             if self.query().get('panel-update') == ['1']:
@@ -19814,6 +19825,30 @@ exit 127
                     {"action": payload.get("action"), "version": payload.get("version") or ""},
                 ))
             except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/canary/preview":
+            if not self.require_owner(json_mode=True):
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                config = payload.get("profiles")
+                from transport_profiles import validate_profiles
+                validate_profiles(config)
+                baseline = host_adapter_request("xray.current")
+                result = host_adapter_request("xray.transport.canary.preview", {
+                    "profiles": config,
+                    "router_id": payload.get("router_id"),
+                    "remote_host": payload.get("remote_host"),
+                    "admin_test_port": payload.get("admin_test_port"),
+                    "ssh_test_port": payload.get("ssh_test_port"),
+                    "expected_sha256": baseline["sha256"]
+                })
+                self.send_json(200, result)
+            except (TypeError, ValueError, KeyError, RuntimeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
         if path == "/api/transports/preview":
