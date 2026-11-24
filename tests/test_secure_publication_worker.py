@@ -54,6 +54,15 @@ class WorkerTests(unittest.TestCase):
         with self.assertRaises(adapter.Rejected):
             adapter.hydrate_server_keys(live,public)
 
+    def test_temporary_proof_identities_are_not_exposed_to_hub(self):
+        live={"inbounds":[{"tag":"ro-secure-test-r1","settings":{"clients":[
+            {"email":"pilot-probe-trial@owrt-remote","id":"temporary-secret"},
+            {"email":"router@owrt-remote","id":"existing-identity"}]}}]}
+        public=adapter.redact_server_keys(live)
+        self.assertNotIn("temporary-secret",json.dumps(public))
+        self.assertIn("existing-identity",json.dumps(public))
+        self.assertEqual(len(live["inbounds"][0]["settings"]["clients"]),2)
+
     def test_missing_tls_mount_is_a_hard_gate(self):
         item={"Id":"container","Image":"sha256:"+"a"*64,"HostConfig":{"NetworkMode":"host"},
               "State":{"Running":True},"Config":{"Cmd":["run","-config",str(worker.CONFIG)]},
