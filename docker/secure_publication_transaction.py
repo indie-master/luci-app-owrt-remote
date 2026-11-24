@@ -111,13 +111,27 @@ class PublicationTransaction:
         record["phase"] = "ROLLED_BACK"
         self._write_journal(record)
 
+    def _finalize(self, record, finalize):
+        if finalize is None:
+            raise ProfileError("publication metadata finalizer required")
+        for name, path in self.paths.items():
+            if sha(read_regular(path)[0]) != record["files"][name]["after"]:
+                raise ProfileError("accepted publication files changed; manual recovery required")
+        finalize(record)
+        record["phase"] = "ACCEPTED"
+        self._write_journal(record)
+        return record
+
     def apply(self, *, candidate_xray, candidate_nginx, expected_xray_sha,
-              expected_nginx_sha, validate, activate, accept, verify_baseline):
-        """Accept only after explicit runtime evidence; never publish DB metadata.
+              expected_nginx_sha, validate, activate, accept, verify_baseline,
+              binding=None, finalize=None):
+        """Accept only after explicit runtime evidence; optional metadata finalizer.
 
         The caller must hold the common Xray lifecycle lock, prevent unrelated
         nginx edits, and install an external recovery service before invoking.
-        A crash leaves a durable journal for that recovery service.
+        A crash leaves a durable journal for that recovery service. FILES_ACCEPTED
+        is a forward-only commit decision; the finalizer must be idempotent and
+        independently check runtime and metadata before exposing the revision.
         """
         with self.locked():
             if self.journal.exists() or self.journal.is_symlink():
@@ -125,7 +139,11 @@ class PublicationTransaction:
             candidates = {"xray": candidate_xray, "nginx": candidate_nginx}
             expected = {"xray": expected_xray_sha, "nginx": expected_nginx_sha}
             originals = {name: read_regular(path) for name, path in self.paths.items()}
+            if (binding is None) != (finalize is None):
+                raise ProfileError("binding and metadata finalizer must be supplied together")
             record = {"phase": "PREPARED", "files": {}}
+            if binding is not None:
+                record["binding"] = binding
             for name, (data, mode, uid, gid) in originals.items():
                 if sha(data) != expected[name]:
                     raise ProfileError("publication baseline changed")
@@ -157,18 +175,29 @@ class PublicationTransaction:
                 for name, path in self.paths.items():
                     if sha(read_regular(path)[0]) != record["files"][name]["after"]:
                         raise ProfileError("publication target changed during acceptance")
-                record["phase"] = "ACCEPTED"
+                record["phase"] = "FILES_ACCEPTED" if binding is not None else "ACCEPTED"
                 self._write_journal(record)
-                return record
             except Exception:
+                # No metadata finalizer has run before the durable decision.
+                # A failed journal fsync must not roll back an already-recorded
+                # decision that a recovery worker might subsequently finalize.
+                if self._record().get("phase") == "FILES_ACCEPTED":
+                    raise
                 self._restore(record, activate, verify_baseline)
                 raise
+            if binding is not None:
+                # Forward-only commit: never restore old files after a catalog
+                # revision might have become visible to other processes.
+                return self._finalize(record, finalize)
+            return record
 
-    def recover(self, *, activate, verify_baseline):
+    def recover(self, *, activate, verify_baseline, finalize=None):
         with self.locked():
             record = self._record()
             if record["phase"] in ("ACCEPTED", "ROLLED_BACK"):
                 return record
+            if record["phase"] == "FILES_ACCEPTED":
+                return self._finalize(record, finalize)
             if record["phase"] not in ("PREPARED", "APPLYING", "VERIFYING", "RESTORING"):
                 raise ProfileError("unknown publication journal phase")
             self._restore(record, activate, verify_baseline)
