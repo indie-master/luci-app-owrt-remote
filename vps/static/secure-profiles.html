@@ -9,6 +9,7 @@ label{display:flex;flex-direction:column;gap:5px;font-size:14px}select,button{ba
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.item{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid #344254;padding:12px 0}.item:last-child{border:0}.state{font-size:13px}.error{color:#ffaaa9} [hidden]{display:none!important}
 </style></head><body data-csrf="__TRANSPORT_CSRF__">
 <header><h1>Транспортные профили</h1><nav><a href="/">HUB</a> · <a href="/transport-configurator/">Создать профиль</a></nav></header>
+<section class="panel"><h2>Публикация</h2><p id="publication-status" role="status">Проверка доступности…</p><button id="refresh-job" type="button">Обновить статус</button></section>
 <section class="panel"><h2>Каталог</h2><p class="muted">Черновики не создают серверные входы. Только опубликованные ревизии можно выбрать для роутера.</p><div id="catalog" aria-live="polite">Загрузка…</div></section>
 <section class="panel"><h2>Настройки конкретного роутера</h2>
 <label>Роутер<select id="router"><option value="">Выбрать устройство</option></select></label>
@@ -24,7 +25,8 @@ label{display:flex;flex-direction:column;gap:5px;font-size:14px}select,button{ba
 <p id="message" role="status"></p></section>
 <script>
 const get=id=>document.getElementById(id),router=get('router'),selects=['primary','fallback1','fallback2'].map(get);
-let routers=[],available=[],selectionToken=0,loaded=false,saving=false;
+let routers=[],available=[],selectionToken=0,loaded=false,saving=false,publicationEnabled=false,publicationBusy=true;
+const publishButtons=[];
 function message(value,error=false){get('message').textContent=value;get('message').classList.toggle('error',error)}
 async function api(path,body){
  const opts={credentials:'same-origin',cache:'no-store'};
@@ -33,6 +35,18 @@ async function api(path,body){
  if(!response.ok||!data.ok)throw Error(data.error||'Запрос не выполнен');
  return data;
 }
+async function refreshJob(){
+ try{
+  const data=await api('/api/secure-profiles/job'),job=data.job;
+  publicationEnabled=data.enabled;
+  publicationBusy=['pending','running','recovery_required'].includes(job.status);
+  const labels={none:'Нет операций',pending:'В очереди',running:'Выполняется',success:'Опубликовано',failed:'Не выполнено',recovery_required:'Требуется проверка восстановления'};
+  get('publication-status').textContent=(publicationEnabled?'Публикация разрешена':'Публикация отключена на VPS')+
+   ' · '+(labels[job.status]||job.status)+(job.profile_id?' · '+job.profile_id+' rev '+job.revision:'')+(job.message?' · '+job.message:'');
+ }catch(err){publicationEnabled=false;publicationBusy=true;get('publication-status').textContent=String(err.message||err)}
+ for(const refresh of publishButtons)refresh();
+}
+get('refresh-job').addEventListener('click',refreshJob);
 const key=p=>p.profile_id+':'+p.revision;
 function option(value,label){const node=document.createElement('option');node.value=value;node.textContent=label;return node}
 function fill(desired){
@@ -101,13 +115,19 @@ get('preferences').addEventListener('submit',async e=>{
      }catch(err){result.textContent=String(err.message||err)}
      finally{validate.disabled=false}
     });
+    let sealedDigest="";
+    const publish=document.createElement("button");
+    publish.type="button";publish.textContent="Опубликовать";
+    const updatePublish=()=>{publish.disabled=!publicationEnabled||publicationBusy||!sealedDigest;};
+    publishButtons.push(updatePublish);updatePublish();
     const plan=document.createElement('button');
     plan.type='button';plan.textContent='План публикации';
     plan.addEventListener('click',async()=>{
-     plan.disabled=true;validate.disabled=true;
+     sealedDigest='';updatePublish();plan.disabled=true;validate.disabled=true;
      result.textContent='Проверка выделенных SNI, портов и серверной конфигурации…';
      try{
       const candidate=await api('/api/secure-profiles/plan',{profile_id:p.profile_id,revision:p.revision});
+      sealedDigest=candidate.artifact_sha256;updatePublish();
       result.textContent='План готов · Xray: PASS · '+candidate.routes.map(route=>route.sni+' → '+route.upstream).join(' · ')+
        ' · Конфигурация nginx на диске сверена. Вход не активирован, роутеры не изменены.';
      }catch(err){result.textContent=String(err.message||err)}
@@ -124,7 +144,16 @@ get('preferences').addEventListener('submit',async e=>{
      }catch(err){result.textContent=String(err.message||err)}
      finally{approve.disabled=false;plan.disabled=false}
     });
-    item.append(validate,approve,plan,result);
+    publish.addEventListener('click',async()=>{
+     if(publish.disabled||!confirm('Опубликовать '+p.label+'? Xray будет перезапущен дважды; существующие reverse-сессии кратковременно прервутся. Настройки роутеров не изменятся.'))return;
+     publicationBusy=true;for(const refresh of publishButtons)refresh();
+     try{
+      await api('/api/secure-profiles/publish',{profile_id:p.profile_id,revision:p.revision,artifact_sha256:sealedDigest,confirmed:true});
+      result.textContent='Задание принято. Проверяй состояние публикации; после успеха обнови страницу.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{await refreshJob()}
+    });
+    item.append(validate,approve,plan,publish,result);
    }
    catalog.append(item);
   }
@@ -132,7 +161,7 @@ get('preferences').addEventListener('submit',async e=>{
   for(const r of routers)router.appendChild(option(r.id,r.name+' · '+r.id));
   const requested=new URLSearchParams(location.search).get('router_id');
   if(routers.some(r=>r.id===requested))router.value=requested;
-  fill([]);await loadRouter();
+  fill([]);await loadRouter();await refreshJob();
  }catch(err){get('catalog').textContent='Каталог недоступен';message(String(err.message||err),true)}
 })();
 </script></body></html>
