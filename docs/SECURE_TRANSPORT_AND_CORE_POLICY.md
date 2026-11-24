@@ -317,3 +317,44 @@ actual listener acceptance, and protection of published REALITY secrets
 in the legacy full-config adapter API remain release gates. Existing
 production Xray lacks the required TLS mount. No live publish endpoint
 has been enabled, and no production profile or router has been changed.
+
+
+## External-stream publication worker (first operator-only implementation)
+
+Belt 5f01bde passed all 20 publication regression tests and the real
+namespace nginx preflight; baseline and live services remained unchanged.
+
+The root-only secure_publication_worker.py now requires the installed
+production revision, active recovery timer, exact draft digest, explicit
+maintenance confirmation, exact Docker image/container and read-only
+Xray config/TLS directory mounts. It checks every recently online router's
+heartbeat, SSH banner and LuCI HTTP reachability, not just 80 percent.
+It checks the reviewed nginx digest, candidate Xray syntax and TLS pair
+(or REALITY target at 443). The first REALITY live implementation rejects
+target addresses overlapping the dial hostname or local interfaces; this
+is a conservative recursion gate, not proof against all DNS changes.
+
+For live acceptance the transaction temporarily installs two independent
+random reverse credentials and private loopback portals on the new inbound.
+A test client connects through the configured public hostname/port and
+proves two independent nonce responses for each selected SNI. The worker
+then removes the probe, installs the final empty inbound and checks the
+fleet again. This entails two Xray restarts and nginx reloads; a failed
+trial can entail a third restart during recovery. No existing router
+configuration is changed. The final catalog commit is forward-only after
+FILES_ACCEPTED; actual router enrollment remains a separate feature.
+
+Recovery uses the same lifecycle and ingress locks and a durable maintenance
+hold. The independent timer retries incomplete transactions or forward
+metadata commits. The core watchdog skips this hold; shadow rollback cannot
+remove another transaction's hold. The worker refuses to reload unrelated
+changed nginx files and retains recovery state for operator review.
+The legacy config API masks server REALITY private keys and transient
+proof identities; unchanged keys are hydrated only inside the host adapter.
+Core validation now mounts the dedicated TLS directory when present.
+
+The production worker and timer are not installed or enabled by these
+commits. They require real deployment rehearsal and fault-injection tests.
+The Web publish job endpoint is intentionally not enabled yet. Current
+Belt lacks the production TLS mount; do not run the live publish command
+from a server-candidates checkout or bypass the mount gate.
