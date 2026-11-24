@@ -27,7 +27,7 @@ jobs:
           python-version: '3.11'
       - name: Syntax check production modules
         run: |
-          python -m py_compile vps/owrt-remote-hub.py docker/host_adapter.py docker/transport_profiles.py docker/transport_canary.py docker/xray_lifecycle.py docker/xray_releases.py docker/core_job_runner.py deploy/prepare_belt.py deploy/apply_belt.py deploy/refresh_belt_candidate.py docker/xray_watchdog.py docker/transport_stage.py docker/cleanup.py
+          python -m py_compile vps/owrt-remote-hub.py docker/host_adapter.py docker/transport_profiles.py docker/transport_canary.py docker/xray_lifecycle.py docker/xray_releases.py docker/core_job_runner.py deploy/prepare_belt.py deploy/apply_belt.py deploy/refresh_belt_candidate.py docker/xray_watchdog.py docker/transport_stage.py docker/transport_stage_job.py docker/cleanup.py
           python -m py_compile tests/test_transport_profiles.py
       - name: Pure transport tests
         run: |
@@ -47,7 +47,7 @@ jobs:
           grep -Fq 'vps_transport" in tcp|ws|reality-tcp|xhttp|grpc)' files/usr/sbin/owrt-remote
       - name: Validate systemd worker and watchdog units
         run: |
-          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer
+          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer deploy/systemd/router-orchestrator-transport-stage@.service
       - name: Validate embedded nginx configuration
         run: |
           docker run --rm -v "$PWD/deploy/nginx/embedded.conf:/etc/nginx/nginx.conf:ro" nginx:1.29-alpine nginx -t
