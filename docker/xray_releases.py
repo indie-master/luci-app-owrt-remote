@@ -74,6 +74,8 @@ def prepare(version):
                         "--cap-drop", "ALL",
                         "-v", "/etc/xray:/etc/xray:ro",
                         "-v", "/usr/local/share/xray:/usr/local/share/xray:ro",
+                        *(["-v", "/opt/router-orchestrator/tls:/etc/router-orchestrator/tls:ro"]
+                          if Path("/opt/router-orchestrator/tls").is_dir() else []),
                         local, "run", "-test",
                         "-config", "/etc/xray/owrt-remote.json", timeout=45)
     require(candidate.returncode == 0, "candidate core rejected current config")
