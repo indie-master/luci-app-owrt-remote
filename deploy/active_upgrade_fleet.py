@@ -73,12 +73,21 @@ def survey():
 
 
 def baseline_from(rows, allowed_degraded=()):
-    degraded=sorted(rid for rid,row in rows.items() if row["recent"] and
-                    not (row["admin_ok"] and row["ssh_ok"]))
-    if set(degraded)!=set(allowed_degraded):
-        raise RuntimeError("existing degraded routers need explicit review: "+(", ".join(degraded) or "none"))
+    allowed=set(allowed_degraded)
+    unknown=allowed-set(rows)
+    if unknown:
+        raise RuntimeError("unknown acknowledged router IDs: "+", ".join(sorted(unknown)))
+    degraded={rid for rid,row in rows.items() if row["recent"] and
+              not (row["admin_ok"] and row["ssh_ok"])}
+    unreviewed=degraded-allowed
+    if unreviewed:
+        raise RuntimeError("existing degraded routers need explicit review: "+", ".join(sorted(unreviewed)))
+    # A named acknowledgment permits only an already unavailable channel.
+    # If a router recovers, capture and require its newly working channels.
+    # If it goes stale before cutover, retain its identity and port mapping
+    # without demanding a fresh heartbeat that was absent at capture.
     baseline={rid:{key:row[key] for key in ("admin","ssh","admin_ok","ssh_ok","recent")}
-              for rid,row in rows.items() if row["recent"] or row["admin_ok"] or row["ssh_ok"]}
+              for rid,row in rows.items() if row["recent"] or row["admin_ok"] or row["ssh_ok"] or rid in allowed}
     if not any(row["admin_ok"] and row["ssh_ok"] for row in baseline.values()):
         raise RuntimeError("no fully working reverse router available for acceptance")
     return baseline
