@@ -85,6 +85,11 @@ def normalize_profile(value):
     profile = dict(value)
     if transport in REALITY_PROFILES:
         reality_keys(profile)
+    elif not profile.get("certificate_file") and not profile.get("key_file"):
+        from secure_certificate_inventory import mounted_certificate
+        profile.update(mounted_certificate(profile.get("server_name")))
+    elif not profile.get("certificate_file") or not profile.get("key_file"):
+        raise ProfileError("provide both certificate paths or leave both empty for auto selection")
     return profile
 
 
