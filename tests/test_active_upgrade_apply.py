@@ -56,6 +56,33 @@ class UpgradeApplyTests(unittest.TestCase):
                 self.assertEqual((units/names[0]).read_bytes(),b"old")
                 self.assertFalse((units/names[1]).exists())
 
+    def test_preserved_legacy_hold_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/"hold"
+            path.write_bytes(b"legacy")
+            snapshot=list(upgrade.hold_snapshot(path))
+            record={"legacy_hold":snapshot}
+            with patch.object(upgrade.life,"TRANSPORT_HOLD",path), \
+                 patch.object(upgrade,"legacy_hold",return_value=snapshot):
+                upgrade.release_hold(record)
+            self.assertEqual(path.read_bytes(),b"legacy")
+
+    def test_legacy_hold_change_blocks_completion(self):
+        with patch.object(upgrade,"legacy_hold",return_value=["changed"]):
+            with self.assertRaisesRegex(RuntimeError,"legacy hold changed"):
+                upgrade.check_upgrade_hold({"legacy_hold":["original"]})
+
+    def test_installer_only_fixes_reuse_staged_image(self):
+        old="a"*40
+        new="b"*40
+        with patch.object(upgrade,"head",return_value=new), \
+             patch.object(upgrade,"run",side_effect=[b"",b"deploy/apply_active_upgrade.py\n"]):
+            upgrade.check_installer_revision(old)
+        with patch.object(upgrade,"head",return_value=new), \
+             patch.object(upgrade,"run",side_effect=[b"",b"docker/host_adapter.py\n"]):
+            with self.assertRaisesRegex(RuntimeError,"runtime source differs"):
+                upgrade.check_installer_revision(old)
+
     def test_recovery_never_clears_foreign_hold(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/"hold"
