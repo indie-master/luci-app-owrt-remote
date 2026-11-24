@@ -90,10 +90,11 @@ class FleetTransportParityTests(unittest.TestCase):
                     self.assertNotEqual(self.jq(transport,case).returncode,0)
 
 class FleetReleaseContracts(unittest.TestCase):
-    def test_agent_retains_both_tcp_and_wss_renderers(self):
+    def test_agent_retains_legacy_tcp_wss_and_opt_in_transport_renderers(self):
         s=CLIENT.read_text()
-        self.assertIn('case "$vps_transport" in tcp|ws)',s)
-        self.assertIn('if [ "$vps_transport" = ws ]; then',s)
+        self.assertIn('case "$vps_transport" in tcp|ws|reality-tcp|xhttp|grpc)',s)
+        self.assertIn('stream_fields=\'"network": "tcp", "security": "none"\'',s)
+        self.assertIn('transport_preflight() (',s)
         self.assertIn('tlsSettings',s)
         self.assertIn('wsSettings',s)
         self.assertIn('allowInsecure',s)
