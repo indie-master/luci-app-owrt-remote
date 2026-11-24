@@ -516,7 +516,7 @@ log_new_fact_locked() {
 	return 0
 }
 log_event_health_locked() {
-	local epoch uptime accepted_epoch accepted_up accepted suppressed failed extra
+	local epoch uptime accepted_epoch accepted_up accepted suppressed failed extra temp
 	accepted_epoch=0; accepted_up=0; accepted=0; suppressed=0; failed=0
 	if [ -s "$RUN_DIR/event-health" ]; then
 		read -r epoch uptime accepted_epoch accepted_up accepted suppressed failed extra <"$RUN_DIR/event-health"
@@ -528,8 +528,15 @@ log_event_health_locked() {
 		suppressed) [ "$suppressed" -ge 2147483647 ] || suppressed=$((suppressed + 1)) ;;
 		failed) [ "$failed" -ge 2147483647 ] || failed=$((failed + 1)) ;;
 	esac
-	printf '%s %s %s %s %s %s %s\n' "$epoch" "$uptime" "$accepted_epoch" "$accepted_up" "$accepted" "$suppressed" "$failed" >"$RUN_DIR/event-health.new" &&
-		mv -f "$RUN_DIR/event-health.new" "$RUN_DIR/event-health"
+	# Separate concurrent candidates even if a stale-lock recovery races a
+	# writer. BusyBox mktemp uses randomized names and honors umask 077.
+	temp="$(mktemp "$RUN_DIR/.event-health.XXXXXX")" || return 1
+	if ! printf '%s %s %s %s %s %s %s\n' "$epoch" "$uptime" "$accepted_epoch" "$accepted_up" "$accepted" "$suppressed" "$failed" >"$temp"; then
+		rm -f "$temp"; return 1
+	fi
+	if ! mv -f "$temp" "$RUN_DIR/event-health"; then
+		rm -f "$temp"; return 1
+	fi
 }
 log_append() {
 	local line size bytes dropped outcome
