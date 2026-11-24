@@ -45,6 +45,48 @@ verify_installed() {
         [ -f "/$rel" ] && [ ! -L "/$rel" ] && [ "$(hash "/$rel")" = "$digest" ] || fail "installed file changed: $rel"
     done < "$manifest"
 }
+# The next bundle may differ from the confirmed bundle ONLY in logs.sh.
+# Retain the original stage and snapshot; do not change the live lock
+# protocol until the early boot hook, before any agent writer starts.
+verify_next() {
+    next_sha="$1"
+    case "$next_sha" in ''|*[!0-9a-f]*) fail 'invalid next digest';; esac
+    [ "${#next_sha}" = 64 ] || fail 'invalid next digest length'
+    next="$S/next-client.tar"
+    [ -f "$next" ] && [ ! -L "$next" ] &&
+    [ "$(hash "$next")" = "$next_sha" ] || fail 'next bundle digest mismatch'
+    old_manifest="$S/stage/unpacked/manifest.txt"
+    [ "$(tar -xOf "$S/stage/candidate.tar" manifest.txt | sha256sum | awk '{print $1}')" = "$(hash "$old_manifest")" ] &&
+    [ "$(hash "$S/stage/candidate.tar")" = "$(cat "$S/stage/archive.sha256")" ] || fail 'old manifest changed'
+    next_manifest="$(tar -xOf "$next" manifest.txt)" || fail 'next manifest missing'
+    [ "$(printf '%s\n' "$next_manifest" | wc -l)" = 10 ] || fail 'next manifest count'
+    [ "$(printf '%s\n' "$next_manifest" | awk '$3!="usr/lib/owrt-remote/logs.sh"')" = "$(awk '$3!="usr/lib/owrt-remote/logs.sh"' "$old_manifest")" ] || fail 'next bundle changes more than journal helper'
+    next_log_hash="$(printf '%s\n' "$next_manifest" | awk '$2=="0644" && $3=="usr/lib/owrt-remote/logs.sh" {print $1}')"
+    case "$next_log_hash" in ''|*[!0-9a-f]*) fail 'bad journal digest';; esac
+    [ "${#next_log_hash}" = 64 ] &&
+    [ "$(tar -xOf "$next" payload/usr/lib/owrt-remote/logs.sh | sha256sum | awk '{print $1}')" = "$next_log_hash" ] || fail 'journal payload mismatch'
+}
+switch_journal() (
+    verify_installed
+    verify_next "$(cat "$S/boot-trial.next.sha")"
+    dst=/usr/lib/owrt-remote/logs.sh
+    tmp="$(mktemp "$(dirname "$dst")/.ro-journal.XXXXXX")" || exit 1
+    trap 'rm -f "$tmp"' EXIT
+    tar -xOf "$next" payload/usr/lib/owrt-remote/logs.sh >"$tmp" &&
+    [ "$(hash "$tmp")" = "$next_log_hash" ] &&
+    sh -n "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$dst" || exit 1
+    sync
+)
+verify_trial_installed() {
+    if [ ! -f "$S/boot-trial.next.sha" ]; then verify_installed; return; fi
+    verify_next "$(cat "$S/boot-trial.next.sha")"
+    while read -r digest mode rel; do
+        [ -f "/$rel" ] && [ ! -L "/$rel" ] &&
+        [ "$(hash "/$rel")" = "$digest" ] || fail "trial installed digest: $rel"
+    done <<EOF
+$next_manifest
+EOF
+}
 verify_old_files() {
     [ "$(wc -l < "$S/backup/present.txt")" = 10 ] &&
     [ "$(wc -l < "$S/backup/original.sha256")" = 10 ] || fail 'invalid original inventory'
@@ -126,7 +168,7 @@ runtime_ok() {
 request_reboot() { /sbin/reboot; }
 case "${1:-}" in
 arm)
-    [ "$#" = 3 ] || fail 'arm ROUTER_ID BUNDLE_SHA256'
+    [ "$#" = 3 ] || [ "$#" = 4 ] || fail 'arm ROUTER_ID BUNDLE_SHA256 [NEXT_SHA256]'
     [ -z "$(phase)" ] && [ ! -e "$INIT" ] && [ ! -L "$INIT" ] && [ ! -e "$BOOT" ] && [ ! -L "$BOOT" ] || fail 'trial already exists'
     [ -f "$TX" ] && [ ! -L "$TX" ] && sh -n "$TX" || fail 'disk recovery runner unavailable'
     [ "$(cat "$S/client.result")" = CONFIRMED_ON_DISK ] && [ ! -e "$S/client.pending" ] && [ ! -e "$S/client.armed" ] || fail 'client transaction not confirmed'
@@ -134,6 +176,7 @@ arm)
     [ "$(cat "$S/client.boot")" = "$(boot_id)" ] || fail 'client already rebooted'
     [ -z "$(uci -q changes owrtremote)" ] || fail 'uncommitted UCI changes'
     critical_backup; verify_installed; verify_old_files
+    if [ "$#" = 4 ]; then verify_next "$4"; fi
     [ "$(hash "$UCI")" = "$(cat "$S/stage/uci.sha256")" ] && [ "$(hash "$XRAY")" = "$(cat "$S/stage/xray.sha256")" ] || fail 'critical configuration changed since staging'
     [ -x /etc/init.d/owrt-remote ] && /etc/init.d/owrt-remote enabled || fail 'agent not enabled at boot'
     # Require a persistent executable or a verified compressed boot copy
@@ -182,6 +225,7 @@ start_service() {
 EOF
     chmod 700 "$tmp"; mv "$tmp" "$INIT"; "$INIT" enable
     [ -L "$BOOT" ] || fail 'boot hook not enabled'
+    if [ "$#" = 4 ]; then mark boot-trial.next.sha "$4"; fi
     mark boot-trial.before "$(boot_id)"
     mark boot-trial.phase ARMED
     say 'ARMED: reboot deliberately to start 300-second trial'
@@ -190,11 +234,15 @@ boot-enter)
     case "$(phase)" in
         ARMED)
             [ "$(cat "$S/boot-trial.before")" != "$(boot_id)" ] || fail 'not a new boot'
+            if [ -f "$S/boot-trial.next.sha" ]; then
+                mark boot-trial.phase SWITCHING
+                if ! switch_journal; then restore_trial; return_code=1; exit "$return_code"; fi
+            fi
             mark boot-trial.boot "$(boot_id)"
             mark boot-trial.deadline "$(($(now) + 300))"
             mark boot-trial.phase TRIAL
             ;;
-        TRIAL|RESTORING) restore_trial;;
+        SWITCHING|TRIAL|RESTORING) restore_trial;;
     esac
     ;;
 ready)
@@ -209,10 +257,9 @@ worker)
     printf '%s\n' "$$" >"$S/boot-trial.$role.pid"
     while :; do
         if [ "$(phase)" = TRIAL ] && ! valid_window || [ "$(phase)" = RESTORING ]; then
-            restore_trial
-            # The candidate may already be running: reboot once into original
-            # code after durable rollback. A second boot does not retry trial.
-            sync
+            # Restore only on the next early boot, before any journal writer
+            # starts. Never switch lock protocols underneath live processes.
+            mark boot-trial.phase RESTORING
             request_reboot
         fi
         flock -u 9
@@ -222,10 +269,15 @@ worker)
     ;;
 confirm)
     valid_window && workers_ready || fail 'trial expired or monitors unavailable'
-    verify_installed
+    verify_trial_installed
     [ "$(hash "$UCI")" = "$(cat "$S/stage/uci.sha256")" ] || fail 'UCI changed; manual review before acceptance'
     runtime_ok || fail 'runtime or reverse parity failed'
     valid_window || fail 'deadline elapsed during verification'
+    if [ -f "$S/boot-trial.next.sha" ]; then
+        mark boot-trial.accepted.sha "$(cat "$S/boot-trial.next.sha")"
+    else
+        mark boot-trial.accepted.sha "$(cat "$S/stage/archive.sha256")"
+    fi
     mark boot-trial.phase ACCEPTED
     say 'ACCEPTED: new boot and agent processes verified; caller must verify reverse access independently'
     ;;
@@ -233,7 +285,7 @@ cancel)
     [ "$(phase)" = ARMED ] && [ "$(cat "$S/boot-trial.before")" = "$(boot_id)" ] || fail 'only an unstarted trial may be cancelled'
     "$INIT" disable
     [ ! -e "$BOOT" ] && [ ! -L "$BOOT" ] || fail 'boot hook still enabled'
-    rm -f "$INIT" "$S/boot-trial.phase" "$S/boot-trial.before"
+    rm -f "$INIT" "$S/boot-trial.phase" "$S/boot-trial.before" "$S/boot-trial.next.sha"
     sync
     say 'unstarted trial cancelled; confirmed disk update retained'
     ;;
