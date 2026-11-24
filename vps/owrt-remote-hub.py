@@ -4524,6 +4524,10 @@ def make_router_xray_config(row):
     bridge_tag = row["reverse_tag"]
     ssh_bridge_tag = row["ssh_reverse_tag"] or f"{bridge_tag}-ssh"
     transport = row_str_value(row, "vps_transport", "tcp")
+    if transport not in ("tcp", "ws"):
+        # Prevent an unsupported profile being silently exported as
+        # insecure legacy TCP before transactional profile support ships.
+        raise ValueError("Client Xray export requires an applied supported transport")
     sni = (vps_host_name(os.environ.get("OWRT_REMOTE_PUBLIC_URL", ""))
            or vps_host_name(row_str_value(row, "public_url", ""))
            or row_str_value(row, "vps_host", ""))
