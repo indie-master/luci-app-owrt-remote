@@ -1,0 +1,12 @@
+[Unit]
+Description=Router Orchestrator Xray core health and rollback watchdog
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=90s
+AccuracySec=10s
+Unit=router-orchestrator-xray-watchdog.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target
