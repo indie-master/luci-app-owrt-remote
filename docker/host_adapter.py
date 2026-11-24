@@ -81,6 +81,34 @@ def _client_map(inbound):
     return indexed
 
 
+REDACTED_KEY = "[REDACTED]"
+
+
+def redact_server_keys(config):
+    import copy
+    result = copy.deepcopy(config)
+    for inbound in config_inbounds(result).values():
+        reality = inbound.get("streamSettings", {}).get("realitySettings", {})
+        if "privateKey" in reality:
+            reality["privateKey"] = REDACTED_KEY
+    return result
+
+
+def hydrate_server_keys(previous, candidate):
+    """Restore only the unchanged baseline key for a matching inbound tag."""
+    import copy
+    result = copy.deepcopy(candidate)
+    old = config_inbounds(previous)
+    for tag, inbound in config_inbounds(result).items():
+        reality = inbound.get("streamSettings", {}).get("realitySettings", {})
+        before = old.get(tag, {}).get("streamSettings", {}).get("realitySettings", {})
+        if "privateKey" in reality:
+            require("privateKey" in before and reality["privateKey"] == REDACTED_KEY,
+                    "server private key mutation is not permitted")
+            reality["privateKey"] = before["privateKey"]
+    return result
+
+
 def validate_transition(previous, candidate):
     """Fail closed: the only approved mutation enrolls ONE new WSS router.
 
@@ -369,7 +397,7 @@ class Adapter:
     def current(self):
         data = CONFIG.read_bytes()
         require(len(data) <= MAX_REQUEST - 4096, "Xray config exceeds response limit")
-        return {"ok": True, "config": json.loads(data), "sha256": sha(data)}
+        return {"ok": True, "config": redact_server_keys(json.loads(data)), "sha256": sha(data)}
 
     def xray_preview(self, request):
         """Validate one WSS addition without changing host Xray or services.
@@ -383,7 +411,7 @@ class Adapter:
         expected = request.get("expected_sha256")
         require(isinstance(expected, str) and expected == sha(original),
                 "Xray config changed since candidate was generated")
-        candidate = request.get("config")
+        candidate = hydrate_server_keys(json.loads(original), request.get("config"))
         validate_transition(json.loads(original), candidate)
         require(json.loads(original) != candidate,
                 "preview requires exactly one new WSS router")
@@ -861,7 +889,7 @@ class Adapter:
         original = CONFIG.read_bytes()
         require(request.get("expected_sha256") == sha(original),
                 "Xray config changed concurrently")
-        candidate = request.get("config")
+        candidate = hydrate_server_keys(json.loads(original), request.get("config"))
         validate_transition(json.loads(original), candidate)
         data = (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode()
         if json.loads(original) == candidate:
