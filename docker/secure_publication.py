@@ -23,16 +23,18 @@ def digest(value):
 
 
 def validate_inventory(inventory):
-    if not isinstance(inventory, dict) or set(inventory) != {
+    if not isinstance(inventory, dict) or set(inventory) - {"proxy_protocol"} != {
         "mode", "public_port", "allowed_names", "existing_routes",
         "occupied_ports", "managed_routes", "nginx_config_sha256"
     }:
         raise ProfileError("invalid reviewed ingress inventory")
     if inventory["mode"] not in ("external-stream", "standalone-stream"):
         raise ProfileError("unsupported ingress mode")
+    if type(inventory.get("proxy_protocol", False)) is not bool:
+        raise ProfileError("invalid PROXY protocol inventory")
     public = _port(inventory["public_port"])
     names = inventory["allowed_names"]
-    if not isinstance(names, list) or not names or len(names) > 128:
+    if not isinstance(names, list) or len(names) > 128:
         raise ProfileError("no approved ingress names")
     allowed = {domain(n) for n in names}
     if len(allowed) != len(names):
@@ -100,10 +102,13 @@ def build_publication(live, artifact, inventory, *, profile_id, revision):
     if len(tag) > 128 or any(i.get("tag") == tag for i in inbounds):
         raise ProfileError("candidate inbound tag already exists or is too long")
     candidate = copy.deepcopy(live)
+    stream = copy.deepcopy(plan["streamSettings"])
+    if inventory.get("proxy_protocol", False):
+        stream["sockopt"] = {"acceptProxyProtocol": True}
     candidate["inbounds"].append({
         "tag": tag, "listen": "127.0.0.1", "port": plan["backend_port"],
         "protocol": "vless", "settings": {"decryption": "none", "clients": []},
-        "streamSettings": plan["streamSettings"],
+        "streamSettings": stream,
     })
     # Render the complete managed fragment; preserve previously managed routes.
     combined = sorted(inventory["managed_routes"] + plan["routes"], key=lambda r: r["sni"])
