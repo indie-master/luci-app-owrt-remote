@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import sys
+import time
 import unittest
 from urllib.parse import urlencode
 
@@ -193,18 +195,60 @@ class GlobalLogTests(unittest.TestCase):
         self.assertIn('Content-Type: text/plain', self.cgi_call('logs_live'))
 
     def test_parallel_events_do_not_corrupt_or_drop_lines(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(lambda i: self.helper_call('append', f'event-{i}\n'), range(12)))
-        self.assertEqual(set(self.helper_call('read').splitlines()), {f'[OK] event-{i}' for i in range(12)})
+        # Exercise concurrent first publication and subsequent appends without
+        # clearing the journal or retrying a failed assertion.
+        lock = self.run_dir / 'journal.flock'
+        for batch in range(4):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda i: self.helper_call('append', f'event-{batch}-{i}\n'), range(24)))
+            lines = self.helper_call('read').splitlines()
+            expected = {f'[OK] event-{b}-{i}' for b in range(batch + 1) for i in range(24)}
+            self.assertEqual(set(lines), expected)
+            self.assertEqual(len(lines), len(expected), 'duplicates are also a failure')
+            self.assertTrue(lock.is_file())
+            if batch == 0:
+                inode = lock.stat().st_ino
+            else:
+                self.assertEqual(lock.stat().st_ino, inode, 'kernel lock inode must never be replaced')
         self.assertFalse((self.run_dir / 'lock').exists())
+        self.assertEqual((self.run_dir / 'storage').read_text().strip(), self.log_dir.as_posix())
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX kernel lock crash test')
     def test_stale_lock_recovers(self):
         self.helper_call('clear')
-        lock = self.run_dir / 'lock'
-        lock.mkdir()
-        (lock / 'pid').write_text('99999999')
-        self.helper_call('append', 'recovered\n')
-        self.assertEqual(self.helper_call('read'), '[OK] recovered\n')
+        lock = self.run_dir / 'journal.flock'
+        inode = lock.stat().st_ino
+        # Hold the actual kernel lock in a single process; killing it cannot
+        # leave stale PID state or an inherited sleeping child.
+        holder = subprocess.Popen([sys.executable, '-u', '-c',
+            'import fcntl,sys,time; f=open(sys.argv[1],"a"); '
+            'fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); time.sleep(60)',
+            str(lock)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        writer = None
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), 'ready')
+            writer = subprocess.Popen([SH, self.helper.as_posix(), 'append'],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, env=self.env, text=True)
+            writer.stdin.write('recovered\n')
+            writer.stdin.close()
+            writer.stdin = None
+            time.sleep(.3)
+            self.assertIsNone(writer.poll(), 'writer must wait for the live lock')
+            holder.kill()
+            holder.wait(timeout=5)
+            _, err = writer.communicate(timeout=10)
+            self.assertEqual(writer.returncode, 0, err)
+            self.assertEqual(self.helper_call('read'), '[OK] recovered\n')
+            self.assertEqual(lock.stat().st_ino, inode)
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            holder.communicate(timeout=5)
+            if writer is not None:
+                if writer.poll() is None:
+                    writer.kill()
+                writer.communicate(timeout=5)
 
     def test_missing_collector_is_reported(self):
         self.helper.unlink()
@@ -212,9 +256,12 @@ class GlobalLogTests(unittest.TestCase):
 
     def test_empty_lock_left_by_killed_writer_recovers(self):
         self.helper_call('clear')
-        (self.run_dir / 'lock').mkdir()
+        lock = self.run_dir / 'journal.flock'
+        self.assertEqual(lock.stat().st_size, 0)
+        inode = lock.stat().st_ino
         self.helper_call('append', 'after empty lock\n')
         self.assertEqual(self.helper_call('read'), '[OK] after empty lock\n')
+        self.assertEqual(lock.stat().st_ino, inode)
 
 
 
