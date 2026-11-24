@@ -5,12 +5,15 @@ No service restart, live source checkout, env change or unit installation.
 Run from a clean, detached candidate worktree. Private artifacts are retained.
 """
 from __future__ import annotations
+import argparse
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import tempfile
 
@@ -90,7 +93,23 @@ def private_write(path,data):
         os.fsync(stream.fileno())
 
 
-def main():
+def hold_snapshot(path):
+    """Observe a legacy marker without granting it transaction authority."""
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd,"rb") as stream:
+        info=os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_size<=4096,
+                "maintenance hold is not a small regular file")
+        data=stream.read(4097)
+        require(len(data)<=4096,"maintenance hold exceeds limit")
+        return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,
+                stat.S_IMODE(info.st_mode),info.st_nlink,digest(data))
+
+
+def prepare(allow_preserved_hold=False):
     os.umask(0o077)
     require(os.geteuid()==0,"root required")
     require(REPO!=SRC.resolve() and REPO.is_relative_to(ROOT/"server-candidates"),
@@ -100,7 +119,18 @@ def main():
     for path in (REPO,SRC):
         require(not run("git","-C",str(path),"status","--porcelain","--untracked-files=all").strip(),
                 "tracked source has edits")
-    require(not (ROOT/"data/.xray-maintenance-hold").exists(),"maintenance already active")
+    hold=ROOT/"data/.xray-maintenance-hold"
+    held=hold_snapshot(hold)
+    require(held is None or allow_preserved_hold,"maintenance already active")
+    if held is not None:
+        for journal,terminal in (
+            (ROOT/"data/xray-lifecycle.json",{"committed","rolled-back"}),
+            (ROOT/"data/transport-stage/stage.json",{"ROLLED_BACK"}),
+            (STORE/"publication/pending.json",{"ACCEPTED","ROLLED_BACK"}),
+        ):
+            require(not journal.exists() or json.loads(journal.read_text()).get("phase") in terminal,
+                    "unfinished maintenance journal: "+journal.name)
+        print("EXISTING HOLD: PRESERVED; preparation only",flush=True)
     before=containers()
     old_commit=head(SRC)
     new_commit=head(REPO)
@@ -145,7 +175,8 @@ def main():
     require(containers()==before and head(SRC)==old_commit and ENV.read_bytes()==old_env
             and Path("/etc/xray/owrt-remote.json").read_bytes()==(stage/"previous-xray.json").read_bytes(),
             "production changed during staging; candidate not accepted")
-    manifest={"phase":"STAGED_ONLY","old_commit":old_commit,"new_commit":new_commit,
+    require(hold_snapshot(hold)==held,"maintenance hold changed during preparation")
+    manifest={"phase":"STAGED_ONLY","preserved_hold":held is not None,"old_commit":old_commit,"new_commit":new_commit,
               "hub_image":tag,"hub_image_id":image,"containers":before,
               "old_env_sha256":digest(old_env),"xray_sha256":digest((stage/"previous-xray.json").read_bytes()),
               "requires_xray_recreate":not any(m["target"]=="/etc/router-orchestrator/tls" and
@@ -155,6 +186,24 @@ def main():
     print("XRAY RECREATE FOR TLS MOUNT:",manifest["requires_xray_recreate"])
     print("ACTIVE UPGRADE CANDIDATE: STAGED")
     print("LIVE SERVICES AND SOURCE: UNCHANGED")
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preserve-hold",action="store_true",
+                        help="stage only while leaving an existing maintenance marker untouched")
+    args=parser.parse_args()
+    os.umask(0o077)
+    require(os.geteuid()==0,"root required")
+    fd=os.open(ROOT/"data/xray-lifecycle.lock",os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try:
+        info=os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and info.st_nlink==1
+                and not info.st_mode&0o022,"unsafe lifecycle lock")
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        prepare(args.preserve_hold)
+    finally:
+        os.close(fd)
 
 
 if __name__=="__main__":
