@@ -91,6 +91,13 @@ def redact_server_keys(config):
         reality = inbound.get("streamSettings", {}).get("realitySettings", {})
         if "privateKey" in reality:
             reality["privateKey"] = REDACTED_KEY
+        # Live publication uses temporary random test identities. Never expose
+        # these to the legacy HUB config API even during a trial restart.
+        if inbound.get("tag", "").startswith("ro-secure-"):
+            settings = inbound.get("settings", {})
+            if isinstance(settings.get("clients"), list):
+                settings["clients"] = [entry for entry in settings["clients"]
+                    if not str(entry.get("email", "")).startswith("pilot-probe-trial")]
     return result
 
 
