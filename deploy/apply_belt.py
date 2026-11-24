@@ -22,6 +22,8 @@ COMPOSE = ROOT / "docker-compose.yml"
 UNIT = Path("/etc/systemd/system/router-orchestrator-host-adapter.service")
 OVERRIDE = Path("/etc/systemd/system/router-orchestrator-host-adapter.service.d/50-docker-xray.conf")
 CORE_UNIT = Path("/etc/systemd/system/router-orchestrator-core-job@.service")
+WATCHDOG_SERVICE = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.service")
+WATCHDOG_TIMER = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.timer")
 BACKUP = STAGE / "cutover-rollback"
 SYSTEMD = "router-orchestrator-host-adapter.service"
 
@@ -94,6 +96,9 @@ def main():
             "new host-adapter unit missing")
     require((SRC / "deploy/systemd/router-orchestrator-core-job@.service").is_file(),
             "new core worker unit missing")
+    for watchdog in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+        require((SRC / "deploy/systemd" / watchdog.name).is_file(),
+                "missing Xray watchdog unit: " + watchdog.name)
 
     git_clean = run("git", "-C", str(SRC), "diff", "--quiet")
     require(git_clean.returncode == 0, "worktree has uncommitted edits")
@@ -111,6 +116,12 @@ def main():
     had_core_unit = CORE_UNIT.is_file()
     if had_core_unit:
         shutil.copy2(CORE_UNIT, BACKUP / "core-job.service")
+    watchdog_original = {}
+    for path in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+        watchdog_original[path.name] = path.is_file()
+        if path.is_file():
+            require(not path.is_symlink(), "unexpected watchdog symlink")
+            shutil.copy2(path, BACKUP / path.name)
     (BACKUP / "images.json").write_text(json.dumps({
         "hub": image_before, "xray_id": xray_id
     }, indent=2) + "\n")
@@ -125,6 +136,8 @@ def main():
         if had_override:
             OVERRIDE.unlink()
         shutil.copy2(SRC / "deploy/systemd/router-orchestrator-core-job@.service", CORE_UNIT)
+        for path in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+            shutil.copy2(SRC / "deploy/systemd" / path.name, path)
         jobs = ROOT / "data/core-jobs"
         jobs.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(jobs, 0, 0)
@@ -174,6 +187,10 @@ assert reply.get("ok") is True and reply.get("active") is True
                      "python", "-c", probe, timeout=20)
         require(result.returncode == 0, "new HUB cannot reach Xray host adapter")
 
+        started = run("systemctl", "enable", "--now",
+                      "router-orchestrator-xray-watchdog.timer")
+        require(started.returncode == 0,
+                "Xray watchdog timer could not be enabled")
         (BACKUP / "cutover-state").write_text("DOCKER_THREE_SERVICE_ACTIVE\n")
         print("UNIFIED COMPOSE: PASS")
         print("HUB, XRAY, NGINX: PRESENT")
@@ -197,7 +214,12 @@ assert reply.get("ok") is True and reply.get("active") is True
             shutil.copy2(BACKUP / "50-docker-xray.conf", OVERRIDE)
         else:
             OVERRIDE.unlink(missing_ok=True)
+        run("systemctl", "disable", "--now",
+            "router-orchestrator-xray-watchdog.timer", timeout=30)
         restore_file(CORE_UNIT, BACKUP / "core-job.service", had_core_unit)
+        for path in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+            restore_file(path, BACKUP / path.name,
+                         watchdog_original[path.name])
         run("systemctl", "daemon-reload")
         run("systemctl", "restart", SYSTEMD)
         old = run("docker", "compose", "up", "-d", "--no-build",
