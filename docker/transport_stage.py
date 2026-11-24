@@ -107,7 +107,7 @@ def live_router(router_id):
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "select id,vless_uuid,ssh_vless_uuid,admin_host,admin_port,"
-            "ssh_host,ssh_port from routers where id=? and deleted_at=0",
+            "ssh_host,ssh_port,vps_host from routers where id=? and deleted_at=0",
             (router_id,)
         ).fetchone()
     require(row is not None, "router not found")
@@ -183,7 +183,25 @@ def stage(router_id, profile_path, entry_port, ssh_port):
     JOURNAL_DIR.mkdir(mode=0o700, parents=True, exist_ok=False)
     os.chmod(JOURNAL_DIR, 0o700)
     write_atomic(ORIGINAL, previous)
+    # Store only the client-facing transport metadata. Never persist
+    # REALITY private keys or TLS private-key material in the stage journal.
+    from transport_profiles import _host
+    client_host = _host(str(profile.get("remote_host") or router["vps_host"]))
+    client = {
+        "transport": profile["transport"],
+        "host": client_host,
+        "port": int(profile["port"]),
+        "sni": str(profile.get("server_name") or ""),
+        "ws_path": str(profile.get("path") or "/owrt-ws/"),
+        "xhttp_path": str(profile.get("path") or "/owrt-xhttp/"),
+        "grpc_service": str(profile.get("service_name") or "owrt_remote"),
+        "reality_public_key": str(profile.get("public_key") or ""),
+        "reality_short_id": str((profile.get("short_ids") or [""])[0]),
+        "reverse_tag": pilot["reverse_tag"],
+        "ssh_reverse_tag": pilot["ssh_reverse_tag"],
+    }
     record = {
+        "client": client,
         "phase": "STAGING",
         "router_id": router_id, "pilot": pilot,
         "image": image, "baseline_sha256": sha(previous),
