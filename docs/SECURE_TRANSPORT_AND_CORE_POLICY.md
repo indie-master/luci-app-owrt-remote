@@ -159,3 +159,37 @@ publication transaction exists. A draft cannot be assigned; validation
 does not publish it. Existing router runtime remains untouched.
 The new StateDirectory and host adapter require an approved service upgrade;
 do not change the pinned production worktree to test this UI.
+
+
+## Publication planning and recovery engine
+
+`tools/inspect_secure_ingress.py` reports the current external nginx disk
+configuration digest, SNI map hints, include locations, occupied TCP ports
+and Xray listener metadata. It prints neither certificate keys nor raw
+nginx/Xray configurations. This is a read-only onboarding aid (nginx -T
+tests the config; no reload). It cannot infer ownership from arbitrary
+includes, wildcard or regex rules. An operator-reviewed ownership inventory
+is required at /var/lib/router-orchestrator-secure-profiles/ingress.json
+(mode 0600, root-owned). Its exact nginx -T stdout digest must match before
+and after planning. A matching digest describes files on disk, not proof
+of the running nginx configuration.
+
+The owner-only catalog action "План публикации" builds a candidate adding
+one empty protected VLESS listener on loopback, preserves all baseline
+Xray configuration and existing managed routes, rejects unapproved SNI,
+port conflicts and obvious recursive REALITY targets, and validates the
+exact candidate with the running Xray image. It returns metadata only.
+There is no publish/apply endpoint yet.
+
+The two-file publication engine saves both original files and modes,
+records an fsynced recovery journal before replacing either file, and
+requires explicit activation and runtime acceptance callbacks. If
+acceptance fails it restores both originals; a crash leaves a recovery
+journal. It refuses to overwrite unrelated concurrent edits. Its tests
+use temporary files and stub runtime callbacks. Production integration
+requires the shared Xray lifecycle lock, root-owned managed nginx include,
+safe activation and independently supervised recovery, live authenticated
+canary and baseline reachability checks. DNS aliases and REALITY target
+loop detection still require runtime checks. Do not enable publication
+until those gates are met. No production files or devices are mutated
+by the new planning endpoint.
