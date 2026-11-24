@@ -149,6 +149,14 @@ def rollback_impl(record):
 
 
 def stage(router_id, profile_path, entry_port, ssh_port):
+    path = Path(profile_path)
+    require(path.is_file() and not path.is_symlink(),
+            "profile JSON file absent or symlinked")
+    require(path.stat().st_uid == 0 and path.stat().st_mode & 0o077 == 0,
+            "transport profile must be root-owned mode 0600")
+    profile = json.loads(path.read_text())
+    from transport_profiles import require_secure_profile
+    require_secure_profile(profile)
     require(not HOLD.exists(), "another Xray maintenance hold is present")
     if STATE.exists():
         previous_stage = json.loads(STATE.read_text())
@@ -160,12 +168,6 @@ def stage(router_id, profile_path, entry_port, ssh_port):
         require(not archived.exists(), "shadow archive path exists")
         JOURNAL_DIR.rename(archived)
     require(lifecycle.active(), "production Docker Xray unhealthy")
-    path = Path(profile_path)
-    require(path.is_file() and not path.is_symlink(),
-            "profile JSON file absent or symlinked")
-    require(path.stat().st_uid == 0 and path.stat().st_mode & 0o077 == 0,
-            "transport profile must be root-owned mode 0600")
-    profile = json.loads(path.read_text())
     router = live_router(router_id)
     previous = CONFIG.read_bytes()
     live = json.loads(previous)
