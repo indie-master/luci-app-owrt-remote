@@ -37,6 +37,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_transport_canary.py' -v
           python -m unittest discover -s tests -p 'test_transport_stage_recovery.py' -v
           python -m unittest discover -s tests -p 'test_openwrt_transport_pilot.py' -v
+          python -m unittest discover -s tests -p 'test_ssh_command_quoting.py' -v
           python -m unittest discover -s tests -p 'test_xray_core_manager.py' -v
       - name: Global Logs persistence and delivery regression
         run: |
