@@ -852,6 +852,8 @@ pilot_start() (
 	[ "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" != "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" ] || die "duplicate pilot tags"
 	[ "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" != "$(uci_get reverse_tag reverse-in)" ] || die "pilot would reuse current admin reverse tag"
 	[ "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" != "$(uci_get ssh_reverse_tag reverse-in-ssh)" ] || die "pilot would reuse current SSH reverse tag"
+	[ -r /proc/meminfo ] || die "pilot memory metrics missing"
+	awk '/^MemAvailable:/ { if ($2 < 65536) exit 1; found=1 } END { if (!found) exit 1 }' /proc/meminfo || die "pilot requires 64 MiB available"
 	[ ! -L "$pilot_dir" ] || die "unsafe pilot directory"
 	[ ! -e "$pilot_dir/pending" ] || die "pilot already running"
 	mkdir -p "$pilot_dir" || return 1
