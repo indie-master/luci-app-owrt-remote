@@ -92,6 +92,20 @@ def main():
             (STAGE / "docker-compose.yml").is_file(),
             "candidate artifacts missing")
     require((STAGE / "backup/hub.db").is_file(), "database backup missing")
+    # A candidate built against an earlier commit is unsafe: refuse rather
+    # than deploying stale web code with a newer Host Adapter.
+    manifest_file = STAGE / "backup/live-images.json"
+    require(manifest_file.is_file(), "candidate build manifest missing")
+    manifest = json.loads(manifest_file.read_text())
+    head = run("git", "-C", str(SRC), "rev-parse", "--short=12", "HEAD")
+    require(head.returncode == 0 and
+            head.stdout.strip() == manifest.get("git_commit"),
+            "staged candidate is stale; refresh it after updating Git")
+    env_data = (STAGE / ".env").read_text()
+    expected_hub = "RO_HUB_IMAGE=router-orchestrator-hub:unified-" + head.stdout.strip()
+    require(expected_hub in env_data.splitlines(),
+            "staged HUB image does not match the reviewed Git commit")
+
     require((SRC / "deploy/systemd/router-orchestrator-host-adapter.service").is_file(),
             "new host-adapter unit missing")
     require((SRC / "deploy/systemd/router-orchestrator-core-job@.service").is_file(),
