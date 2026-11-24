@@ -5566,8 +5566,8 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
           </div>
           <div class="headerActions">
             <a class="badge" id="vpsTerminalLink" href="/vps-terminal/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Терминал VPS</a>
-            <a class="badge" href="/transport-configurator/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Транспорты</a>
-            <a class="badge" href="/xray-core/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Xray Core</a>
+            <a class="badge" id="transportCatalogLink" href="/secure-profiles/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Транспорты</a>
+            <a class="badge" id="xrayCoreLink" href="/xray-core/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Xray Core</a>
             <button class="badge" id="xrayReload" type="button" {'hidden' if not is_owner else ''}>Обновить Xray CFG</button>
             <button class="badge" id="xrayRestart" type="button" {'hidden' if not is_owner else ''}>Рестарт Xray VPS</button>
             <button class="badge authToggle" id="authToggle" type="button">{safe_username}</button>
@@ -5901,7 +5901,7 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div id="hubMenuPanelHost"></div>
     <div class="mobileOwnerTools" id="mobileOwnerTools" hidden>
       <a class="badge" href="/vps-terminal/" id="mobileVpsTerminal" target="_blank" rel="noopener noreferrer">Терминал VPS</a>
-      <a class="badge" href="/transport-configurator/" target="_blank" rel="noopener noreferrer">Транспорты</a>
+      <a class="badge" href="/secure-profiles/" target="_blank" rel="noopener noreferrer">Транспорты</a>
       <a class="badge" href="/xray-core/" target="_blank" rel="noopener noreferrer">Xray Core</a>
       <button class="badge" id="mobileXrayReload" type="button">Обновить Xray CFG</button>
       <button class="badge" id="mobileXrayRestart" type="button">Рестарт Xray VPS</button>
@@ -10230,7 +10230,7 @@ function renderDelegatedOverview(meta) {{
 function syncOwnerChrome() {{
   const owner = authIsOwner();
   const canAddRouter = authCanAddRouter();
-  ['vpsTerminalLink', 'xrayReload', 'xrayRestart'].forEach((id) => {{
+  ['vpsTerminalLink', 'transportCatalogLink', 'xrayCoreLink', 'xrayReload', 'xrayRestart'].forEach((id) => {{
     const node = document.getElementById(id);
     if (node) node.hidden = !owner || mobileLayoutMq.matches;
   }});
@@ -19251,8 +19251,10 @@ exit 127
             try:
                 from xray_releases import stable_release_tags
                 self.send_json(200, {"ok": True, "versions": stable_release_tags()})
+            except RuntimeError as exc:
+                self.send_json(503, {"ok": False, "error": str(exc)[:160]})
             except Exception:
-                self.send_json(503, {"ok": False, "error": "official stable release lookup unavailable"})
+                self.send_json(503, {"ok": False, "error": "GitHub release lookup unavailable"})
             return
         if path.startswith("/api/xray/core/job/"):
             if not self.require_owner(json_mode=True):
