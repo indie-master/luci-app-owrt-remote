@@ -149,6 +149,7 @@ LUCI_ABSOLUTE_ROOTS = ("/ubus", "/cgi-bin/luci", "/luci-static")
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 VPS_TERMINAL_ID = "__vps__"
 XRAY_CORE_ACTION_CSRF = secrets.token_urlsafe(32)
+TRANSPORT_STAGE_ACTION_CSRF = secrets.token_urlsafe(32)
 SSH_HTTP_SESSIONS = {}
 SSH_HTTP_LOCK = threading.Lock()
 ROUTER_PROXY_LOCK = threading.Lock()
@@ -19175,7 +19176,11 @@ exit 127
             if not self.require_owner():
                 return
             source = Path(__file__).resolve().parent / "static" / "transport-configurator.html"
-            self.send_bytes(200, source.read_bytes(), "text/html; charset=utf-8",
+            template = source.read_text(encoding="utf-8")
+            stage_enabled = os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") == "1"
+            page = template.replace("__TRANSPORT_CSRF__", html.escape(TRANSPORT_STAGE_ACTION_CSRF))
+            page = page.replace("__TRANSPORT_STAGE_ENABLED__", "1" if stage_enabled else "0")
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
                             [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
             return
         if path in ("/xray-core", "/xray-core/"):
@@ -19222,6 +19227,17 @@ exit 127
                         "transport": row_str_value(row, "vps_transport", "tcp")}
                        for row in rows if not router_deleted(row)]
             self.send_json(200, {"ok": True, "routers": routers})
+            return
+        if path.startswith("/api/transports/stage/job/"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                job_id = path.rsplit("/", 1)[-1]
+                self.send_json(200, host_adapter_request(
+                    "xray.transport.stage.job", {"job_id": job_id}
+                ))
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:150]})
             return
         if path == "/health":
             result = {"ok": True}
@@ -19825,6 +19841,39 @@ exit 127
                     {"action": payload.get("action"), "version": payload.get("version") or ""},
                 ))
             except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/stage/start":
+            if not self.require_owner(json_mode=True):
+                return
+            if os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") != "1":
+                self.send_json(403, {"ok": False, "error": "shadow staging is disabled in server settings"})
+                return
+            csrf = self.headers.get("X-Transport-Action-CSRF", "")
+            if not secrets.compare_digest(csrf, TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport action CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                from transport_profiles import validate_profiles
+                validate_profiles(payload.get("profiles"))
+                baseline = host_adapter_request("xray.current")
+                request = {
+                    "profiles": payload.get("profiles"),
+                    "router_id": payload.get("router_id"),
+                    "remote_host": payload.get("remote_host"),
+                    "admin_test_port": payload.get("admin_test_port"),
+                    "ssh_test_port": payload.get("ssh_test_port"),
+                    "expected_sha256": baseline["sha256"],
+                    "confirmed": payload.get("confirmed") is True,
+                }
+                self.send_json(200, host_adapter_request(
+                    "xray.transport.stage.start", request
+                ))
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
         if path == "/api/transports/router/preflight":
