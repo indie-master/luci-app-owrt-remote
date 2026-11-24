@@ -9,7 +9,7 @@ import copy
 import hashlib
 import json
 import re
-from secure_ingress import domain, plan_ingress, render_map_entries
+from secure_ingress import domain, plan_ingress
 from transport_profiles import ProfileError, _port
 from secure_profile_catalog import _identifier
 
@@ -76,6 +76,8 @@ def build_publication(live, artifact, inventory, *, profile_id, revision):
     if not isinstance(artifact, dict) or set(artifact) != {"profile", "remote_host", "public_port"}:
         raise ProfileError("invalid private profile artifact")
     profile = artifact["profile"]
+    if not isinstance(profile, dict):
+        raise ProfileError("invalid private profile")
     if profile.get("name") != profile_id or artifact["public_port"] != public:
         raise ProfileError("profile identity or public port differs from reviewed ingress")
     inbounds = live.get("inbounds") if isinstance(live, dict) else None
@@ -105,7 +107,7 @@ def build_publication(live, artifact, inventory, *, profile_id, revision):
     })
     # Render the complete managed fragment; preserve previously managed routes.
     combined = sorted(inventory["managed_routes"] + plan["routes"], key=lambda r: r["sni"])
-    fragment = "".join(f"{r['sni']} {r['upstream']};\n" for r in combined)
+    fragment = "".join(f"{domain(r['sni'])} {r['upstream']};\n" for r in combined)
     return {"candidate": candidate, "fragment": fragment, "tag": tag,
             "baseline_sha256": digest(live), "inventory_sha256": digest(inventory),
             "artifact_sha256": digest(artifact), "routes": plan["routes"],
