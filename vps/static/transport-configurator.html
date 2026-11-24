@@ -37,6 +37,12 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <label data-field="public_key">REALITY public key (для роутера)<input name="public_key" autocomplete="off" placeholder="Публичный ключ из Xray"></label>
 </div><p><button type="submit">Проверить и сгенерировать</button> <button type="button" class="secondary" id="routerPreflight" disabled>Проверить на OpenWrt без изменений</button> <button type="button" class="secondary" id="stagePilot" disabled title="Тестовый серверный Xray будет перезапущен и автоматически восстановлен через 10 минут">Запустить тестовый серверный вход (10 мин)</button> <button type="button" class="secondary" disabled title="Доступно после внедрения транзакционного применения">Применить к роутеру</button></p>
 </form>
+<div class="panel">
+<h2>Активный серверный пилот</h2>
+<p class="muted" id="pilotStatus" aria-live="polite">Проверка статуса…</p>
+<button type="button" class="secondary" id="pilotRefresh">Обновить статус</button>
+<button type="button" class="secondary" id="pilotRollback" disabled>Немедленно откатить пилот</button>
+</div>
 <div class="panel"><h2>Результат проверки</h2><pre id="output" aria-live="polite">Выбери транспорт и нажми «Проверить».</pre></div>
 <script>
 const form=document.getElementById('editor'),output=document.getElementById('output'),choice=document.getElementById('transport');
@@ -84,6 +90,34 @@ preflight.addEventListener('click',async()=>{
  }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
  finally{preflight.disabled=!routerSelect.value}
 });
+const pilotStatus=document.getElementById('pilotStatus'),pilotRollback=document.getElementById('pilotRollback');
+async function refreshPilotStatus(){
+ try{
+  const response=await fetch('/api/transports/stage/status',{credentials:'same-origin',cache:'no-store'});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Статус пилота недоступен');
+  pilotStatus.textContent=result.active
+    ? 'Роутер: '+result.router_id+' · '+result.phase+' · осталось '+result.seconds_remaining+' с'
+    : 'Активных пилотов нет · '+result.phase;
+  pilotRollback.disabled=!(document.body.dataset.stageEnabled==='1'&&['STAGED','VERIFIED'].includes(result.phase));
+ }catch(error){pilotStatus.textContent=String(error.message||error);pilotRollback.disabled=true}
+}
+document.getElementById('pilotRefresh').addEventListener('click',refreshPilotStatus);
+pilotRollback.addEventListener('click',async()=>{
+ if(pilotRollback.disabled)return;
+ if(!confirm('Немедленно восстановить прежний Xray-конфиг и перезапустить Docker Xray? Текущие туннели кратковременно прервутся.'))return;
+ pilotRollback.disabled=true;
+ pilotStatus.textContent='Запрошен откат пилота…';
+ try{
+  const response=await fetch('/api/transports/stage/rollback',{method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+    body:JSON.stringify({confirmed:true})});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Не удалось запустить откат');
+  pilotStatus.textContent='Откат выполняется. Проверь статус через несколько секунд.';
+ }catch(error){pilotStatus.textContent=String(error.message||error)}
+});
+refreshPilotStatus();
 const stageButton=document.getElementById('stagePilot');
 stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value;
 routerSelect.addEventListener('change',()=>{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value});
@@ -116,7 +150,7 @@ stageButton.addEventListener('click',async()=>{
    if(result.job.status==='success'||result.job.status==='failed')break;
   }
  }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
- finally{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value}
+ finally{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value;refreshPilotStatus()}
 });
 form.addEventListener('submit',async e=>{
  e.preventDefault();output.classList.remove('error');output.textContent='Проверка…';
