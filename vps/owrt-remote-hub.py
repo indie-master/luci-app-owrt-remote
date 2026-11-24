@@ -19851,6 +19851,110 @@ exit 127
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
+        if path == "/api/transports/router/pilot/start":
+            if not self.require_owner(json_mode=True):
+                return
+            if os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") != "1":
+                self.send_json(403, {"ok": False, "error": "shadow pilot is disabled"})
+                return
+            csrf = self.headers.get("X-Transport-Action-CSRF", "")
+            if not secrets.compare_digest(csrf, TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                router_id = clean_router_id(payload.get("router_id"))
+                stage = host_adapter_request("xray.transport.stage.status")
+                if stage.get("phase") != "STAGED" or stage.get("router_id") != router_id:
+                    raise ValueError("matching server shadow pilot is not staged")
+                if int(stage.get("seconds_remaining") or 0) < 100:
+                    raise ValueError("pilot lease too short; start a new server pilot")
+                client = stage.get("client")
+                test_ports = stage.get("test_ports")
+                if not isinstance(client, dict) or not isinstance(test_ports, dict):
+                    raise ValueError("server pilot client metadata unavailable")
+                from transport_profiles import _host, _port
+                _host(str(client["host"]))
+                _port(client["port"])
+                ssh_test_port = _port(test_ports["ssh"])
+                with self.app.conn() as conn:
+                    row = get_active_router(conn, router_id)
+                if not row:
+                    raise ValueError("router is unavailable")
+                # The staged server is the only source of client transport
+                # fields. No browser-supplied reverse tags or UUIDs are used.
+                variables = [
+                    "OWRT_REMOTE_CANDIDATE_TRANSPORT",
+                    "OWRT_REMOTE_CANDIDATE_HOST",
+                    "OWRT_REMOTE_CANDIDATE_PORT",
+                    "OWRT_REMOTE_CANDIDATE_SNI",
+                    "OWRT_REMOTE_CANDIDATE_WS_PATH",
+                    "OWRT_REMOTE_CANDIDATE_XHTTP_PATH",
+                    "OWRT_REMOTE_CANDIDATE_GRPC_SERVICE",
+                    "OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY",
+                    "OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID",
+                    "OWRT_REMOTE_CANDIDATE_REVERSE_TAG",
+                    "OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG",
+                ]
+                values = [
+                    client["transport"], client["host"], str(client["port"]),
+                    client.get("sni") or "", client.get("ws_path") or "/owrt-ws/",
+                    client.get("xhttp_path") or "/owrt-xhttp/",
+                    client.get("grpc_service") or "owrt_remote",
+                    client.get("reality_public_key") or "",
+                    client.get("reality_short_id") or "",
+                    client["reverse_tag"], client["ssh_reverse_tag"],
+                ]
+                remote_script = "set -eu\n" + "".join(
+                    'export ' + name + '="${' + str(i) + '}"\n'
+                    for i, name in enumerate(variables, start=1)
+                ) + "exec /usr/sbin/owrt-remote transport-pilot-start\n"
+                password = str(payload.get("ssh_password") or "")
+                result = self.run_router_ssh_script(
+                    row, remote_script, values, timeout=28, ssh_password=password
+                )
+                if "TRANSPORT PILOT: STARTED" not in result:
+                    raise RuntimeError("OpenWrt did not confirm shadow Xray start")
+                verified = False
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    current = host_adapter_request("xray.transport.stage.status")
+                    if (current.get("phase") != "STAGED" or
+                        int(current.get("seconds_remaining") or 0) < 20):
+                        break
+                    try:
+                        with socket.create_connection(
+                            ("127.0.0.1", ssh_test_port), timeout=2
+                        ) as conn:
+                            conn.settimeout(3)
+                            if conn.recv(48).startswith(b"SSH-"):
+                                verified = True
+                                break
+                    except OSError:
+                        pass
+                    time.sleep(2)
+                if not verified:
+                    # Stop only the temporary OpenWrt pilot. Primary Xray
+                    # remains untouched even if the pilot cannot connect.
+                    try:
+                        self.run_router_ssh_script(
+                            row, "exec /usr/sbin/owrt-remote transport-pilot-stop\n",
+                            timeout=8, ssh_password=password
+                        )
+                    except Exception:
+                        pass
+                    raise RuntimeError("shadow reverse SSH did not become reachable")
+                self.send_json(200, {"ok": True, "router_id": router_id,
+                                     "verified": True, "ssh_reverse": True,
+                                     "primary_uci_changed": False,
+                                     "pilot_ttl_seconds": 180})
+            except Exception as exc:
+                self.send_json(409, {"ok": False,
+                                     "error": str(exc)[:160]})
+            return
         if path == "/api/transports/stage/rollback":
             if not self.require_owner(json_mode=True):
                 return
