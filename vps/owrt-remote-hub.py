@@ -17959,7 +17959,15 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         env, args = self.ssh_exec_args(port, allow_password=bool(password))
         askpass_dir = self.prepare_ssh_askpass(env, password)
         try:
-            argv = args + ["sh", "-s", "--"] + [str(item) for item in (script_args or [])]
+            # OpenSSH joins command arguments into a remote shell string.
+            # Quote each argument before invoking the remote shell, including
+            # the arbitrary path, SNI and profile fields from owner input.
+            remote_command = "sh -s --"
+            if script_args:
+                remote_command += " " + " ".join(
+                    shlex.quote(str(item)) for item in script_args
+                )
+            argv = args + [remote_command]
             result = subprocess.run(
                 argv,
                 input=str(script),
