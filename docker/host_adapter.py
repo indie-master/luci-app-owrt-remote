@@ -602,6 +602,45 @@ class Adapter:
             "finished_unix": entry.get("finished_unix"),
         }}
 
+    def transport_stage_status(self):
+        """Redacted status of the one active shadow transaction."""
+        state = Path("/opt/router-orchestrator/data/transport-stage/stage.json")
+        if not state.exists():
+            return {"ok": True, "active": False, "phase": "NONE"}
+        require(state.is_file() and not state.is_symlink(), "unsafe stage journal")
+        meta = state.stat()
+        require(meta.st_uid == 0 and stat.S_IMODE(meta.st_mode) == 0o600,
+                "unsafe stage journal permissions")
+        entry = json.loads(state.read_text())
+        phase = entry.get("phase")
+        require(phase in ("STAGING", "STAGED", "VERIFIED", "ROLLED_BACK",
+                          "ROLLBACK_FAILED"), "unrecognized stage state")
+        expires = int(entry.get("expires_unix") or 0)
+        return {"ok": True, "active": phase in ("STAGING", "STAGED", "VERIFIED",
+                                                "ROLLBACK_FAILED"),
+                "phase": phase, "router_id": entry.get("router_id"),
+                "expires_unix": expires,
+                "seconds_remaining": max(0, expires - int(time.time()))}
+
+    def transport_stage_rollback(self, request):
+        """Request an immediate fixed-unit rollback; never execute web input."""
+        self.can_mutate(self.allow_apply)
+        require(request.get("confirmed") is True,
+                "explicit confirmation required")
+        stage = self.transport_stage_status()
+        require(stage["phase"] in ("STAGED", "VERIFIED"),
+                "no completed shadow pilot available for rollback")
+        unit = "router-orchestrator-transport-rollback.service"
+        started = subprocess.run(
+            ["systemctl", "start", "--no-block", unit],
+            capture_output=True, text=True, timeout=15, check=False
+        )
+        require(started.returncode == 0,
+                "rollback service could not be started")
+        self.last_restart = time.monotonic()
+        return {"ok": True, "status": "rollback_requested",
+                "router_id": stage["router_id"], "phase": stage["phase"]}
+
     def core_job_start(self, request):
         action = request.get("action")
         require(action in ("prepare", "upgrade", "restart", "rollback"),
@@ -767,6 +806,10 @@ class Adapter:
             return self.transport_stage_start(request)
         if op == "xray.transport.stage.job":
             return self.transport_stage_job(request)
+        if op == "xray.transport.stage.status":
+            return self.transport_stage_status()
+        if op == "xray.transport.stage.rollback":
+            return self.transport_stage_rollback(request)
         if op == "xray.core.info":
             return {"ok": True, "active": active_xray(),
                     "image": docker_inspect_image(),
