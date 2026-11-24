@@ -146,6 +146,18 @@ ready() {
     done
     [ "$(cat "$S/client.primary.ready")" != "$(cat "$S/client.secondary.ready")" ]
 }
+supervised() {
+    a="$(cat "$S/client.primary.ready" 2>/dev/null || true)"
+    b="$(cat "$S/client.secondary.ready" 2>/dev/null || true)"
+    number "$a" && number "$b" || return 1
+    ubus -t 3 call service list '{"name":"ro-client-recovery"}' |
+        jq -e --arg a "$a" --arg b "$b" '
+          .["ro-client-recovery"].instances as $i
+          | $i.primary.running == true and $i.secondary.running == true
+          and ($i.primary.pid|tostring) == $a
+          and ($i.secondary.pid|tostring) == $b
+        ' >/dev/null
+}
 valid_window() {
     [ "$(cat "$S/client.boot")" = "$(boot_id)" ] || return 1
     deadline="$(cat "$S/client.deadline")"; current="$(now)"
@@ -204,7 +216,7 @@ arm)
 apply)
     [ "$#" = 2 ] && [ -f "$S/client.armed" ] && [ ! -e "$S/client.pending" ] || fail 'not armed'
     [ "$2" = "$(cat "$S/client.sha")" ] || fail 'wrong digest'
-    [ -L "$BOOT" ] && ready && valid_window || fail 'recovery not ready or deadline expired'
+    [ -L "$BOOT" ] && ready && supervised && valid_window || fail 'recovery not ready or deadline expired'
     verify_backup; verify_candidate "$2"; verify_originals; critical
     [ "$(xray_identity)" = "$(cat "$S/client.xray")" ] || fail 'Xray identity changed'
     # All recovery metadata and pending marker reach disk before first replacement.
@@ -274,6 +286,7 @@ status)
     elif [ -f "$S/client.armed" ]; then say ARMED
     else say PREPARED; fi
     if ready; then say 'TWO WORKERS READY'; fi
+    if supervised; then say 'PROCD SUPERVISION: PASS'; fi
     ;;
 *) fail 'arm | apply | confirm | rollback | reset-rolled-back | status | boot-recover | worker';;
 esac
