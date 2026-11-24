@@ -80,7 +80,8 @@ services:
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
-    cap_add: [NET_BIND_SERVICE]
+    # Root master must initialize tmpfs paths and drop worker privileges.
+    cap_add: [NET_BIND_SERVICE, CHOWN, SETGID, SETUID]
     security_opt: ["no-new-privileges:true"]
     volumes:
       - type: bind
