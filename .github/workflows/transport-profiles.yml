@@ -33,6 +33,10 @@ jobs:
         run: |
           python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
           python -m unittest discover -s tests -p 'test_xray_core_manager.py' -v
+      - name: Global Logs persistence and delivery regression
+        run: |
+          python -m unittest discover -s tests -p 'test_global_logs.py' -v
+          python -m unittest discover -s tests -p 'test_router_log_transport.py' -v
       - name: Validate OpenWrt transport client POSIX shell
         run: |
           sh -n files/usr/sbin/owrt-remote
