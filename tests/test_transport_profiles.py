@@ -103,8 +103,9 @@ class TransportProfilesTest(unittest.TestCase):
                 outbound = render_router_outbound(
                     item, router_uuid=uid, remote_host="router.example.org"
                 )
-                self.assertEqual(outbound["settings"]["vnext"][0]["users"][0]["id"], uid)
-                self.assertEqual(outbound["settings"]["vnext"][0]["port"], 18450 + i)
+                self.assertEqual(outbound["settings"]["id"], uid)
+                self.assertEqual(outbound["settings"]["port"], 18450 + i)
+                self.assertEqual(outbound["settings"]["reverse"]["tag"], "reverse-in")
                 self.assertNotIn("PRIVATE_TEST_VALUE_NEVER_IN_CLIENT", str(outbound))
 
     def test_client_rejects_malformed_identity(self):
