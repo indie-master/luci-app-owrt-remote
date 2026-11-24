@@ -12,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docker"))
 import secure_profile_store as store
 import secure_profile_catalog as catalog
+original_connection = store.connection
 from transport_profiles import ProfileError
 
 
@@ -51,6 +52,41 @@ class StoreTests(unittest.TestCase):
         with store.connection(self.root) as db:
             self.assertEqual(self.save(db)["revision"], 2)
             self.assertEqual(len(store.list_revisions(db)), 2)
+
+    def test_immutable_artifact_validation_rejects_tampering(self):
+        with store.connection(self.root) as db:
+            self.save(db)
+            artifact, digest, published = store.load_artifact(db, "test", 1)
+            self.assertFalse(published)
+            self.assertEqual(artifact["remote_host"], "router.example.org")
+            self.assertEqual(len(digest), 64)
+            db.execute("UPDATE secure_profile_artifacts SET artifact=?",
+                       (b'{"modified":true}',))
+            with self.assertRaisesRegex(ProfileError, "digest mismatch"):
+                store.load_artifact(db, "test", 1)
+
+    def test_adapter_draft_validation_is_not_publication_or_assignment(self):
+        import host_adapter
+        with store.connection(self.root) as db:
+            self.save(db)
+        live = self.root / "xray.json"
+        original = b'{"inbounds":[],"routing":{"rules":[]}}'
+        live.write_bytes(original)
+        adapter = host_adapter.Adapter()
+        with patch.object(store, "connection", side_effect=lambda: original_connection(self.root)), \
+                patch.object(host_adapter, "CONFIG", live), \
+                patch.object(adapter, "transport_preview", return_value={"validated": True}) as preview:
+            result = adapter.handle({"op":"secure.catalog.validate","profile_id":"test","revision":1})
+        self.assertTrue(result["xray_validated"])
+        self.assertFalse(result["published"])
+        self.assertFalse(result["applied"])
+        self.assertFalse(result["ingress_inventory_checked"])
+        self.assertNotIn("private_key", json.dumps(result))
+        self.assertEqual(live.read_bytes(), original)
+        preview.assert_called_once()
+        with store.connection(self.root) as db:
+            self.assertEqual(catalog.available_profiles(db), [])
+            self.assertEqual(catalog.desired_profiles(db, "netis"), [])
 
     def test_bad_pair_and_plaintext_rejected_without_draft(self):
         with store.connection(self.root) as db:
