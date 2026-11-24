@@ -190,7 +190,7 @@ def stage(router_id, profile_path, entry_port, ssh_port):
     from transport_profiles import _host
     client_host = _host(str(profile.get("remote_host") or router["vps_host"]))
     client = {
-        "transport": profile["transport"],
+        "transport": "ws" if profile["transport"] == "wss" else profile["transport"],
         "host": client_host,
         "port": int(profile["port"]),
         "sni": str(profile.get("server_name") or ""),
