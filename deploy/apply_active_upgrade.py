@@ -145,7 +145,9 @@ def stop_workers():
 
 
 def stop_hub():
-    run("docker","stop","--time","10","router-orchestrator-hub",timeout=45)
+    running=run("docker","ps","--filter","name=^/router-orchestrator-hub$","--format","{{.Names}}",timeout=10).decode().splitlines()
+    if "router-orchestrator-hub" in running:
+        run("docker","stop","--time","10","router-orchestrator-hub",timeout=45)
     run("systemctl","stop",ADAPTER,timeout=30)
 
 
@@ -291,7 +293,11 @@ def apply(stage, preserve_legacy_hold=False):
         dropins=UNITS/(unit+".d")
         require(not dropins.exists() or not any(dropins.iterdir()),"unexpected systemd drop-in: "+unit)
     require(life.image_id(manifest["hub_image"])==manifest["hub_image_id"],"candidate image changed")
-    life.candidate_test(parse_env(ENV.read_bytes())["RO_XRAY_IMAGE"])
+    settings=parse_env(ENV.read_bytes())
+    for service,var in (("hub","RO_HUB_IMAGE"),("xray","RO_XRAY_IMAGE")):
+        require(life.image_id(settings[var])==manifest["containers"][service]["image"],
+                "active image tag was changed: "+service)
+    life.candidate_test(settings["RO_XRAY_IMAGE"])
     database,baseline=capture_fleet()
     record={"old_commit":manifest["old_commit"],"new_commit":manifest["new_commit"],
         "old_xray_image":manifest["containers"]["xray"]["image"],
