@@ -44,6 +44,9 @@ jobs:
           python -m unittest discover -s tests -p 'test_secure_profile_store.py' -v
           python -m unittest discover -s tests -p 'test_secure_publication.py' -v
           python -m unittest discover -s tests -p 'test_secure_publication_transaction.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_commit.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_lock.py' -v
+          python -m unittest discover -s tests -p 'test_secure_nginx_preflight.py' -v
           python -m unittest discover -s tests -p 'test_secure_ingress_inventory.py' -v
           python -m unittest discover -s tests -p 'test_secure_ingress_audit.py' -v
           python -m unittest discover -s tests -p 'test_external_ingress_bootstrap.py' -v
