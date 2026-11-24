@@ -13,6 +13,7 @@ import stat
 import subprocess
 
 import secure_profile_catalog as catalog
+from secure_profile_catalog import _identifier
 from secure_ingress import domain, plan_ingress
 from transport_profiles import ProfileError, require_secure_profile, REALITY_PROFILES, _port
 
@@ -142,3 +143,19 @@ def list_revisions(db):
                           FROM secure_profile_revisions ORDER BY label,revision DESC""")
     fields = ("profile_id","revision","label","transport","hostname","public_port","published")
     return [dict(zip(fields, row)) for row in rows]
+
+def load_artifact(db, profile_id, revision):
+    """Return sealed private artifact to privileged caller only."""
+    _identifier(profile_id)
+    if type(revision) is not int or revision < 1:
+        raise ProfileError("invalid revision")
+    row = db.execute("""SELECT a.artifact,r.artifact_sha256,r.published
+          FROM secure_profile_artifacts a JOIN secure_profile_revisions r
+          USING(profile_id,revision) WHERE a.profile_id=? AND a.revision=?""",
+          (profile_id, revision)).fetchone()
+    if not row:
+        raise ProfileError("profile revision not found")
+    artifact, digest, published = row
+    if not isinstance(artifact, bytes) or not secrets.compare_digest(hashlib.sha256(artifact).hexdigest(), digest):
+        raise ProfileError("profile artifact digest mismatch")
+    return json.loads(artifact), digest, bool(published)
