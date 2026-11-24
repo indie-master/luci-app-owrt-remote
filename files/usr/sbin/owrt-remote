@@ -637,8 +637,8 @@ render_client_config() (
 	ssh_uuid="$(uci_get ssh_vless_uuid '')"
 	encryption="$(uci_get vless_encryption none)"
 	flow="$(uci_get vless_flow '')"
-	reverse_tag="$(uci_get reverse_tag reverse-in)"
-	ssh_reverse_tag="$(uci_get ssh_reverse_tag "${reverse_tag}-ssh")"
+	reverse_tag="${OWRT_REMOTE_CANDIDATE_REVERSE_TAG:-$(uci_get reverse_tag reverse-in)}"
+	ssh_reverse_tag="${OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG:-$(uci_get ssh_reverse_tag "${reverse_tag}-ssh")}"
 	admin_host="$(uci_get admin_host 127.0.0.1)"
 	admin_port="$(xray_port admin_port "$(uci_get admin_port 80)")" || return 1
 	ssh_host="$(uci_get ssh_host 127.0.0.1)"
