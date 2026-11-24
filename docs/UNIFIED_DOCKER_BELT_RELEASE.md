@@ -189,6 +189,38 @@ Use `python3 docker/transport_stage.py status` for an existing root-only
 transaction inspection in a test environment. Never run `stage` on
 Belt simply to inspect a configuration: it **restarts production Xray**.
 
+## Web shadow transport pilot (safe test, NOT permanent migration)
+
+The owner-only /transport-configurator/ now supports a staged live pilot:
+
+1. Choose a router and transport and run the candidate preflight against its
+   installed OpenWrt Xray without changing UCI.
+2. Start a ten-minute **server shadow listener** (explicit opt-in,
+   RO_ENABLE_TRANSPORT_STAGE=1). The current server config is backed up and
+   old reverse tunnels must recover after the single Docker Xray restart.
+3. Once stage status is STAGED with more than 100 seconds remaining, click
+   **Test shadow transport on OpenWrt (3 min)**. The OpenWrt agent starts a
+   separate, temporary Xray instance using the staged reverse tags and never
+   overwrites its primary UCI configuration or procd service.
+4. The HUB verifies a real SSH banner from the shadow SSH reverse tunnel.
+   A failure triggers an attempt to stop the router-only pilot. The OpenWrt
+   pilot has its own 180-second expiry; the server stage has a 600-second
+   expiry and an independent systemd expiry timer.
+5. Use **Rollback shadow pilot** to restore the previous server Xray config
+   immediately, without waiting for the expiry timer. This recovery action
+   bypasses the normal Xray maintenance hold and restart cooldown, but still
+   requires owner authentication, CSRF and explicit confirmation.
+
+A successful shadow SSH test is evidence of transport connectivity, **not**
+permission to overwrite the router's active UCI. Durable promotion still
+requires two-phase persistence, post-reboot check, a fallback listener and
+an automatic router-side rollback contract. Do not treat the preview or stage
+mode as a completed migration.
+
+The server pilot may require an explicitly allowed test inbound TCP port
+in the host firewall or outer stream routing. The project must not modify
+Belt-wide firewall policy automatically.
+
 ## Post-cutover acceptance
 
 - HUB owner and delegated-account RBAC; no delegated VPS root shell.
