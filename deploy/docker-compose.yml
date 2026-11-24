@@ -22,6 +22,7 @@ services:
       OWRT_REMOTE_RUNTIME: docker
       OWRT_REMOTE_APP_NAME: "Router Orchestrator"
       OWRT_REMOTE_RESTART_XRAY_ON_WAN_RECONNECT: "0"
+      RO_ENABLE_TRANSPORT_STAGE: "${RO_ENABLE_TRANSPORT_STAGE:-0}"
     volumes:
       - type: bind
         source: ${RO_STATE_DIR:?Set RO_STATE_DIR}
