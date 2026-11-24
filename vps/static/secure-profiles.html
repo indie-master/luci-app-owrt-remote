@@ -101,7 +101,19 @@ get('preferences').addEventListener('submit',async e=>{
      }catch(err){result.textContent=String(err.message||err)}
      finally{validate.disabled=false}
     });
-    item.append(validate,result);
+    const plan=document.createElement('button');
+    plan.type='button';plan.textContent='План публикации';
+    plan.addEventListener('click',async()=>{
+     plan.disabled=true;validate.disabled=true;
+     result.textContent='Проверка выделенных SNI, портов и серверной конфигурации…';
+     try{
+      const candidate=await api('/api/secure-profiles/plan',{profile_id:p.profile_id,revision:p.revision});
+      result.textContent='План готов · Xray: PASS · '+candidate.routes.map(route=>route.sni+' → '+route.upstream).join(' · ')+
+       ' · Конфигурация nginx на диске сверена. Вход не активирован, роутеры не изменены.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{plan.disabled=false;validate.disabled=false}
+    });
+    item.append(validate,plan,result);
    }
    catalog.append(item);
   }
