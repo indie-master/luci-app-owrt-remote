@@ -535,6 +535,73 @@ class Adapter:
                 "baseline_unchanged": True, "applied": False,
                 "candidate_sha256": sha(data)}
 
+    def transport_stage_start(self, request):
+        """Explicit opt-in, short-lived server canary; never changes router UCI."""
+        self.can_mutate(self.allow_apply)
+        require(request.get("confirmed") is True,
+                "operator confirmation required")
+        self.transport_canary_preview(request)
+        queue = Path("/opt/router-orchestrator/data/transport-stage-queue")
+        require(queue.is_dir() and not queue.is_symlink(), "stage queue not provisioned")
+        metadata = queue.stat()
+        require(metadata.st_uid == 0 and stat.S_IMODE(metadata.st_mode) == 0o700,
+                "unsafe stage queue permissions")
+        state = Path("/opt/router-orchestrator/data/transport-stage/stage.json")
+        if state.exists():
+            require(not state.is_symlink(), "unsafe shadow journal")
+            journal = json.loads(state.read_text())
+            require(journal.get("phase") == "ROLLED_BACK",
+                    "another shadow transport transaction is still active")
+        for candidate in queue.glob("*.json"):
+            require(not candidate.is_symlink(), "unsafe stage queue entry")
+            item = json.loads(candidate.read_text())
+            require(item.get("status") not in ("pending", "running"),
+                    "another shadow staging job is already pending/running")
+        profile = request["profiles"][0]
+        job_id = str(uuid.uuid4())
+        record = {
+            "id": job_id, "action": "stage", "status": "pending",
+            "profile": profile, "router_id": request["router_id"],
+            "entry_port": request["admin_test_port"],
+            "ssh_port": request["ssh_test_port"],
+            "created_unix": int(time.time()),
+        }
+        path = queue / (job_id + ".json")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        unit = "router-orchestrator-transport-stage@" + job_id + ".service"
+        started = subprocess.run(["systemctl", "start", "--no-block", unit],
+                                 capture_output=True, timeout=15, text=True)
+        if started.returncode:
+            path.unlink(missing_ok=True)
+            raise Rejected("shadow stage worker did not start")
+        self.last_restart = time.monotonic()
+        return {"ok": True, "job_id": job_id, "status": "pending",
+                "expires_after_seconds": 600, "primary_uci_changed": False}
+
+    def transport_stage_job(self, request):
+        job_id = request.get("job_id")
+        require(isinstance(job_id, str) and
+                re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", job_id),
+                "invalid stage job identifier")
+        path = Path("/opt/router-orchestrator/data/transport-stage-queue") / (job_id + ".json")
+        require(path.is_file() and not path.is_symlink(), "stage job unavailable")
+        meta = path.stat()
+        require(meta.st_uid == 0 and stat.S_IMODE(meta.st_mode) == 0o600,
+                "stage job permissions unsafe")
+        entry = json.loads(path.read_text())
+        require(entry.get("id") == job_id, "stage job identifier mismatch")
+        return {"ok": True, "job": {
+            "id": entry["id"], "status": entry.get("status"),
+            "message": entry.get("message", ""),
+            "created_unix": entry.get("created_unix"),
+            "finished_unix": entry.get("finished_unix"),
+        }}
+
     def core_job_start(self, request):
         action = request.get("action")
         require(action in ("prepare", "upgrade", "restart", "rollback"),
@@ -696,6 +763,10 @@ class Adapter:
             return self.transport_preview(request)
         if op == "xray.transport.canary.preview":
             return self.transport_canary_preview(request)
+        if op == "xray.transport.stage.start":
+            return self.transport_stage_start(request)
+        if op == "xray.transport.stage.job":
+            return self.transport_stage_job(request)
         if op == "xray.core.info":
             return {"ok": True, "active": active_xray(),
                     "image": docker_inspect_image(),
