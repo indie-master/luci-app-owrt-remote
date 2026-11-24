@@ -23,6 +23,7 @@ import xray_lifecycle as life
 from secure_publication_transaction import atomic,read_regular,sync_directory
 from secure_publication_worker import exclusive,capture_fleet,wait_fleet,identity
 from secure_ingress_inventory import nginx_digest
+import active_upgrade_fleet as fleet
 
 ADAPTER="router-orchestrator-host-adapter.service"
 TIMERS=("router-orchestrator-xray-watchdog.timer","router-orchestrator-transport-expiry.timer",
@@ -195,8 +196,10 @@ def wait_ready(record):
     else:
         raise RuntimeError("HUB/adapter did not become healthy")
     require(life.wait_healthy(),"Xray listeners unavailable")
-    require(wait_fleet(record["fleet"],record["started"],timeout=180),
-            "not all baseline routers recovered")
+    baseline=record["fleet"]["baseline"]
+    check=fleet.wait if baseline and all("admin_ok" in row for row in baseline.values()) else wait_fleet
+    require(check(record["fleet"],record["started"],timeout=180),
+            "not all baseline router channels recovered")
     check_files(record)
 
 
@@ -262,7 +265,7 @@ def release_hold(record=None):
     sync_directory(life.TRANSPORT_HOLD.parent)
 
 
-def apply(stage, preserve_legacy_hold=False):
+def apply(stage, preserve_legacy_hold=False, allowed_degraded=()):
     manifest=read_json(stage/"manifest.json")
     require(manifest["phase"]=="STAGED_ONLY" and not (stage/"upgrade-state.json").exists(),
             "candidate was already used")
@@ -298,7 +301,7 @@ def apply(stage, preserve_legacy_hold=False):
         require(life.image_id(settings[var])==manifest["containers"][service]["image"],
                 "active image tag was changed: "+service)
     life.candidate_test(settings["RO_XRAY_IMAGE"])
-    database,baseline=capture_fleet()
+    database,baseline=fleet.capture(allowed_degraded)
     record={"old_commit":manifest["old_commit"],"new_commit":manifest["new_commit"],
         "old_xray_image":manifest["containers"]["xray"]["image"],
         "old_hub_image":manifest["containers"]["hub"]["image"],
@@ -355,17 +358,24 @@ def apply(stage, preserve_legacy_hold=False):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action",choices=("apply","recover"))
-    parser.add_argument("--stage",required=True)
+    parser.add_argument("action",choices=("apply","recover","preflight"))
+    parser.add_argument("--stage")
+    parser.add_argument("--allow-degraded-router",action="append",default=[])
     parser.add_argument("--confirm-maintenance",action="store_true")
     parser.add_argument("--preserve-legacy-hold",action="store_true")
     args=parser.parse_args()
     os.umask(0o077)
-    require(os.geteuid()==0 and args.confirm_maintenance,"root and explicit maintenance confirmation required")
+    require(os.geteuid()==0,"root required")
+    if args.action=="preflight":
+        with exclusive(life.LOCK):
+            fleet.capture(args.allow_degraded_router)
+            print("FLEET PREFLIGHT: PASS")
+        return
+    require(args.confirm_maintenance and args.stage,"stage and explicit maintenance confirmation required")
     stage=checked_stage(args.stage)
     with exclusive(life.LOCK):
         if args.action=="apply":
-            apply(stage,args.preserve_legacy_hold)
+            apply(stage,args.preserve_legacy_hold,args.allow_degraded_router)
         else:
             record=read_json(stage/"upgrade-state.json")
             check_installer_revision(record["new_commit"])
