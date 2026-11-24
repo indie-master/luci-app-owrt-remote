@@ -27,8 +27,10 @@ WATCHDOG_TIMER = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.tim
 TRANSPORT_SERVICE = Path("/etc/systemd/system/router-orchestrator-transport-expiry.service")
 TRANSPORT_TIMER = Path("/etc/systemd/system/router-orchestrator-transport-expiry.timer")
 TRANSPORT_JOB_UNIT = Path("/etc/systemd/system/router-orchestrator-transport-stage@.service")
+TRANSPORT_ROLLBACK_UNIT = Path("/etc/systemd/system/router-orchestrator-transport-rollback.service")
 MANAGED_RECOVERY_UNITS = (WATCHDOG_SERVICE, WATCHDOG_TIMER,
-                          TRANSPORT_SERVICE, TRANSPORT_TIMER, TRANSPORT_JOB_UNIT)
+                          TRANSPORT_SERVICE, TRANSPORT_TIMER, TRANSPORT_JOB_UNIT,
+                          TRANSPORT_ROLLBACK_UNIT)
 BACKUP = STAGE / "cutover-rollback"
 SYSTEMD = "router-orchestrator-host-adapter.service"
 
