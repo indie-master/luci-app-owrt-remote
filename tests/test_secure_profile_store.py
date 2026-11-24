@@ -36,6 +36,21 @@ class StoreTests(unittest.TestCase):
         return store.save_draft(db, profile=data, label="Management",
                                 remote_host="router.example.org", public_port=443)
 
+    def test_automatic_port_reservation_and_explicit_collision(self):
+        def save(db, port):
+            return store.save_allocated_draft(db, profile=dict(profile(), port=port),
+                 label="Management", remote_host="router.example.org", public_port=443,
+                 occupied_ports={24000,24002})
+        with store.connection(self.root) as db:
+            self.assertEqual(save(db,0)["backend_port"],24001)
+            self.assertEqual(save(db,0)["backend_port"],24003)
+            for port in (24001,24000,443):
+                with self.assertRaises(ProfileError):
+                    save(db,port)
+            self.assertEqual(len(store.list_revisions(db)),2)
+        with store.connection(self.root) as db:
+            self.assertEqual(save(db,0)["backend_port"],24004)
+
     def test_private_artifact_and_public_metadata_are_separate(self):
         with store.connection(self.root) as db:
             draft = self.save(db)
