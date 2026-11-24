@@ -446,6 +446,15 @@ class Adapter:
         from secure_profile_store import connection, save_allocated_draft, list_revisions
         from secure_profile_catalog import available_profiles, desired_profiles, set_desired_profiles
         op = request["op"]
+        if op == "secure.catalog.job":
+            from secure_publication_job import status, enabled
+            return {"ok": True, "enabled": enabled(), "job": status()}
+        if op == "secure.catalog.publish":
+            from secure_publication_job import enqueue
+            self.can_mutate(self.allow_apply)
+            return {"ok": True, "job": enqueue(request.get("profile_id"),
+                request.get("revision"), request.get("artifact_sha256"),
+                request.get("confirmed"))}
         with connection() as db:
             if op == "secure.catalog.list":
                 return {"ok": True, "revisions": list_revisions(db),
@@ -975,7 +984,7 @@ class Adapter:
         if op == "xray.preview":
             return self.xray_preview(request)
         if op in ("secure.catalog.list", "secure.catalog.draft",
-                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate", "secure.catalog.plan", "secure.catalog.approve"):
+                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate", "secure.catalog.plan", "secure.catalog.approve", "secure.catalog.job", "secure.catalog.publish"):
             try:
                 return self.secure_catalog(request)
             except sqlite3.Error:
