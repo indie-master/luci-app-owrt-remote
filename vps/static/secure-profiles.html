@@ -24,7 +24,7 @@ label{display:flex;flex-direction:column;gap:5px;font-size:14px}select,button{ba
 <p id="message" role="status"></p></section>
 <script>
 const get=id=>document.getElementById(id),router=get('router'),selects=['primary','fallback1','fallback2'].map(get);
-let routers=[],available=[],selectionToken=0;
+let routers=[],available=[],selectionToken=0,loaded=false,saving=false;
 function message(value,error=false){get('message').textContent=value;get('message').classList.toggle('error',error)}
 async function api(path,body){
  const opts={credentials:'same-origin',cache:'no-store'};
@@ -46,12 +46,12 @@ function fill(desired){
 }
 function check(){
  const vals=selects.map(s=>s.value),selected=vals.filter(Boolean);
- get('save').disabled=!router.value||!vals[0]||(!vals[1]&&!!vals[2])||new Set(selected).size!==selected.length;
+ get('save').disabled=!loaded||saving||!router.value||!vals[0]||(!vals[1]&&!!vals[2])||new Set(selected).size!==selected.length;
  for(const s of selects)for(const o of s.options)o.disabled=!!o.value&&selects.some(other=>other!==s&&other.value===o.value);
 }
 selects.forEach(s=>s.addEventListener('change',check));
 async function loadRouter(){
- const token=++selectionToken,id=router.value;get('save').disabled=true;
+ const token=++selectionToken,id=router.value;loaded=false;get('save').disabled=true;
  for(const s of selects)s.disabled=true;
  fill([]);get('save').disabled=true;message('');
  const current=routers.find(r=>r.id===id);
@@ -60,7 +60,7 @@ async function loadRouter(){
  try{
   const data=await api('/api/secure-profiles/router?router_id='+encodeURIComponent(id));
   if(token!==selectionToken)return;
-  available=data.available;fill(data.desired);
+  available=data.available;loaded=true;fill(data.desired);
   message(available.length?'Выбери опубликованные ревизии.':'Нет опубликованных профилей. Черновики пока не доступны для назначения.');
  }catch(err){if(token===selectionToken)message(String(err.message||err),true)}
  finally{if(token===selectionToken){for(const s of selects)s.disabled=false;check()}}
@@ -70,12 +70,12 @@ get('preferences').addEventListener('submit',async e=>{
  e.preventDefault();check();if(get('save').disabled)return;
  const id=router.value,token=selectionToken;
  const profiles=selects.map(s=>available.find(p=>key(p)===s.value)).filter(Boolean).map(p=>({profile_id:p.profile_id,revision:p.revision}));
- get('save').disabled=true;
+ saving=true;check();
  try{
   await api('/api/secure-profiles/select',{router_id:id,profiles});
   if(token===selectionToken)message('Желаемые профили сохранены. Настройки и работающие процессы роутера не изменены.');
  }catch(err){if(token===selectionToken)message(String(err.message||err),true)}
- finally{if(token===selectionToken)check()}
+ finally{saving=false;check()}
 });
 (async()=>{
  try{
