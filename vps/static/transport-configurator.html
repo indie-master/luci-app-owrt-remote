@@ -21,6 +21,9 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <label>Порт<input name="port" type="number" min="1" max="65535" value="18446" required></label>
 <label>Хост VPS для подключения роутера<input name="remote_host" value="router.example.org" maxlength="255"></label>
 <label>UUID роутера (необязательно; только для клиентского JSON)<input name="router_uuid" autocomplete="off" placeholder="UUID из карточки роутера"></label>
+<label>Роутер для теневого reverse-пилота<select name="router_id" id="router_id"><option value="">Без роутера — проверка схемы</option></select></label>
+<label>Тестовый LuCI-порт VPS<input name="admin_test_port" type="number" value="21080" min="1024" max="65535"></label>
+<label>Тестовый SSH-порт VPS<input name="ssh_test_port" type="number" value="22080" min="1024" max="65535"></label>
 <label data-field="server_name">SNI / домен<input name="server_name" value="router.example.org"></label>
 <label data-field="path">URL path<input name="path" value="/owrt-remote"></label>
 <label data-field="service_name">gRPC service name<input name="service_name" value="owrt_remote"></label>
@@ -39,13 +42,36 @@ const form=document.getElementById('editor'),output=document.getElementById('out
 const fields={tcp:[],wss:['server_name','path','certificate_file','key_file'],'reality-tcp':['server_name','target_host','target_port','short_ids','private_key','public_key'],xhttp:['server_name','path','certificate_file','key_file'],grpc:['server_name','service_name','certificate_file','key_file']};
 function refresh(){const allowed=new Set(fields[choice.value]);for(const label of form.querySelectorAll('[data-field]'))label.hidden=!allowed.has(label.dataset.field)}
 choice.addEventListener('change',refresh);refresh();
+(async()=>{
+ try{
+  const response=await fetch('/api/transports/routers',{credentials:'same-origin'});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Не удалось загрузить роутеры');
+  const dropdown=document.getElementById('router_id');
+  for(const router of result.routers){
+   const option=document.createElement('option');
+   option.value=router.id;
+   option.textContent=router.name+' ('+router.id+', '+router.transport+')';
+   dropdown.appendChild(option);
+  }
+ }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
+})();
 form.addEventListener('submit',async e=>{
  e.preventDefault();output.classList.remove('error');output.textContent='Проверка…';
  const values=Object.fromEntries(new FormData(form).entries());
  const data={name:values.name,port:Number(values.port),transport:values.transport};
  for(const key of fields[values.transport])data[key]=values[key];
  if(values.transport==='reality-tcp'){data.target_port=Number(values.target_port);data.short_ids=values.short_ids.split(',').map(x=>x.trim());data.server_names=[values.server_name]}
- try{const response=await fetch('/api/transports/preview',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({profiles:[data],router_uuid:values.router_uuid,remote_host:values.remote_host})});const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Ошибка');output.textContent=JSON.stringify({server:result.preview,routerOutbound:result.router_outbound||null,validatedByXray:result.validated_by_xray},null,2)}
+ try{
+ const isPilot=!!values.router_id;
+ const route=isPilot?'/api/transports/canary/preview':'/api/transports/preview';
+ const body={profiles:[data],router_uuid:values.router_uuid,remote_host:values.remote_host};
+ if(isPilot){body.router_id=values.router_id;body.admin_test_port=Number(values.admin_test_port);body.ssh_test_port=Number(values.ssh_test_port)}
+ const response=await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});
+ const result=await response.json();
+ if(!response.ok||!result.ok)throw Error(result.error||'Ошибка');
+ output.textContent=JSON.stringify(isPilot?{pilot:result.pilot,clientOutbounds:result.client_outbounds,validatedByXray:result.validated_by_xray,applied:false}:{server:result.preview,routerOutbound:result.router_outbound||null,validatedByXray:result.validated_by_xray},null,2)
+}
  catch(err){output.classList.add('error');output.textContent=String(err.message||err)}
 });
 </script></body></html>
