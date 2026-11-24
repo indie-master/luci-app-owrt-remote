@@ -207,6 +207,7 @@ def main():
                  "occupied_ports":occupied_ports(),"managed_routes":[],
                  "nginx_config_sha256":sha(raw),"proxy_protocol":proxy}
     validate_inventory(inventory)
+    print("AUDITED NGINX SHA256:",sha(raw))
     print("EXISTING SNI ROUTES:",len(routes)-1)
     print("DEFAULT:",routes["default"])
     print("OUTGOING PROXY PROTOCOL:","on" if proxy else "off")
@@ -229,7 +230,6 @@ def main():
         stream.write(b"# Router Orchestrator managed SNI entries (empty at onboarding)\n")
         stream.flush()
         os.fsync(stream.fileno())
-    replaced = False
     try:
         fd,temp = tempfile.mkstemp(prefix=".ro-ingress-test-",dir=MAIN.parent)
         try:
@@ -241,14 +241,16 @@ def main():
         if MAIN.read_bytes() != original or sha(dump()) != args.expected_sha256:
             raise ProfileError("nginx changed during preparation")
         atomic(MAIN,candidate,mode,(uid,gid))
-        replaced = True
         inventory["nginx_config_sha256"] = sha(dump())
         atomic(STORE/"ingress.json",json.dumps(inventory,indent=2).encode())
     except Exception:
-        if replaced and MAIN.read_bytes() == candidate:
+        actual = MAIN.read_bytes()
+        if actual == candidate:
             atomic(MAIN,original,mode,(uid,gid))
-        elif replaced:
+        elif actual != original:
             raise ProfileError("external nginx edit detected; retain backup and include for manual recovery")
+        # Do not leave an ownership inventory pointing to an absent include.
+        (STORE/"ingress.json").unlink(missing_ok=True)
         MANAGED.unlink(missing_ok=True)
         raise
     print("MANAGED INCLUDE:",MANAGED)
