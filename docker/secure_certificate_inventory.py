@@ -61,3 +61,43 @@ def find_certificate(hostname, pairs, *, roots, minimum_seconds=86400):
         except ProfileError:
             continue
     raise ProfileError("no valid matching certificate in approved inventory")
+
+MOUNTED_TLS = Path("/opt/router-orchestrator/tls")
+CONTAINER_TLS = Path("/etc/router-orchestrator/tls")
+
+
+def mounted_certificate(hostname, *, root=MOUNTED_TLS):
+    """Bounded discovery of certificate pairs already mounted into Xray.
+
+    Only root and immediate children of the dedicated mount are scanned.
+    External nginx certificates must first be provisioned in this directory
+    by a separate privileged import/renewal operation. No arbitrary host path
+    from the browser is read.
+    """
+    root = Path(root)
+    if not root.is_dir() or root.is_symlink():
+        raise ProfileError("dedicated TLS directory is unavailable")
+    folders = [root]
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                folders.append(Path(entry.path))
+                if len(folders) > 128:
+                    raise ProfileError("TLS inventory exceeds bounded scan limit")
+    name = domain(hostname)
+    folders.sort(key=lambda folder: (folder.name != name, folder != root, str(folder)))
+    pairs = []
+    for folder in folders:
+        for cert_name, key_name in (("fullchain.pem", "privkey.pem"), ("cert.pem", "key.pem")):
+            cert, key = folder / cert_name, folder / key_name
+            if cert.is_file() and key.is_file():
+                pairs.append((cert, key))
+    # Resolve paths for checking but retain mount-relative source names for Xray.
+    for cert, key in pairs:
+        try:
+            inspect_pair(name, cert, key, roots=[root])
+        except ProfileError:
+            continue
+        return {"certificate_file": str(CONTAINER_TLS / cert.relative_to(root)),
+                "key_file": str(CONTAINER_TLS / key.relative_to(root))}
+    raise ProfileError("no matching TLS certificate in dedicated mount; import required")
