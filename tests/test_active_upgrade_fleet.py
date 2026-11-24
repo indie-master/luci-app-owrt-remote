@@ -20,8 +20,29 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(set(baseline),{"main","netis"})
         self.assertTrue(baseline["netis"]["admin_ok"])
         self.assertFalse(baseline["netis"]["ssh_ok"])
-        with self.assertRaises(RuntimeError):
-            fleet.baseline_from(rows,["netis","offline"])
+        with self.assertRaisesRegex(RuntimeError,"unknown acknowledged router IDs"):
+            fleet.baseline_from(rows,["netis","typo"])
+        with self.assertRaisesRegex(RuntimeError,"netis"):
+            fleet.baseline_from(rows,["offline"])
+
+    def test_acknowledged_router_goes_stale_before_cutover(self):
+        rows={"main":row(),"PaxoBs":row(False,False,False)}
+        baseline=fleet.baseline_from(rows,["PaxoBs"])
+        self.assertIn("PaxoBs",baseline)
+        self.assertTrue(fleet.preserved(baseline["PaxoBs"],rows["PaxoBs"],2000))
+        self.assertFalse(fleet.preserved(baseline["PaxoBs"],None,2000))
+
+    def test_acknowledged_router_recovers_before_cutover(self):
+        rows={"main":row(),"PaxoBs":row()}
+        baseline=fleet.baseline_from(rows,["PaxoBs"])
+        self.assertTrue(baseline["PaxoBs"]["admin_ok"])
+        self.assertTrue(baseline["PaxoBs"]["ssh_ok"])
+        self.assertFalse(fleet.preserved(baseline["PaxoBs"],row(ssh=False),900))
+
+    def test_new_unreviewed_degradation_still_blocks(self):
+        rows={"main":row(),"PaxoBs":row(False,False,False),"netis":row(ssh=False)}
+        with self.assertRaisesRegex(RuntimeError,"netis"):
+            fleet.baseline_from(rows,["PaxoBs"])
 
     def test_every_working_channel_is_required_even_with_stale_heartbeat(self):
         baseline=fleet.baseline_from({"main":row(),"stale":row(recent=False)})
