@@ -112,6 +112,11 @@ verify_originals() {
         fi
     done
 }
+verify_installed() {
+    for rel in $FILES; do
+        [ "$(hash "/$rel")" = "$(hash "$S/stage/unpacked/payload/$rel")" ] || fail "installed digest: $rel"
+    done
+}
 replace_file() {
     src="$1"; dst="$2"; mode="$3"
     mkdir -p "$(dirname "$dst")"
@@ -242,8 +247,9 @@ worker)
     flock -u 9
     while :; do
         flock -x 9
-        if [ -f "$S/client.pending" ] && ! valid_window; then restore; exit 0; fi
-        if [ ! -f "$S/client.armed" ] && [ ! -f "$S/client.pending" ]; then exit 0; fi
+        if [ -f "$S/client.pending" ] && ! valid_window; then restore; fi
+        # Keep the supervised process idle until the operator stops it;
+        # exiting here would cause endless procd respawn after success.
         flock -u 9
         sleep 2
     done
@@ -254,9 +260,7 @@ confirm)
     valid_window || { restore; fail 'deadline expired'; }
     critical; verify_candidate "$(cat "$S/client.sha")"
     [ "$(xray_identity)" = "$(cat "$S/client.xray")" ] || fail 'Xray changed'
-    for rel in $FILES; do
-        [ "$(hash "/$rel")" = "$(hash "$S/stage/unpacked/payload/$rel")" ] || fail "installed digest: $rel"
-    done
+    verify_installed
     # Pending wins on boot even if interrupted after writing the result.
     mark client.result CONFIRMED_ON_DISK
     rm -f "$S/client.pending"
@@ -264,6 +268,16 @@ confirm)
     rm -f "$S/client.armed"
     sync
     say 'CONFIRMED ON DISK; runtime activation is separate'
+    ;;
+rollback-confirmed)
+    [ "$#" = 1 ] && [ ! -e "$S/client.pending" ] && [ ! -e "$S/client.armed" ] || fail 'active transaction'
+    [ "$(cat "$S/client.result")" = CONFIRMED_ON_DISK ] || fail 'not confirmed on disk'
+    [ "$(cat "$S/client.boot")" = "$(boot_id)" ] || fail 'boot changed; runtime recovery required'
+    [ "$(xray_identity)" = "$(cat "$S/client.xray")" ] || fail 'Xray changed; runtime recovery required'
+    verify_backup; critical; verify_candidate "$(cat "$S/client.sha")"; verify_installed
+    # Before mutation make manual recovery crash-recoverable as well.
+    mark client.pending yes
+    restore
     ;;
 rollback|boot-recover)
     restore
@@ -288,5 +302,5 @@ status)
     if ready; then say 'TWO WORKERS READY'; fi
     if supervised; then say 'PROCD SUPERVISION: PASS'; fi
     ;;
-*) fail 'arm | apply | confirm | rollback | reset-rolled-back | status | boot-recover | worker';;
+*) fail 'arm | apply | confirm | rollback | rollback-confirmed | reset-rolled-back | status | boot-recover | worker';;
 esac
