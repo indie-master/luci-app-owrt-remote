@@ -540,6 +540,11 @@ class Adapter:
         self.can_mutate(self.allow_apply)
         require(request.get("confirmed") is True,
                 "operator confirmation required")
+        from transport_profiles import require_secure_profile
+        profiles = request.get("profiles")
+        require(isinstance(profiles, list) and len(profiles) == 1,
+                "exactly one transport candidate required")
+        require_secure_profile(profiles[0])
         self.transport_canary_preview(request)
         queue = Path("/opt/router-orchestrator/data/transport-stage-queue")
         require(queue.is_dir() and not queue.is_symlink(), "stage queue not provisioned")
