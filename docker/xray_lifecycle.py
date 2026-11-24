@@ -128,11 +128,13 @@ def wait_healthy(attempts=30):
 def candidate_test(image):
     require(IMAGE_RE.fullmatch(image) is not None, "unapproved candidate image")
     image_id(image)
+    tls = ROOT / "tls"
+    mounts = ["-v", str(tls) + ":/etc/router-orchestrator/tls:ro"] if tls.is_dir() else []
     result = docker("run", "--rm", "--network", "none",
                     "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                     "-v", "/etc/xray:/etc/xray:ro",
                     "-v", "/usr/local/share/xray:/usr/local/share/xray:ro",
-                    image, "run", "-test",
+                    *mounts, image, "run", "-test",
                     "-config", "/etc/xray/owrt-remote.json", timeout=45)
     require(result.returncode == 0, "candidate Xray config test failed")
 
