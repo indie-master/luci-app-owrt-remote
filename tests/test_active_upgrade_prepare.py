@@ -36,6 +36,31 @@ class UpgradePreparationTests(unittest.TestCase):
                     self.assertEqual(backup.execute("SELECT id FROM routers").fetchone()[0],"netis")
             self.assertEqual(dst.stat().st_mode & 0o777,0o600)
 
+    def test_legacy_hold_snapshot_preserves_bytes_and_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hold=Path(tmp)/"hold"
+            self.assertIsNone(upgrade.hold_snapshot(hold))
+            hold.write_bytes(b"legacy protection")
+            hold.chmod(0o664)
+            before=upgrade.hold_snapshot(hold)
+            self.assertEqual(before[4],0o664)
+            self.assertEqual(before[-1],upgrade.digest(b"legacy protection"))
+            self.assertEqual(upgrade.hold_snapshot(hold),before)
+            self.assertEqual(hold.read_bytes(),b"legacy protection")
+            hold.chmod(0o600)
+            self.assertNotEqual(upgrade.hold_snapshot(hold),before)
+            hold.unlink()
+            hold.symlink_to(Path(tmp)/"missing")
+            with self.assertRaises(OSError):
+                upgrade.hold_snapshot(hold)
+
+    def test_non_regular_hold_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/"directory"
+            path.mkdir()
+            with self.assertRaises(RuntimeError):
+                upgrade.hold_snapshot(path)
+
     def test_private_artifacts_are_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/"manifest.json"
