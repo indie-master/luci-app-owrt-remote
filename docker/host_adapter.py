@@ -420,6 +420,33 @@ class Adapter:
                                    label=request.get("label"), remote_host=request.get("remote_host"),
                                    public_port=request.get("public_port"), occupied_ports=occupied)
                 return {"ok": True, "draft": draft}
+            if op == "secure.catalog.validate":
+                from secure_profile_store import load_artifact
+                from secure_certificate_inventory import inspect_pair
+                from secure_ingress import plan_ingress
+                artifact, digest, published = load_artifact(
+                    db, request.get("profile_id"), request.get("revision"))
+                profile = artifact["profile"]
+                original = CONFIG.read_bytes()
+                config = json.loads(original)
+                occupied = [item.get("port") for item in config.get("inbounds", [])
+                            if isinstance(item, dict) and type(item.get("port")) is int]
+                plan = plan_ingress(profile, public_port=artifact["public_port"],
+                                    occupied_ports=occupied)
+                if plan["requires_certificate"]:
+                    mount = Path("/etc/router-orchestrator/tls")
+                    host = Path("/opt/router-orchestrator/tls")
+                    cert = host / Path(profile["certificate_file"]).relative_to(mount)
+                    key = host / Path(profile["key_file"]).relative_to(mount)
+                    inspect_pair(profile["server_name"], cert, key, roots=[host])
+                result = self.transport_preview({"profiles": [profile],
+                                                 "expected_sha256": sha(original)})
+                return {"ok": True, "profile_id": profile["name"],
+                        "revision": request["revision"], "artifact_sha256": digest,
+                        "xray_validated": result["validated"],
+                        "certificate_validated": plan["requires_certificate"],
+                        "ingress_inventory_checked": False, "published": published,
+                        "applied": False}
             router_id = request.get("router_id")
             if op == "secure.catalog.preferences":
                 return {"ok": True, "desired": desired_profiles(db, router_id),
@@ -847,7 +874,7 @@ class Adapter:
         if op == "xray.preview":
             return self.xray_preview(request)
         if op in ("secure.catalog.list", "secure.catalog.draft",
-                  "secure.catalog.preferences", "secure.catalog.select"):
+                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate"):
             try:
                 return self.secure_catalog(request)
             except sqlite3.Error:
