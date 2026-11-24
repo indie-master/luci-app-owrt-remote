@@ -81,7 +81,7 @@ def read_pem(path, roots):
     # Every resolved ancestor must be trusted against non-root replacement.
     for parent in (resolved.parent, *resolved.parent.parents):
         info = parent.stat()
-        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        if info.st_uid != os.geteuid() or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
             raise ProfileError("untrusted certificate source directory")
     fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
@@ -120,7 +120,6 @@ def import_certificate(hostname, *, root=MOUNTED_TLS, pairs=None, roots=SOURCE_R
                 continue
             try:
                 os.rename(temp, destination)
-                sync_directory(root)
             except OSError:
                 # Existing slot must be identical. Never overwrite or follow
                 # a symlink placed at the content-addressed destination.
@@ -132,6 +131,7 @@ def import_certificate(hostname, *, root=MOUNTED_TLS, pairs=None, roots=SOURCE_R
                 if (read_pem(destination/"fullchain.pem",[root]) != cert_bytes
                         or read_pem(destination/"privkey.pem",[root]) != key_bytes):
                     raise ProfileError("existing TLS slot integrity mismatch")
+            sync_directory(root)
             return {"server_name":name,
                     "certificate_file":str(CONTAINER_TLS/slot/"fullchain.pem"),
                     "key_file":str(CONTAINER_TLS/slot/"privkey.pem"),
