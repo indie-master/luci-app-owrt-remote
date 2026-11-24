@@ -108,6 +108,7 @@ runtime_ok() {
        [.[1].outbounds[]|select(.tag=="router-admin" or .tag=="router-ssh")|.settings.redirect])
     ' "$S/backup/files$XRAY" "$XRAY" >/dev/null
 }
+request_reboot() { /sbin/reboot; }
 case "${1:-}" in
 arm)
     [ "$#" = 3 ] || fail 'arm ROUTER_ID BUNDLE_SHA256'
@@ -143,7 +144,7 @@ STOP=99
 boot() {
     local runner=/etc/router-orchestrator/upgrade/client-boot-trial.sh
     /bin/sh "$runner" boot-enter || return 1
-    [ "$(cat /etc/router-orchestrator/upgrade/boot-trial.phase)" = TRIAL ] || return 0
+    [ "$(cat /etc/router-orchestrator/upgrade/boot-trial.phase 2>/dev/null)" = TRIAL ] || return 0
     start
     for i in 1 2 3 4 5 6 7 8 9 10; do
         /bin/sh "$runner" ready && return 0
@@ -196,7 +197,7 @@ worker)
             # The candidate may already be running: reboot once into original
             # code after durable rollback. A second boot does not retry trial.
             sync
-            /sbin/reboot
+            request_reboot
         fi
         flock -u 9
         sleep 2
@@ -208,13 +209,22 @@ confirm)
     verify_installed
     [ "$(hash "$UCI")" = "$(cat "$S/stage/uci.sha256")" ] || fail 'UCI changed; manual review before acceptance'
     runtime_ok || fail 'runtime or reverse parity failed'
+    valid_window || fail 'deadline elapsed during verification'
     mark boot-trial.phase ACCEPTED
     say 'ACCEPTED: new boot and agent processes verified; caller must verify reverse access independently'
+    ;;
+cancel)
+    [ "$(phase)" = ARMED ] && [ "$(cat "$S/boot-trial.before")" = "$(boot_id)" ] || fail 'only an unstarted trial may be cancelled'
+    "$INIT" disable
+    [ ! -e "$BOOT" ] && [ ! -L "$BOOT" ] || fail 'boot hook still enabled'
+    rm -f "$INIT" "$S/boot-trial.phase" "$S/boot-trial.before"
+    sync
+    say 'unstarted trial cancelled; confirmed disk update retained'
     ;;
 status)
     say "PHASE=$(phase)"
     if workers_ready; then say 'WATCHDOGS: READY'; fi
     if runtime_ok; then say 'RUNTIME: PASS'; fi
     ;;
-*) fail 'arm | boot-enter | worker | ready | recover-before-start | confirm | status';;
+*) fail 'arm | boot-enter | worker | ready | recover-before-start | confirm | cancel | status';;
 esac
