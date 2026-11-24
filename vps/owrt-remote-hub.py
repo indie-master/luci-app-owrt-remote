@@ -8411,6 +8411,7 @@ function render(list) {{
         ${{sshButton}}
         ${{wolButton}}
         ${{logsButton}}
+        ${{authIsOwner() ? `<a class="btn" href="/secure-profiles/?router_id=${{encodeURIComponent(r.id)}}" target="_blank" rel="noopener noreferrer">Транспортные профили</a>` : ""}}
         ${{permissions.config ? `<a class="btn" href="${{escapeAttr(r.config_url)}}">OpenWrt config</a>` : '<span class="btn disabled">OpenWrt config</span>'}}
         ${{permissions.delete ? `<button class="btn" data-delete="${{escapeAttr(r.id)}}">Удалить</button>` : '<span class="btn disabled">Удалить</span>'}}
       </div>
@@ -8635,6 +8636,7 @@ render = function(list) {{
         ${{wolButton}}
         ${{notesButton}}
         ${{logsButton}}
+        ${{authIsOwner() ? `<a class="btn" href="/secure-profiles/?router_id=${{encodeURIComponent(r.id)}}" target="_blank" rel="noopener noreferrer">Транспортные профили</a>` : ""}}
         ${{permissions.config ? `<a class="btn" href="${{escapeAttr(r.config_url)}}">OpenWrt config</a>` : '<span class="btn disabled">OpenWrt config</span>'}}
         ${{permissions.delete ? `<button class="btn" data-delete="${{escapeAttr(r.id)}}">Удалить</button>` : '<span class="btn disabled">Удалить</span>'}}
       </div>
@@ -19180,6 +19182,40 @@ exit 127
 
     def do_GET(self):
         path = self.parsed().path
+        if path in ("/secure-profiles", "/secure-profiles/"):
+            if not self.require_owner():
+                return
+            source = Path(__file__).resolve().parent / "static" / "secure-profiles.html"
+            page = source.read_text(encoding="utf-8").replace(
+                "__TRANSPORT_CSRF__", html.escape(TRANSPORT_STAGE_ACTION_CSRF))
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
+        if path in ("/api/secure-profiles", "/api/secure-profiles/router"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                if path == "/api/secure-profiles":
+                    result = host_adapter_request("secure.catalog.list")
+                    with self.app.conn() as conn:
+                        rows = list_router_rows(conn)
+                    result["routers"] = [{"id": row_str_value(row, "id"),
+                                          "name": row_str_value(row, "name"),
+                                          "transport": row_str_value(row, "vps_transport", "tcp")}
+                                         for row in rows if not router_deleted(row)]
+                else:
+                    from urllib.parse import parse_qs
+                    query = parse_qs(self.parsed().query)
+                    router_id = query.get("router_id", [""])[0]
+                    with self.app.conn() as conn:
+                        row = get_active_router(conn, router_id)
+                    if not row:
+                        raise ValueError("active router not found")
+                    result = host_adapter_request("secure.catalog.preferences", {"router_id": router_id})
+                self.send_json(200, result)
+            except Exception:
+                self.send_json(400, {"ok": False, "error": "catalog unavailable or router not found"})
+            return
         if path in ("/transport-configurator", "/transport-configurator/"):
             if not self.require_owner():
                 return
@@ -19514,6 +19550,36 @@ exit 127
 
     def do_POST(self):
         path = self.parsed().path
+        if path in ("/api/secure-profiles/draft", "/api/secure-profiles/select"):
+            if not self.require_owner(json_mode=True):
+                return
+            if not secrets.compare_digest(self.headers.get("X-Transport-Action-CSRF", ""),
+                                           TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                if path.endswith("/draft"):
+                    result = host_adapter_request("secure.catalog.draft", {
+                        "profile": payload.get("profile"), "label": payload.get("label"),
+                        "remote_host": payload.get("remote_host"), "public_port": payload.get("public_port")})
+                else:
+                    router_id = payload.get("router_id")
+                    if not isinstance(router_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", router_id):
+                        raise ValueError("invalid router ID")
+                    with self.app.conn() as conn:
+                        row = get_active_router(conn, router_id)
+                    if not row:
+                        raise ValueError("active router not found")
+                    result = host_adapter_request("secure.catalog.select", {
+                        "router_id": router_id, "profiles": payload.get("profiles")})
+                self.send_json(200, result)
+            except (TypeError, ValueError, KeyError, RuntimeError, OSError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
         if path in {'/api/hub-update/check', '/api/hub-update/start'}:
             self.hub_update_api(path.rsplit('/', 1)[-1])
             return
