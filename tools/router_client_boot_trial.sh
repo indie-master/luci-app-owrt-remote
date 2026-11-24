@@ -30,7 +30,7 @@ critical_backup() {
         case "$name" in uci) dest="$UCI";; xray) dest="$XRAY";; esac
         original="$S/backup/files$dest"
         [ -f "$original" ] && [ ! -L "$original" ] &&
-        [ -f "$dest" ] && [ ! -L "$dest" ] &&
+        [ ! -L "$dest" ] && { [ ! -e "$dest" ] || [ -f "$dest" ]; } &&
         [ "$(hash "$original")" = "$(cat "$S/stage/$name.sha256")" ] ||
             fail "invalid $name recovery copy"
     done
@@ -44,6 +44,21 @@ verify_installed() {
         case "$rel" in usr/sbin/owrt-remote|usr/lib/owrt-remote/wan.sh|usr/lib/owrt-remote/logs.sh|etc/init.d/owrt-remote-logs|etc/init.d/owrt-remote|etc/hotplug.d/iface/99-owrt-remote|www/cgi-bin/owrt-remote|usr/share/luci/menu.d/luci-app-owrt-remote.json|usr/share/rpcd/acl.d/luci-app-owrt-remote.json|www/luci-static/resources/view/owrt_remote.js) ;; *) fail 'unexpected manifest path';; esac
         [ -f "/$rel" ] && [ ! -L "/$rel" ] && [ "$(hash "/$rel")" = "$digest" ] || fail "installed file changed: $rel"
     done < "$manifest"
+}
+verify_old_files() {
+    [ "$(wc -l < "$S/backup/present.txt")" = 10 ] &&
+    [ "$(wc -l < "$S/backup/original.sha256")" = 10 ] || fail 'invalid original inventory'
+    while read -r digest mode rel; do
+        presence="$(awk -v p="$rel" '$2==p {print $1}' "$S/backup/present.txt")"
+        old_hash="$(awk -v p="$rel" '$2==p {print $1}' "$S/backup/original.sha256")"
+        old="$S/backup/files/$rel"
+        case "$presence" in
+            1) [ -f "$old" ] && [ ! -L "$old" ] &&
+               [ "$(hash "$old")" = "$old_hash" ] || fail "original backup invalid: $rel";;
+            0) [ "$old_hash" = - ] && [ ! -e "$old" ] && [ ! -L "$old" ] || fail "invalid absent record: $rel";;
+            *) fail "invalid original record: $rel";;
+        esac
+    done < "$S/stage/unpacked/manifest.txt"
 }
 restore_critical() {
     # Arm explicitly reserves owrtremote UCI and its own Xray JSON for recovery.
@@ -113,11 +128,12 @@ case "${1:-}" in
 arm)
     [ "$#" = 3 ] || fail 'arm ROUTER_ID BUNDLE_SHA256'
     [ -z "$(phase)" ] && [ ! -e "$INIT" ] && [ ! -L "$INIT" ] && [ ! -e "$BOOT" ] && [ ! -L "$BOOT" ] || fail 'trial already exists'
+    [ -f "$TX" ] && [ ! -L "$TX" ] && sh -n "$TX" || fail 'disk recovery runner unavailable'
     [ "$(cat "$S/client.result")" = CONFIRMED_ON_DISK ] && [ ! -e "$S/client.pending" ] && [ ! -e "$S/client.armed" ] || fail 'client transaction not confirmed'
     [ "$(uci -q get owrtremote.main.router_id)" = "$2" ] && [ "$(cat "$S/stage/archive.sha256")" = "$3" ] || fail 'target or digest mismatch'
     [ "$(cat "$S/client.boot")" = "$(boot_id)" ] || fail 'client already rebooted'
     [ -z "$(uci -q changes owrtremote)" ] || fail 'uncommitted UCI changes'
-    critical_backup; verify_installed
+    critical_backup; verify_installed; verify_old_files
     [ "$(hash "$UCI")" = "$(cat "$S/stage/uci.sha256")" ] && [ "$(hash "$XRAY")" = "$(cat "$S/stage/xray.sha256")" ] || fail 'critical configuration changed since staging'
     [ -x /etc/init.d/owrt-remote ] && /etc/init.d/owrt-remote enabled || fail 'agent not enabled at boot'
     # Require a persistent executable or a verified compressed boot copy
