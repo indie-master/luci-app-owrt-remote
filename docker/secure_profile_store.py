@@ -165,6 +165,7 @@ def save_allocated_draft(db, *, profile, label, remote_host, public_port, occupi
     immediately before publication; external processes are not reserved here.
     """
     require_secure_profile(profile)
+    public_port = _port(public_port)
     if db.in_transaction:
         raise ProfileError("allocation requires an independent write transaction")
     db.execute("BEGIN IMMEDIATE")
