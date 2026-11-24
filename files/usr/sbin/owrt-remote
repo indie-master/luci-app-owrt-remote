@@ -820,6 +820,59 @@ transport_preflight() (
 )
 
 
+# Time-boxed, isolated Xray shadow reverse. Never modifies active UCI/procd.
+pilot_dir=/etc/router-orchestrator/transport-pilot
+pilot_matches() {
+	case "$1" in ""|*[!0-9]*) return 1 ;; esac
+	[ -r "/proc/$1/cmdline" ] || return 1
+	tr "\000" " " <"/proc/$1/cmdline" | grep -Fq "$pilot_dir/client.json"
+}
+pilot_stop() {
+	local pid
+	pid="$(cat "$pilot_dir/pid" 2>/dev/null || true)"
+	if pilot_matches "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+	rm -f "$pilot_dir/pid" "$pilot_dir/pending" "$pilot_dir/client.json"
+	rmdir "$pilot_dir" 2>/dev/null || true
+	printf 'TRANSPORT PILOT: STOPPED (primary unchanged)\n'
+}
+pilot_status() {
+	local pid
+	pid="$(cat "$pilot_dir/pid" 2>/dev/null || true)"
+	if pilot_matches "$pid"; then
+		printf 'TRANSPORT PILOT: RUNNING (primary unchanged)\n'
+	else
+		printf 'TRANSPORT PILOT: INACTIVE\n'
+	fi
+}
+pilot_start() (
+	umask 077
+	[ -n "$OWRT_REMOTE_CANDIDATE_TRANSPORT" ] || die "candidate transport missing"
+	[ -n "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" ] || die "candidate reverse tag missing"
+	[ -n "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" ] || die "candidate SSH reverse tag missing"
+	[ "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" != "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" ] || die "duplicate pilot tags"
+	[ "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" != "$(uci_get reverse_tag reverse-in)" ] || die "pilot would reuse current admin reverse tag"
+	[ "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" != "$(uci_get ssh_reverse_tag reverse-in-ssh)" ] || die "pilot would reuse current SSH reverse tag"
+	[ ! -L "$pilot_dir" ] || die "unsafe pilot directory"
+	[ ! -e "$pilot_dir/pending" ] || die "pilot already running"
+	mkdir -p "$pilot_dir" || return 1
+	chmod 700 "$pilot_dir" || return 1
+	local xray candidate pid
+	xray="$(xray_bin_path)"
+	candidate="$pilot_dir/client.json"
+	[ ! -e "$candidate" ] || die "stale pilot candidate exists"
+	render_client_config --stdout > "$candidate" || return $?
+	chmod 600 "$candidate" || return 1
+	validate_xray_config "$candidate" || { rm -f "$candidate"; return 1; }
+	printf "pending\n" > "$pilot_dir/pending"
+	nohup "$xray" run -config "$candidate" </dev/null >/dev/null 2>&1 &
+	pid=$!
+	printf "%s\n" "$pid" > "$pilot_dir/pid"
+	sleep 2
+	if ! pilot_matches "$pid"; then pilot_stop; die "pilot Xray failed to start"; fi
+	nohup sh -c 'sleep 180; /usr/sbin/owrt-remote transport-pilot-stop >/dev/null 2>&1' </dev/null >/dev/null 2>&1 &
+	printf 'TRANSPORT PILOT: STARTED (TTL=180s, primary unchanged)\n'
+)
+
 run_xray() {
 	local enabled xray_bin xray_config
 	enabled="$(uci_get enabled 0)"
@@ -2115,6 +2168,15 @@ case "$cmd" in
 		;;
 	transport-preflight)
 		transport_preflight || exit $?
+		;;
+	transport-pilot-start)
+		pilot_start || exit $?
+		;;
+	transport-pilot-stop)
+		pilot_stop || exit $?
+		;;
+	transport-pilot-status)
+		pilot_status || exit $?
 		;;
 	render-client)
 		xray_apply_trace render-client
