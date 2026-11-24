@@ -32,7 +32,7 @@ def tls_profile(transport):
 class TransportProfilesTest(unittest.TestCase):
     def test_supported(self):
         self.assertEqual(set(SUPPORTED),
-                         {"tcp", "tcp-tls", "wss", "reality-tcp", "xhttp", "grpc"})
+                         {"tcp", "tcp-tls", "wss", "reality-tcp", "xhttp", "grpc", "reality-xhttp", "reality-grpc"})
 
     def test_legacy_tcp(self):
         self.assertEqual(render_stream_settings({"transport": "tcp"}),
@@ -60,7 +60,7 @@ class TransportProfilesTest(unittest.TestCase):
         self.assertEqual(settings["network"], "tcp")
 
     def test_new_profiles_never_allow_plaintext(self):
-        self.assertEqual(set(module.SECURE_PROFILES), {"tcp-tls", "wss", "reality-tcp", "xhttp", "grpc"})
+        self.assertEqual(set(module.SECURE_PROFILES), {"tcp-tls", "wss", "reality-tcp", "xhttp", "grpc", "reality-xhttp", "reality-grpc"})
         for name in module.SECURE_PROFILES:
             module.require_secure_profile({"transport": name})
         for name in ("tcp", "none", "unknown"):
@@ -81,6 +81,33 @@ class TransportProfilesTest(unittest.TestCase):
                 self.assertEqual(stream["wsSettings"]["host"], "router.example.org")
         with self.assertRaises(ProfileError):
             render_stream_settings({"transport": "tcp-tls"})
+
+    def test_reality_http_transports_and_multi_sni(self):
+        for transport, network, field in (
+            ("reality-xhttp", "xhttp", "xhttpSettings"),
+            ("reality-grpc", "grpc", "grpcSettings"),
+        ):
+            p = {"name": "candidate", "port": 18550, "transport": transport,
+                 "server_name": "www.example.org",
+                 "server_names": ["www.example.org", "other.example.org"],
+                 "target_host": "www.example.org", "target_port": 443,
+                 "private_key": "PRIVATE_TEST_VALUE_NEVER_IN_CLIENT",
+                 "public_key": "A" * 43, "short_ids": ["aabb"],
+                 "path": "/reverse/", "service_name": "reverse"}
+            server = render_stream_settings(p)
+            self.assertEqual(server["network"], network)
+            self.assertEqual(server["security"], "reality")
+            self.assertEqual(server["realitySettings"]["serverNames"], p["server_names"])
+            client = render_router_outbound(p, router_uuid="550e8400-e29b-41d4-a716-446655440000",
+                                            remote_host="router.example.org")
+            stream = client["streamSettings"]
+            self.assertEqual(stream["network"], network)
+            self.assertEqual(stream["security"], "reality")
+            self.assertEqual(stream[field], server[field])
+            self.assertNotIn("PRIVATE_TEST_VALUE_NEVER_IN_CLIENT", str(client))
+            self.assertNotIn("tlsSettings", stream)
+            with self.assertRaises(ProfileError):
+                render_stream_settings(dict(p, server_names=["other.example.org"]))
 
     def test_reject_unknown(self):
         with self.assertRaises(ProfileError):
