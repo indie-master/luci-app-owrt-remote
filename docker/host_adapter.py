@@ -420,7 +420,7 @@ class Adapter:
                                    label=request.get("label"), remote_host=request.get("remote_host"),
                                    public_port=request.get("public_port"), occupied_ports=occupied)
                 return {"ok": True, "draft": draft}
-            if op == "secure.catalog.validate":
+            if op in ("secure.catalog.validate", "secure.catalog.plan"):
                 from secure_profile_store import load_artifact
                 from secure_certificate_inventory import inspect_pair
                 from secure_ingress import plan_ingress
@@ -439,6 +439,34 @@ class Adapter:
                     cert = host / Path(profile["certificate_file"]).relative_to(mount)
                     key = host / Path(profile["key_file"]).relative_to(mount)
                     inspect_pair(profile["server_name"], cert, key, roots=[host])
+                if op == "secure.catalog.plan":
+                    from secure_ingress_inventory import reviewed_inventory
+                    from secure_publication import build_publication, public_summary
+                    if published:
+                        raise Rejected("revision already published")
+                    inventory = reviewed_inventory()
+                    publication = build_publication(config, artifact, inventory,
+                        profile_id=request["profile_id"], revision=request["revision"])
+                    data = (json.dumps(publication["candidate"], ensure_ascii=False,
+                                       separators=(",", ":")) + "\n").encode()
+                    require(len(data) < MAX_REQUEST, "publication candidate exceeds size limit")
+                    fd, temp = tempfile.mkstemp(prefix=".ro-publication-preview-",
+                                                suffix=".json", dir=CONFIG.parent)
+                    try:
+                        with os.fdopen(fd, "wb") as stream:
+                            os.fchmod(stream.fileno(), 0o600)
+                            stream.write(data)
+                        validate_candidate_with_container(Path(temp))
+                    finally:
+                        Path(temp).unlink(missing_ok=True)
+                    require(CONFIG.read_bytes() == original,
+                            "Xray changed during publication planning")
+                    require(reviewed_inventory() == inventory,
+                            "nginx inventory changed during publication planning")
+                    return {"ok": True, **public_summary(publication),
+                            "artifact_sha256": digest, "xray_validated": True,
+                            "nginx_disk_inventory_checked": True,
+                            "live_listener_verified": False}
                 result = self.transport_preview({"profiles": [profile],
                                                  "expected_sha256": sha(original)})
                 return {"ok": True, "profile_id": profile["name"],
@@ -874,7 +902,7 @@ class Adapter:
         if op == "xray.preview":
             return self.xray_preview(request)
         if op in ("secure.catalog.list", "secure.catalog.draft",
-                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate"):
+                  "secure.catalog.preferences", "secure.catalog.select", "secure.catalog.validate", "secure.catalog.plan"):
             try:
                 return self.secure_catalog(request)
             except sqlite3.Error:
