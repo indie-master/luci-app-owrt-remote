@@ -36,6 +36,25 @@ Xray/HUB/nginx or edit the shared nginx configuration.
 
 Do not paste .env, auth state or secret keys into a public issue.
 
+## Refreshing a previously staged candidate
+
+The Belt candidate built at an earlier Git SHA is **not valid** after source
+changes. Before applying, fast-forward the dedicated worktree and rebuild
+the candidate safely, retaining the previous candidate in a private archive:
+
+```sh
+git -C /opt/router-orchestrator/release fetch origin \
+  refs/heads/feature/router-orchestrator-unified-docker-transports-20261123:refs/remotes/origin/feature/router-orchestrator-unified-docker-transports-20261123
+git -C /opt/router-orchestrator/src merge --ff-only \
+  refs/remotes/origin/feature/router-orchestrator-unified-docker-transports-20261123
+python3 /opt/router-orchestrator/src/deploy/refresh_belt_candidate.py
+```
+
+The preparer now saves both SQLite (online backup) and the other bounded
+persistent HUB state (tokens, authentication, Global Logs, preferences).
+Production containers are not modified. The guarded cutover refuses a
+candidate whose source SHA differs from the current Git worktree.
+
 ## Controlled cutover
 
 Only after the candidate image and backup are verified:
@@ -112,6 +131,15 @@ preview for TCP, WSS/TLS, REALITY/TCP, XHTTP/TLS and gRPC/TLS.
 It rejects duplicate/reserved ports, unsafe TLS paths, invalid UUIDs,
 and credential leakage. It calls the **current Docker Xray binary** in
 an isolated container to validate a proposed server listener.
+
+The configurator also loads the existing router fleet, generates a distinct
+shadow reverse proposal with separate loopback LuCI/SSH test ports, and allows
+an owner to run `owrt-remote transport-preflight` over SSH on a selected
+router. That check uses the installed OpenWrt Xray binary and NEVER changes
+its UCI settings or running tunnel. The router must first have the new agent
+version installed. Shadow listener staging, pilot promotion, and automatic
+router-side rollback are NOT yet implemented.
+
 
 **Applying a transport to a real router is intentionally disabled.**
 The current OpenWrt agent knows only TCP and WSS migrations. A new
