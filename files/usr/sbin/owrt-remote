@@ -674,7 +674,7 @@ render_client_config() (
 		fi
 	done
 	case "$vps_host" in *://*|*/*) die "vps_host должен содержать IP или домен без http(s):// и пути" ;; esac
-	case "$vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc) ;; *) die "vps_transport: неподдерживаемый транспорт" ;; esac
+	case "$vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc|reality-xhttp|reality-grpc) ;; *) die "vps_transport: неподдерживаемый транспорт" ;; esac
 	stream_fields='"network": "tcp", "security": "none"'
 	admin_rules=''
 	ssh_rules=''
@@ -691,11 +691,22 @@ render_client_config() (
 			case "$vps_ws_path" in *[!a-zA-Z0-9/._~-]*) die "Недопустимый vps_ws_path" ;; esac
 			stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
 			;;
-		reality-tcp)
+		reality-tcp|reality-xhttp|reality-grpc)
 			printf '%s\n' "$vps_reality_public_key" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{43}$' || die "REALITY: некорректный публичный ключ"
 			printf '%s\n' "$vps_reality_short_id" | LC_ALL=C grep -Eq '^[0-9a-fA-F]{0,16}$' || die "REALITY: некорректный shortId"
 			[ $((${#vps_reality_short_id} % 2)) -eq 0 ] || die "REALITY: shortId должен иметь чётную длину"
-			stream_fields="\"network\": \"tcp\", \"security\": \"reality\", \"realitySettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"fingerprint\": \"chrome\", \"publicKey\": \"$(json_escape "$vps_reality_public_key")\", \"shortId\": \"$(json_escape "$vps_reality_short_id")\"}"
+			stream_fields="\"network\": \"${vps_transport#reality-}\", \"security\": \"reality\", \"realitySettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"fingerprint\": \"chrome\", \"publicKey\": \"$(json_escape "$vps_reality_public_key")\", \"shortId\": \"$(json_escape "$vps_reality_short_id")\"}"
+			case "$vps_transport" in
+				reality-xhttp)
+					case "$vps_xhttp_path" in /*) ;; *) die "XHTTP: path должен начинаться с /" ;; esac
+					case "$vps_xhttp_path" in *[!a-zA-Z0-9/._~-]*) die "XHTTP: недопустимый path" ;; esac
+					stream_fields="$stream_fields, \"xhttpSettings\": {\"path\": \"$(json_escape "$vps_xhttp_path")\", \"mode\": \"auto\"}"
+					;;
+				reality-grpc)
+					printf '%s\n' "$vps_grpc_service" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,64}$' || die "gRPC: некорректное имя сервиса"
+					stream_fields="$stream_fields, \"grpcSettings\": {\"serviceName\": \"$(json_escape "$vps_grpc_service")\"}"
+					;;
+			esac
 			;;
 		xhttp)
 			case "$vps_xhttp_path" in /*) ;; *) die "XHTTP: path должен начинаться с /" ;; esac
