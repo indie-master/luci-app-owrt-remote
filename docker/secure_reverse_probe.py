@@ -26,7 +26,7 @@ def build_probe(profile, *, ingress_port, admin_port, ssh_port,
     require_secure_profile(profile)
     ports = [_port(p) for p in (profile["port"], ingress_port, admin_port,
                                 ssh_port, admin_target, ssh_target)]
-    if len(set(ports)) != len(ports) or min(ports) < 1024:
+    if len(set(ports)) != len(ports) or min(ports[0], *ports[2:]) < 1024:
         raise ProfileError("isolated probe ports must be distinct and unprivileged")
     if type(proxy_protocol) is not bool:
         raise ProfileError("invalid PROXY protocol flag")
