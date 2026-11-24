@@ -86,7 +86,24 @@ get('preferences').addEventListener('submit',async e=>{
    const item=document.createElement('div'),info=document.createElement('div'),name=document.createElement('strong'),detail=document.createElement('div'),state=document.createElement('span');
    item.className='item';name.textContent=p.label+' · rev '+p.revision;detail.className='muted';detail.textContent=p.transport+' · '+p.hostname+':'+p.public_port;
    state.className='state';state.textContent=p.published?'Опубликован':'Черновик';
-   info.append(name,detail);item.append(info,state);catalog.append(item);
+   info.append(name,detail);item.append(info,state);
+   if(!p.published){
+    const validate=document.createElement('button'),result=document.createElement('p');
+    validate.type='button';validate.textContent='Проверить';
+    result.className='muted';result.setAttribute('role','status');
+    validate.addEventListener('click',async()=>{
+     validate.disabled=true;result.textContent='Проверка сохранённой ревизии действующим ядром…';
+     try{
+      const check=await api('/api/secure-profiles/validate',{profile_id:p.profile_id,revision:p.revision});
+      result.textContent=(check.xray_validated?'Xray: PASS':'Xray: FAIL')+
+       (check.certificate_validated?' · Сертификат: PASS':'')+
+       ' · Внешний nginx не проверен. Профиль не опубликован.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{validate.disabled=false}
+    });
+    item.append(validate,result);
+   }
+   catalog.append(item);
   }
   if(!data.revisions.length)catalog.textContent='Пока нет профилей. Создай первый в конфигураторе.';
   for(const r of routers)router.appendChild(option(r.id,r.name+' · '+r.id));
