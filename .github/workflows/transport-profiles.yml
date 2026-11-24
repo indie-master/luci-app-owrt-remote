@@ -6,7 +6,9 @@ on:
       - 'docker/**'
       - 'deploy/**'
       - 'vps/**'
-      - 'tests/test_transport_profiles.py'
+      - 'tests/**'
+      - 'files/usr/lib/owrt-remote/logs.sh'
+      - 'files/usr/sbin/owrt-remote'
       - '.github/workflows/transport-profiles.yml'
   push:
     branches:
@@ -47,7 +49,7 @@ jobs:
           grep -Fq 'vps_transport" in tcp|ws|reality-tcp|xhttp|grpc)' files/usr/sbin/owrt-remote
       - name: Validate systemd worker and watchdog units
         run: |
-          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer deploy/systemd/router-orchestrator-transport-stage@.service
+          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer deploy/systemd/router-orchestrator-transport-stage@.service deploy/systemd/router-orchestrator-transport-rollback.service
       - name: Validate embedded nginx configuration
         run: |
           docker run --rm -v "$PWD/deploy/nginx/embedded.conf:/etc/nginx/nginx.conf:ro" nginx:1.29-alpine nginx -t
