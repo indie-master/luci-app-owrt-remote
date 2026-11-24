@@ -53,16 +53,16 @@ class CanaryContract(unittest.TestCase):
         import tempfile
         from unittest.mock import patch
         adapter = adapter_module.Adapter(allow_apply=True)
-        with patch.object(adapter, "can_mutate") as mutate, \\
+        with patch.object(adapter, "can_mutate") as mutate, \
              patch.object(adapter, "transport_stage_status",
-                          return_value={"phase": "STAGING", "router_id": "main"}), \\
+                          return_value={"phase": "STAGING", "router_id": "main"}), \
              patch.object(adapter_module.subprocess, "run") as launch:
             with self.assertRaises(adapter_module.Rejected):
                 adapter.transport_stage_rollback({"confirmed": True})
             launch.assert_not_called()
-        with patch.object(adapter, "can_mutate") as mutate, \\
+        with patch.object(adapter, "can_mutate") as mutate, \
              patch.object(adapter, "transport_stage_status",
-                          return_value={"phase": "STAGED", "router_id": "main"}), \\
+                          return_value={"phase": "STAGED", "router_id": "main"}), \
              patch.object(adapter_module.subprocess, "run") as launch:
             launch.return_value.returncode = 0
             with self.assertRaises(adapter_module.Rejected):
