@@ -1,10 +1,11 @@
+import contextlib
 import copy
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"docker"))
 import secure_publication_worker as worker
@@ -83,6 +84,96 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(worker.recover_locked(),"OTHER_MAINTENANCE")
                 tx.assert_not_called()
                 self.assertTrue(hold.exists())
+
+
+class WorkerIntegrationTests(unittest.TestCase):
+    def test_complete_worker_commit_and_cleanup_with_mock_host(self):
+        import secure_profile_store as store
+        import secure_profile_catalog as catalog
+        from secure_publication import encode
+        from secure_ingress_inventory import read_inventory
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            root=Path(tmp)
+            private=root/"private"
+            private.mkdir(mode=0o700)
+            (root/"src").symlink_to(Path(worker.__file__).resolve().parents[1],target_is_directory=True)
+            state=private/"publication"
+            inv=private/"ingress.json"
+            xray=root/"xray.json"
+            nginx=root/"managed.map"
+            hold=root/"hold"
+            original={"inbounds":[],"routing":{"rules":[]},"outbounds":[]}
+            xray.write_bytes(encode(original))
+            nginx.write_bytes(b"# empty\n")
+            inventory={"mode":"external-stream","public_port":443,
+                "allowed_names":["new.example.org"],"existing_routes":[],
+                "occupied_ports":[443],"managed_routes":[],
+                "nginx_config_sha256":"a"*64,"proxy_protocol":True}
+            inv.write_text(json.dumps(inventory))
+            inv.chmod(0o600)
+            with store.connection(private) as db:
+                store.save_draft(db,profile={"name":"test","transport":"tcp-tls","port":24001,
+                    "server_name":"new.example.org",
+                    "certificate_file":"/etc/router-orchestrator/tls/cert.pem",
+                    "key_file":"/etc/router-orchestrator/tls/key.pem"},
+                    label="Test",remote_host="new.example.org",public_port=443)
+                _,digest,_=store.load_artifact(db,"test",1)
+            def use_store():
+                return store.connection(private)
+            def dump(mode):
+                return "a"*64 if nginx.read_bytes()==b"# empty\n" else "b"*64
+            def live_ports():
+                return {443}|{i["port"] for i in json.loads(xray.read_bytes())["inbounds"]}
+            def docker(*args,**kwargs):
+                if args[0]=="ps":
+                    return b""
+                if args[0]=="run" and args[-1]=="version":
+                    return b"Xray 26.3.27\n"
+                self.fail("unexpected Docker command: "+args[0])
+            activations=[]
+            def activate(context):
+                doc=json.loads(xray.read_bytes())
+                activations.append(len(doc["inbounds"][0]["settings"]["clients"]))
+            def probe_start(image,name,label,config,probe_stack):
+                self.assertTrue(hold.exists())
+                self.assertEqual(len(json.loads(xray.read_bytes())["inbounds"][0]["settings"]["clients"]),2)
+                self.assertEqual(len([o for o in json.loads(config.read_text())["outbounds"] if o["protocol"]=="vless"]),2)
+            replacements={
+                "STORE":private,"STATE":state,"INVENTORY":inv,"CONFIG":xray,"MANAGED":nginx,
+                "connection":use_store,"run":lambda *a,**k:b"",
+                "docker":docker,"identity":lambda **k:{"id":"container","image":"sha256:"+"a"*64},
+                "capture_fleet":lambda:("mock-db",{"router":{"admin":19100,"ssh":19101}}),
+                "wait_fleet":lambda *a,**k:True,"check_profile":lambda a:None,
+                "check_identity":lambda *a,**k:None,"validate_config":lambda *a:None,
+                "reviewed_inventory":lambda:read_inventory(inv),"nginx_digest":dump,
+                "candidate_digest":lambda *a,**k:"b"*64,"live_tcp_ports":live_ports,
+                "activate":activate,"start_core":probe_start,"proof_matches":lambda *a:True,
+            }
+            for name,value in replacements.items():
+                stack.enter_context(patch.object(worker,name,value))
+            for name,value in {"ROOT":root,"TRANSPORT_HOLD":hold,"JOURNAL":root/"core.json"}.items():
+                stack.enter_context(patch.object(worker.life,name,value))
+            sockets=[]
+            for port in range(25401,25405):
+                sock=MagicMock()
+                sock.getsockname.return_value=("127.0.0.1",port)
+                sockets.append(sock)
+            stack.enter_context(patch.object(worker,"reserve",side_effect=sockets))
+            def proof(sock):
+                result=MagicMock()
+                result.port=sock.getsockname()[1]
+                return result
+            stack.enter_context(patch.object(worker,"Proof",side_effect=proof))
+            self.assertEqual(worker.publish("test",1,digest),"ACCEPTED")
+            self.assertEqual(activations,[2,0])
+            self.assertFalse(hold.exists())
+            self.assertFalse((state/"probe-client.json").exists())
+            self.assertEqual(json.loads((state/"pending.json").read_text())["phase"],"ACCEPTED")
+            self.assertEqual(len(read_inventory(inv)["managed_routes"]),1)
+            with store.connection(private) as db:
+                self.assertEqual(len(catalog.available_profiles(db)),1)
+                self.assertEqual(catalog.desired_profiles(db,"router"),[])
 
 
 class TrialJournalTests(unittest.TestCase):
