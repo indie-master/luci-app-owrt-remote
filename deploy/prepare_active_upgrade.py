@@ -98,7 +98,7 @@ def main():
     require(COMPOSE.is_symlink() and COMPOSE.resolve()==SRC/"deploy/docker-compose.yml",
             "unexpected active Compose layout")
     for path in (REPO,SRC):
-        require(not run("git","-C",str(path),"status","--porcelain","--untracked-files=no").strip(),
+        require(not run("git","-C",str(path),"status","--porcelain","--untracked-files=all").strip(),
                 "tracked source has edits")
     require(not (ROOT/"data/.xray-maintenance-hold").exists(),"maintenance already active")
     before=containers()
@@ -115,6 +115,7 @@ def main():
     require(Path(settings["RO_NGINX_CONF"])==SRC/"deploy/nginx/embedded.conf",
             "unexpected project nginx mode")
     tag="router-orchestrator-hub:unified-"+new_commit[:12]
+    require(tag != before["hub"]["tag"],"candidate tag is currently running")
     stage=Path(tempfile.mkdtemp(prefix="active-upgrade-"+new_commit[:12]+"-",dir=ROOT))
     print("PRIVATE CANDIDATE:",stage,flush=True)
     private_write(stage/"previous.env",old_env)
