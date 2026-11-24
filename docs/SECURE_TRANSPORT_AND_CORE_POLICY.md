@@ -358,3 +358,38 @@ commits. They require real deployment rehearsal and fault-injection tests.
 The Web publish job endpoint is intentionally not enabled yet. Current
 Belt lacks the production TLS mount; do not run the live publish command
 from a server-candidates checkout or bypass the mount gate.
+
+
+## Web publication queue and existing deployment upgrade
+
+The owner-only catalog now exposes a CSRF-protected publication job action
+after planning a sealed draft. A fixed privileged systemd job consumes one
+root-private job record. The browser supplies only the profile ID, revision,
+artifact digest and explicit maintenance confirmation. The job cannot run
+unless the root-private web-publication.enabled file contains exactly
+"enabled" followed by a newline. The marker must remain absent until
+production upgrade and controlled live acceptance are complete. No profile
+is assigned to a router by publication. UI shows the recorded job status;
+the owner can refresh status and reload the catalog after completion.
+Ambiguous or interrupted jobs block subsequent requests. Operator-only
+secure_publication_job.py reconcile verifies that the unit is inactive,
+the maintenance hold is absent and the transaction is terminal before
+clearing the queue gate; success additionally requires the matching
+published revision and accepted journal.
+
+deploy/prepare_active_upgrade.py is for the existing active unified stack,
+not the first installation. It builds a candidate HUB image from the
+detached server-candidates checkout and retains private env, Compose,
+Xray configuration, SQLite online backups and existing unit snapshots.
+It preserves the active Xray image reference and reports whether a
+recreation is required for the dedicated TLS mount. It refuses a dirty or
+unrelated candidate and checks that the active source, containers,
+environment and Xray configuration are unchanged after staging.
+
+This is preparation only. A controlled active-stack cutover with runtime
+fleet acceptance and rollback still must be implemented and tested.
+Do not enable the publication marker or run the original initial
+apply_belt.py on the already-active stack. The old runtime Xray has no TLS
+mount, so the eventual upgrade needs one planned Xray recreation while
+keeping the exact core image. Real live publication and hardware acceptance
+remain outstanding.
