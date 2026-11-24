@@ -42,6 +42,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_secure_publication_transaction.py' -v
           python -m unittest discover -s tests -p 'test_secure_ingress_inventory.py' -v
           python -m unittest discover -s tests -p 'test_secure_ingress_audit.py' -v
+          python -m unittest discover -s tests -p 'test_external_ingress_bootstrap.py' -v
           python -m unittest discover -s tests -p 'test_transport_canary.py' -v
           python -m unittest discover -s tests -p 'test_transport_stage_recovery.py' -v
           python -m unittest discover -s tests -p 'test_openwrt_transport_pilot.py' -v
