@@ -603,7 +603,7 @@ xray_reverse_finalrules_required() {
 }
 
 render_client_config() (
-	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir vps_transport vps_sni vps_ws_path stream_fields admin_rules ssh_rules
+	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir vps_transport vps_sni vps_ws_path vps_xhttp_path vps_grpc_service vps_reality_public_key vps_reality_short_id stream_fields admin_rules ssh_rules
 	temp_dir=""
 	out=""
 	trap 'rm -f "$out"; [ -z "$temp_dir" ] || rmdir "$temp_dir" 2>/dev/null || true' EXIT
@@ -619,6 +619,10 @@ render_client_config() (
 	vps_transport="$(uci_get vps_transport tcp)"
 	vps_sni="$(uci_get vps_sni "$vps_host")"
 	vps_ws_path="$(uci_get vps_ws_path /owrt-ws/)"
+	vps_xhttp_path="$(uci_get vps_xhttp_path /owrt-xhttp/)"
+	vps_grpc_service="$(uci_get vps_grpc_service owrt_remote)"
+	vps_reality_public_key="$(uci_get vps_reality_public_key '')"
+	vps_reality_short_id="$(uci_get vps_reality_short_id '')"
 	local wan_sockopt wan_xray_device
 	wan_sockopt=''
 	if truthy "$(uci_get wan_direct 0)"; then
@@ -657,16 +661,36 @@ render_client_config() (
 		fi
 	done
 	case "$vps_host" in *://*|*/*) die "vps_host должен содержать IP или домен без http(s):// и пути" ;; esac
-	case "$vps_transport" in tcp|ws) ;; *) die "vps_transport должен быть tcp или ws" ;; esac
+	case "$vps_transport" in tcp|ws|reality-tcp|xhttp|grpc) ;; *) die "vps_transport: неподдерживаемый транспорт" ;; esac
 	stream_fields='"network": "tcp", "security": "none"'
 	admin_rules=''
 	ssh_rules=''
-	if [ "$vps_transport" = ws ]; then
-		[ -n "$vps_sni" ] || die "WSS требует vps_sni"
+	if [ "$vps_transport" != tcp ]; then
+		[ -n "$vps_sni" ] || die "транспорт требует vps_sni"
 		case "$vps_sni" in *://*|*/*|*[!a-zA-Z0-9._-]*) die "Некорректный vps_sni" ;; esac
-		case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
-		stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
 	fi
+	case "$vps_transport" in
+		ws)
+			case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
+			case "$vps_ws_path" in *[!a-zA-Z0-9/._~-]*) die "Недопустимый vps_ws_path" ;; esac
+			stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
+			;;
+		reality-tcp)
+			printf '%s\n' "$vps_reality_public_key" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{43}$' || die "REALITY: некорректный публичный ключ"
+			printf '%s\n' "$vps_reality_short_id" | LC_ALL=C grep -Eq '^[0-9a-fA-F]{0,16}$' || die "REALITY: некорректный shortId"
+			[ $((${#vps_reality_short_id} % 2)) -eq 0 ] || die "REALITY: shortId должен иметь чётную длину"
+			stream_fields="\"network\": \"tcp\", \"security\": \"reality\", \"realitySettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"fingerprint\": \"chrome\", \"publicKey\": \"$(json_escape "$vps_reality_public_key")\", \"shortId\": \"$(json_escape "$vps_reality_short_id")\"}"
+			;;
+		xhttp)
+			case "$vps_xhttp_path" in /*) ;; *) die "XHTTP: path должен начинаться с /" ;; esac
+			case "$vps_xhttp_path" in *[!a-zA-Z0-9/._~-]*) die "XHTTP: недопустимый path" ;; esac
+			stream_fields="\"network\": \"xhttp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false}, \"xhttpSettings\": {\"path\": \"$(json_escape "$vps_xhttp_path")\", \"mode\": \"auto\"}"
+			;;
+		grpc)
+			printf '%s\n' "$vps_grpc_service" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,64}$' || die "gRPC: некорректное имя сервиса"
+			stream_fields="\"network\": \"grpc\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"h2\"]}, \"grpcSettings\": {\"serviceName\": \"$(json_escape "$vps_grpc_service")\"}"
+			;;
+	esac
 	if xray_reverse_finalrules_required; then
 		# Modern Xray blocks reverse-originated Freedom requests by default.
 		# Scope access to the exact LuCI/SSH redirect ports, on both transports.
