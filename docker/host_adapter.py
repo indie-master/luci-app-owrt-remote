@@ -623,8 +623,12 @@ class Adapter:
                 "seconds_remaining": max(0, expires - int(time.time()))}
 
     def transport_stage_rollback(self, request):
-        """Request an immediate fixed-unit rollback; never execute web input."""
-        self.can_mutate(self.allow_apply)
+        """Request an immediate fixed-unit rollback; never execute web input.
+
+        Recovery MUST remain possible while the shadow staging maintenance
+        hold exists and during the normal 120-second restart cooldown.
+        """
+        require(self.allow_apply, "transport rollback not approved")
         require(request.get("confirmed") is True,
                 "explicit confirmation required")
         stage = self.transport_stage_status()
