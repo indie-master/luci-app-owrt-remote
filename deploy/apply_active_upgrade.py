@@ -17,7 +17,7 @@ import sys
 import time
 
 from prepare_active_upgrade import (ROOT,SRC,REPO,ENV,COMPOSE,STORE,UNITS,
-    require,run,head,digest,parse_env,snapshot_db,containers,private_write)
+    require,run,head,digest,parse_env,replace_hub,snapshot_db,containers,private_write)
 sys.path.insert(0,str(REPO/"docker"))
 import xray_lifecycle as life
 from secure_publication_transaction import atomic,read_regular,sync_directory
@@ -92,13 +92,20 @@ def check_files(record):
         require(digest(path.read_bytes())==expected,"external configuration changed: "+path.name)
 
 
+def unit_exists(name):
+    return run("systemctl","show","-p","LoadState","--value",name,timeout=10).decode().strip() != "not-found"
+
+
 def stop_workers():
-    run("systemctl","stop",*TIMERS,timeout=30)
+    for timer in TIMERS:
+        if unit_exists(timer):
+            run("systemctl","stop",timer,timeout=30)
     # Stop the fixed timer services as well, so old code cannot run during
     # the source checkout. The common lifecycle lock is held by the caller.
     for timer in TIMERS:
         service=timer.removesuffix(".timer")+".service"
-        run("systemctl","stop",service,timeout=30)
+        if unit_exists(service):
+            run("systemctl","stop",service,timeout=30)
     check_quiescent()
 
 
@@ -183,8 +190,8 @@ def rollback(stage,record):
     # automatically. Old schema compatibility must be accepted by old HUB.
     db=Path(parse_env((stage/"previous.env").read_bytes())["RO_STATE_DIR"])/"hub.db"
     snapshot_db(db,stage/("hub-after-failure-"+str(time.time_ns())+".db"))
-    if service_state(TIMERS[2])!="not-found":
-        subprocess.run(["systemctl","disable","--now",TIMERS[2]],capture_output=True,timeout=30)
+    if not record["timers"][TIMERS[2]]["present"] and unit_exists(TIMERS[2]):
+        run("systemctl","disable","--now",TIMERS[2],timeout=30)
     clean_source()
     run("git","-C",str(SRC),"checkout","--detach",record["old_commit"],timeout=60)
     atomic(ENV,(stage/"previous.env").read_bytes())
@@ -192,10 +199,14 @@ def rollback(stage,record):
     run("systemctl","start",ADAPTER,timeout=30)
     # Old unified Compose already declares the TLS mount. Preserve the exact
     # old core image/config, not necessarily the old container ID/mount set.
-    if not life.active():
-        compose("up","-d","--no-deps","--no-build","--force-recreate","xray")
     require(life.image_id(parse_env(ENV.read_bytes())["RO_XRAY_IMAGE"])==record["old_xray_image"],
             "old Xray image digest changed")
+    require(life.image_id(parse_env(ENV.read_bytes())["RO_HUB_IMAGE"])==record["old_hub_image"],
+            "old HUB image digest changed")
+    if not life.active():
+        compose("up","-d","--no-deps","--no-build","--force-recreate","xray")
+    require(run("docker","inspect","--format","{{.Image}}",life.CONTAINER).decode().strip()==record["old_xray_image"],
+            "running Xray image differs from rollback image")
     compose("up","-d","--no-deps","--no-build","--force-recreate","hub")
     wait_ready(record)
     restart_timers(record,restore=True)
@@ -227,13 +238,18 @@ def apply(stage):
             "project nginx changes require separate migration")
     require((stage/"candidate-compose.yml").read_bytes()==(REPO/"deploy/docker-compose.yml").read_bytes(),
             "candidate compose changed")
-    require(parse_env((stage/"candidate.env").read_bytes())["RO_HUB_IMAGE"]==manifest["hub_image"],
+    require((stage/"previous.env").read_bytes()==ENV.read_bytes() and
+            (stage/"candidate.env").read_bytes()==replace_hub(ENV.read_bytes(),manifest["hub_image"]),
             "candidate env mismatch")
+    for unit in UNIT_NAMES:
+        dropins=UNITS/(unit+".d")
+        require(not dropins.exists() or not any(dropins.iterdir()),"unexpected systemd drop-in: "+unit)
     require(life.image_id(manifest["hub_image"])==manifest["hub_image_id"],"candidate image changed")
     life.candidate_test(parse_env(ENV.read_bytes())["RO_XRAY_IMAGE"])
     database,baseline=capture_fleet()
     record={"old_commit":manifest["old_commit"],"new_commit":manifest["new_commit"],
         "old_xray_image":manifest["containers"]["xray"]["image"],
+        "old_hub_image":manifest["containers"]["hub"]["image"],
         "xray_sha":digest(XRAY.read_bytes()),"map_sha":digest(NGINX.read_bytes()),
         "nginx_sha":digest(EXTERNAL_NGINX.read_bytes()),"started":int(time.time()),
         "fleet":{"database":database,"baseline":baseline},"timers":{}}
@@ -274,7 +290,8 @@ def apply(stage):
         release_hold()
         print("ACTIVE STACK UPGRADE: VERIFIED; WEB PUBLICATION DISABLED",flush=True)
     except BaseException:
-        rollback(stage,record)
+        if record["phase"] not in TERMINAL:
+            rollback(stage,record)
         raise
 
 
