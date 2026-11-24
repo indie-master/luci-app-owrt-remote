@@ -4,6 +4,8 @@ No real init service, reboot, Xray, UCI or network calls. The existing
 router_client_transaction suite separately exercises ten-file restoration.
 """
 import hashlib
+import io
+import tarfile
 import os
 from pathlib import Path
 import shutil
@@ -42,6 +44,7 @@ class BootTrialTests(unittest.TestCase):
         script = script.replace('$S/backup/files$dest', '$S/backup/files${dest#"$FIXTURE"}')
         script = script.replace('$S/backup/files$XRAY', '$S/backup/files${XRAY#"$FIXTURE"}')
         script = script.replace('"/$rel"', '"$FIXTURE/$rel"')
+        script = script.replace("dst=/usr/lib/owrt-remote/logs.sh", "dst=$FIXTURE/usr/lib/owrt-remote/logs.sh")
         script = script.replace('request_reboot() { /sbin/reboot; }',
                                 'request_reboot() { echo reboot >"$S/fake-reboot"; exit 0; }')
         marker = '\ncase "${1:-}" in\narm)'
@@ -63,6 +66,7 @@ verify_installed() { :; }
             'rm -f "$S/client.pending"\n')
         self.env = {**os.environ, "FIXTURE": str(self.root), "TEST_BOOT": "new",
                     "TEST_NOW": "100", "TEST_RUNTIME": "yes", "TEST_WORKERS": "yes"}
+        self.mark("stage/archive.sha256", "fixture-digest")
         self.mark("boot-trial.before", "old")
         self.mark("boot-trial.phase", "ARMED")
 
@@ -102,10 +106,11 @@ verify_installed() { :; }
     def test_expired_worker_restores_then_requests_one_reboot(self):
         self.call("boot-enter")
         self.call("worker", "primary", TEST_NOW="401")
-        self.assertEqual(self.current(), "ROLLED_BACK")
+        self.assertEqual(self.current(), "RESTORING")
         self.assertTrue((self.state / "fake-reboot").exists())
         (self.state / "fake-reboot").unlink()
         self.call("boot-enter", TEST_BOOT="next")
+        self.assertEqual(self.current(), "ROLLED_BACK")
         self.assertFalse((self.state / "fake-reboot").exists())
 
     def test_confirmation_requires_runtime_and_monitors_within_deadline(self):
@@ -118,6 +123,64 @@ verify_installed() { :; }
         self.assertEqual(self.current(), "ACCEPTED")
         self.call("boot-enter", TEST_BOOT="next")
         self.assertEqual(self.current(), "ACCEPTED")
+
+    def make_switch_fixture(self, other_change=False):
+        paths = [
+            "usr/sbin/owrt-remote", "usr/lib/owrt-remote/wan.sh",
+            "usr/lib/owrt-remote/logs.sh", "etc/init.d/owrt-remote-logs",
+            "etc/init.d/owrt-remote", "etc/hotplug.d/iface/99-owrt-remote",
+            "www/cgi-bin/owrt-remote", "usr/share/luci/menu.d/luci-app-owrt-remote.json",
+            "usr/share/rpcd/acl.d/luci-app-owrt-remote.json",
+            "www/luci-static/resources/view/owrt_remote.js",
+        ]
+        journal = paths[2]
+        old = {p: b"# old\n" for p in paths}
+        new = dict(old)
+        new[journal] = b"# new flock\n"
+        if other_change:
+            new[paths[0]] = b"# unwanted change\n"
+        def archive(path, payload):
+            manifest = "".join(f"{hashlib.sha256(data).hexdigest()} 0644 {rel}\n"
+                               for rel, data in payload.items()).encode()
+            with tarfile.open(path, "w") as t:
+                for name, data in [("manifest.txt", manifest)] + [
+                        ("payload/" + rel, data) for rel, data in payload.items()]:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    t.addfile(info, io.BytesIO(data))
+            return manifest, hashlib.sha256(path.read_bytes()).hexdigest()
+        for rel, data in old.items():
+            live = self.root / rel
+            live.parent.mkdir(parents=True, exist_ok=True)
+            live.write_bytes(data)
+        (self.state / "stage/unpacked").mkdir()
+        manifest, old_sha = archive(self.state / "stage/candidate.tar", old)
+        (self.state / "stage/unpacked/manifest.txt").write_bytes(manifest)
+        self.mark("stage/archive.sha256", old_sha)
+        _, next_sha = archive(self.state / "next-client.tar", new)
+        self.mark("boot-trial.next.sha", next_sha)
+        return self.root / journal, next_sha
+
+    def test_lock_protocol_switch_only_on_new_boot(self):
+        journal, sha = self.make_switch_fixture()
+        self.call("boot-enter", ok=False, TEST_BOOT="old")
+        self.assertEqual(journal.read_bytes(), b"# old\n")
+        self.call("boot-enter")
+        self.assertEqual(journal.read_bytes(), b"# new flock\n")
+        self.call("confirm")
+        self.assertEqual(self.current(), "ACCEPTED")
+        self.assertEqual((self.state / "boot-trial.accepted.sha").read_text().strip(), sha)
+
+    def test_switch_refuses_other_changed_files(self):
+        journal, _ = self.make_switch_fixture(other_change=True)
+        self.call("boot-enter", ok=False)
+        self.assertEqual(journal.read_bytes(), b"# old\n")
+        self.assertEqual(self.current(), "ROLLED_BACK")
+
+    def test_interrupted_switch_recovers_on_next_boot(self):
+        self.mark("boot-trial.phase", "SWITCHING")
+        self.call("boot-enter")
+        self.assertEqual(self.current(), "ROLLED_BACK")
 
 
 if __name__ == "__main__":
