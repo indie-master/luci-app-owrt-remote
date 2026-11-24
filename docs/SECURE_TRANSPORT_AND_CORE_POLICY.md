@@ -193,3 +193,31 @@ canary and baseline reachability checks. DNS aliases and REALITY target
 loop detection still require runtime checks. Do not enable publication
 until those gates are met. No production files or devices are mutated
 by the new planning endpoint.
+
+
+## Belt onboarding and draft reservation
+
+Belt onboarding at b94cb3b completed with 53 existing SNI mappings,
+55 reserved names (including HTTP vhosts), outgoing PROXY protocol on,
+an empty /etc/nginx/router-orchestrator-managed.map and no service reload.
+Default route 127.0.0.1:8443 and legacy listeners remain unchanged.
+This is disk onboarding, not live publication.
+
+New drafts use automatic loopback backend ports 24000–24999 by default
+(port 0 in the form). Explicit ports are checked against live TCP sockets,
+Xray listeners and all stored revision reservations. SQLite BEGIN IMMEDIATE
+serializes selection and insertion; the reservation does not bind a socket.
+Unused draft reclamation and in-place revision replacement are not yet
+implemented. Before applying, recheck live port ownership under the common
+publication lock.
+
+The owner can explicitly approve the exact SNI names of a sealed draft
+from the catalog. The approval only extends the reviewed private inventory
+after checking the current nginx digest, reserved routes, public port and
+live socket occupancy. No DNS record is created, no nginx file is changed,
+and no listener or router is activated. The future publication worker must
+also hold ingress.lock, revalidate ownership and verify REALITY target
+resolution (including self-referential aliases) before any activation.
+PROXY protocol is emitted only on server inbounds when the reviewed
+external listener sends it. Actual core/transport interoperability remains
+a live acceptance requirement.
