@@ -130,6 +130,34 @@ opkg() {
         self.assertIn('без загрузки из интернета', result.stderr)
         self.assert_clean()
 
+    def test_legacy_zip_cache_restores_softfloat_without_network(self):
+        data = self.make_binary("Xray legacy softfloat")
+        cached = self.cache(data)
+        legacy = self.store / ("Xray-linux-mips32le.zip." + hashlib.sha256(data).hexdigest() + ".gz")
+        cached.rename(legacy)
+        self.binary.unlink()
+        selected = self.runtime / "xray_softfloat"
+        self.config(enabled="1", wan_direct="0", xray_bin=selected.as_posix())
+        before = legacy.stat().st_mtime_ns
+        result = self.shell("ensure_xray_available",
+                            mocks='fetch_file() { echo forbidden-network >&2; return 99; }')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(selected.read_bytes(), data)
+        self.assertFalse(self.binary.exists())
+        self.assertEqual(legacy.stat().st_mtime_ns, before)
+        self.assertNotIn("forbidden-network", result.stderr)
+        self.assert_clean()
+
+    def test_ambiguous_cache_is_not_selected_arbitrarily(self):
+        data = self.make_binary()
+        self.cache(data)
+        another = b"#!/bin/sh\necho another\n"
+        (self.store / ("other." + hashlib.sha256(another).hexdigest() + ".gz")).write_bytes(gzip.compress(another))
+        self.binary.unlink()
+        result = self.shell("xray_cache_restore")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.binary.exists())
+
     def test_unchanged_binary_does_not_rewrite_flash(self):
         self.make_binary()
         self.assertEqual(self.shell('prepare_xray').returncode, 0)
