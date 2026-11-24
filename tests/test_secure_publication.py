@@ -43,6 +43,17 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn("private-fixture",str(public_summary(plan)))
         self.assertFalse(plan["published"])
 
+    def test_proxy_protocol_is_server_only_and_reality_target_allowed(self):
+        self.inventory["proxy_protocol"] = True
+        self.profile["target_host"] = self.profile["server_name"]
+        result = self.build()
+        self.assertEqual(result["candidate"]["inbounds"][-1]["streamSettings"]["sockopt"],
+                         {"acceptProxyProtocol": True})
+        self.assertNotIn("sockopt",self.profile)
+        self.inventory["proxy_protocol"] = "on"
+        with self.assertRaises(ProfileError):
+            self.build()
+
     def test_external_route_and_port_conflicts(self):
         self.inventory["existing_routes"].append({"public_port":443,"sni":"TARGET.example.org"})
         with self.assertRaises(ProfileError):
