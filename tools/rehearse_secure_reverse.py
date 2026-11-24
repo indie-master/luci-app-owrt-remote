@@ -175,11 +175,13 @@ def rehearsal(profile,image,version,proxy):
             +"stream { map $ssl_preread_server_name $backend { default \"\"; "+entries+" }\n"
             +"server { listen 127.0.0.1:"+str(ingress)+"; ssl_preread on; "
             +"proxy_protocol "+("on" if proxy else "off")+"; proxy_pass $backend; } }\n")
-        run(NGINX,"-t","-p",str(directory)+"/","-c",str(config))
+        # Retain the installed nginx prefix for relative load_module paths.
+        # All runtime files and listen sockets are nevertheless unique.
+        run(NGINX,"-e","stderr","-t","-c",str(config))
         for sock in reservations[:4]:
             sock.close()
         start_core(image,"ro-probe-"+label+"-server",label,directory/"server.json",stack)
-        process=subprocess.Popen([NGINX,"-p",str(directory)+"/","-c",str(config),"-g","daemon off;"],
+        process=subprocess.Popen([NGINX,"-e","stderr","-c",str(config),"-g","daemon off;"],
                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
         stack.callback(stop_nginx,process)
         start_core(image,"ro-probe-"+label+"-client",label,directory/"client.json",stack)
@@ -203,6 +205,10 @@ def main():
     if os.geteuid()!=0:
         raise ProfileError("root required")
     name=domain(args.sni)
+    available=next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
+                    if line.startswith("MemAvailable:")),0)
+    if available < 512*1024:
+        raise ProfileError("less than 512 MiB available RAM; isolated dual-core trial refused")
     modes=args.transport or ["tcp-tls","wss","xhttp","grpc"]
     if any(t in REALITY_PROFILES for t in modes) and not args.target:
         raise ProfileError("REALITY rehearsal requires an explicit target")
@@ -240,6 +246,10 @@ def main():
 
 
 if __name__=="__main__":
+    def interrupted(signum,frame):
+        raise SystemExit("REHEARSAL INTERRUPTED; cleaning up temporary processes")
+    signal.signal(signal.SIGTERM,interrupted)
+    signal.signal(signal.SIGHUP,interrupted)
     try:
         main()
     except (ProfileError,OSError,subprocess.SubprocessError) as exc:
