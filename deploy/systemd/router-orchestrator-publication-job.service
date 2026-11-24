@@ -1,0 +1,17 @@
+[Unit]
+Description=Router Orchestrator approved secure profile publication
+After=docker.service nginx.service router-orchestrator-host-adapter.service
+Requires=docker.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/src/docker/secure_publication_job.py
+RuntimeMaxSec=1850
+TimeoutStopSec=15
+KillMode=control-group
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
