@@ -1,0 +1,21 @@
+[Unit]
+Description=Router Orchestrator rollback active shadow transport pilot
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/src/docker/transport_stage.py rollback
+TimeoutStartSec=100
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/xray /opt/router-orchestrator/data /run/docker.sock /var/run/docker.sock
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+RestrictSUIDSGID=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal
