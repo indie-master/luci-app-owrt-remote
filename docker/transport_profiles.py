@@ -11,9 +11,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-SUPPORTED = ("tcp", "tcp-tls", "wss", "reality-tcp", "xhttp", "grpc")
+SUPPORTED = ("tcp", "tcp-tls", "wss", "reality-tcp", "xhttp", "grpc", "reality-xhttp", "reality-grpc")
 # "tcp" is the historical plaintext wire ID, not a new enrollment choice.
-SECURE_PROFILES = ("tcp-tls", "wss", "reality-tcp", "xhttp", "grpc")
+SECURE_PROFILES = ("tcp-tls", "wss", "reality-tcp", "xhttp", "grpc", "reality-xhttp", "reality-grpc")
+REALITY_PROFILES = ("reality-tcp", "reality-xhttp", "reality-grpc")
 
 
 def require_secure_profile(profile: dict) -> None:
@@ -82,7 +83,7 @@ def render_stream_settings(profile: dict[str, Any]) -> dict[str, Any]:
         return {"network": "tcp", "security": "none"}
 
     server_name = _host(_required_string(profile, "server_name"))
-    if transport == "reality-tcp":
+    if transport in REALITY_PROFILES:
         private_key = _required_string(profile, "private_key", maximum=128)
         public_dest = _host(_required_string(profile, "target_host"))
         target_port = _port(profile.get("target_port"))
@@ -93,19 +94,30 @@ def render_stream_settings(profile: dict[str, Any]) -> dict[str, Any]:
                     not _SHORT_ID_RE.fullmatch(item) for item in short_ids) or
                 len(set(short_ids)) != len(short_ids)):
             raise ProfileError("invalid short_ids")
-        if not profile.get("server_names") == [server_name]:
-            raise ProfileError("server_names must match the selected server_name")
-        return {
-            "network": "tcp", "security": "reality",
+        names = profile.get("server_names")
+        if (not isinstance(names, list) or not 1 <= len(names) <= 16
+                or any(not isinstance(n, str) or not n for n in names)
+                or len(set(names)) != len(names) or server_name not in names):
+            raise ProfileError("server_names must include the selected server_name")
+        for n in names:
+            _host(n)
+        settings = {
+            "network": transport.removeprefix("reality-"), "security": "reality",
             "realitySettings": {
                 "show": False,
                 "dest": f"{public_dest}:{target_port}",
                 "xver": 0,
-                "serverNames": [server_name],
+                "serverNames": names,
                 "privateKey": private_key,
                 "shortIds": short_ids
             }
         }
+        if transport == "reality-xhttp":
+            settings["xhttpSettings"] = {"path": _path(_required_string(profile, "path")), "mode": "auto"}
+        elif transport == "reality-grpc":
+            settings["grpcSettings"] = {"serviceName": _name(
+                _required_string(profile, "service_name", maximum=64), "service_name")}
+        return settings
 
     certificate = _required_string(profile, "certificate_file")
     key = _required_string(profile, "key_file")
@@ -194,12 +206,12 @@ def render_router_outbound(profile: dict[str, Any], *, router_uuid: str,
     name = _name(_required_string(profile, "name", maximum=64), "name")
     server = render_stream_settings(profile)
     transport = profile["transport"]
-    if transport == "reality-tcp":
+    if transport in REALITY_PROFILES:
         public_key = _required_string(profile, "public_key", maximum=80)
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", public_key):
             raise ProfileError("invalid REALITY public key")
         stream = {
-            "network": "tcp", "security": "reality",
+            "network": server["network"], "security": "reality",
             "realitySettings": {
                 "serverName": profile["server_name"],
                 "fingerprint": "chrome",
@@ -207,6 +219,9 @@ def render_router_outbound(profile: dict[str, Any], *, router_uuid: str,
                 "shortId": profile["short_ids"][0],
             },
         }
+        for field in ("xhttpSettings", "grpcSettings"):
+            if field in server:
+                stream[field] = dict(server[field])
     elif transport == "tcp":
         stream = {"network": "tcp", "security": "none"}
     else:
