@@ -1004,7 +1004,7 @@ class Adapter:
         if op == "xray.core.info":
             return {"ok": True, "active": active_xray(),
                     "image": docker_inspect_image(),
-                    "runtime": "docker"}
+                    "runtime": "docker", "maintenance_hold": HOLD.exists() or HOLD.is_symlink()}
         if op == "xray.core.start":
             return self.core_job_start(request)
         if op == "xray.core.job":
