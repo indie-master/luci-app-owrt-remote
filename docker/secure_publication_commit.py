@@ -6,7 +6,9 @@ be durable and bound to the exact private artifact and original inventory.
 """
 from __future__ import annotations
 
+import copy
 import json
+import re
 from pathlib import Path
 import secrets
 
@@ -18,16 +20,19 @@ from secure_publication_transaction import atomic, sha, read_regular
 from transport_profiles import ProfileError
 
 
-def binding_for(plan, inventory, *, profile_id, revision):
+def binding_for(plan, inventory, *, profile_id, revision, expected_nginx_digest):
     """Construct metadata before any file mutation, with no secret config."""
     catalog._identifier(profile_id)
     if type(revision) is not int or revision < 1:
         raise ProfileError("invalid revision")
     validate_inventory(inventory)
+    if not isinstance(expected_nginx_digest,str) or not re.fullmatch(r"[a-f0-9]{64}",expected_nginx_digest):
+        raise ProfileError("invalid prevalidated nginx candidate digest")
     return {"profile_id": profile_id, "revision": revision,
             "artifact_sha256": plan["artifact_sha256"],
-            "original_inventory": inventory,
-            "routes": plan["routes"], "tag": plan["tag"]}
+            "original_inventory": copy.deepcopy(inventory),
+            "routes": copy.deepcopy(plan["routes"]), "tag": plan["tag"],
+            "expected_nginx_digest":expected_nginx_digest}
 
 
 def finalize_publication(record, *, db, inventory_path, xray_path, nginx_path,
@@ -44,7 +49,7 @@ def finalize_publication(record, *, db, inventory_path, xray_path, nginx_path,
     binding = record.get("binding")
     if not isinstance(binding, dict) or set(binding) != {
         "profile_id", "revision", "artifact_sha256",
-        "original_inventory", "routes", "tag"
+        "original_inventory", "routes", "tag", "expected_nginx_digest"
     }:
         raise ProfileError("invalid publication binding")
     artifact, digest, published = load_artifact(db, binding["profile_id"], binding["revision"])
@@ -55,7 +60,8 @@ def finalize_publication(record, *, db, inventory_path, xray_path, nginx_path,
     combined = sorted(original["managed_routes"] + binding["routes"], key=lambda r:r["sni"])
     candidate = dict(original, managed_routes=combined)
     validate_inventory(candidate)
-    expected_map = "".join(f"{r['sni']} {r['upstream']};\n" for r in combined).encode()
+    from secure_ingress import domain
+    expected_map = "".join(f"{domain(r['sni'])} {r['upstream']};\n" for r in combined).encode()
     xray = read_regular(xray_path)[0]
     fragment = read_regular(nginx_path)[0]
     for name, data in (("xray",xray),("nginx",fragment)):
@@ -81,7 +87,9 @@ def finalize_publication(record, *, db, inventory_path, xray_path, nginx_path,
     routes = plan_ingress(artifact["profile"],public_port=artifact["public_port"])["routes"]
     if routes != binding["routes"]:
         raise ProfileError("accepted route differs from sealed profile")
-    candidate["nginx_config_sha256"] = nginx_digest(original["mode"])
+    candidate["nginx_config_sha256"] = binding["expected_nginx_digest"]
+    if nginx_digest(original["mode"]) != candidate["nginx_config_sha256"]:
+        raise ProfileError("nginx differs from prevalidated publication candidate")
     validate_inventory(candidate)
     current = read_inventory(Path(inventory_path))
     if current not in (original,candidate):
