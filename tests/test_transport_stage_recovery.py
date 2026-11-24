@@ -28,7 +28,7 @@ class ShadowStageRecoveryTest(unittest.TestCase):
                        "expires_unix": 1, "pilot": {"router_id": "main"}}
         self.backup.write_bytes(self.original)
         self.config.write_bytes(self.candidate)
-        self.hold.write_bytes(b"lock")
+        self.hold.write_bytes(b"shadow transport transaction\n")
         for key, value in (("ORIGINAL", self.backup), ("CONFIG", self.config),
                            ("STATE", self.journal), ("HOLD", self.hold)):
             patcher = patch.object(stage, key, value)
@@ -60,6 +60,15 @@ class ShadowStageRecoveryTest(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), b'{"other":true}')
         restart.assert_not_called()
         self.assertTrue(self.hold.exists())
+
+    def test_foreign_publication_hold_is_preserved(self):
+        self.hold.write_bytes(b"secure publication v1\n")
+        with patch.object(stage,"restart") as restart:
+            with self.assertRaisesRegex(RuntimeError,"belongs to another transaction"):
+                stage.rollback_impl(self.record)
+        self.assertEqual(self.config.read_bytes(),self.candidate)
+        self.assertEqual(self.hold.read_bytes(),b"secure publication v1\n")
+        restart.assert_not_called()
 
     def test_failed_recovery_leaves_hold_and_alarm(self):
         with patch.object(stage, "restart", side_effect=RuntimeError("Xray down")):
