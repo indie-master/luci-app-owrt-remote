@@ -51,16 +51,50 @@ def health(container):
     return response.returncode == 0 and response.stdout.strip() == "healthy"
 
 
+def wait_ready(predicate, timeout=180):
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(3)
+
+
 def check_new():
-    for _ in range(35):
-        if health("router-orchestrator-hub") and health("router-orchestrator-nginx"):
-            ready = run("curl", "--fail", "--silent", "--show-error",
-                        "--max-time", "3",
-                        "http://127.0.0.1:18089/healthz")
-            if ready.returncode == 0:
-                return True
-        time.sleep(1)
-    return False
+    def ready():
+        if not (health("router-orchestrator-hub") and
+                health("router-orchestrator-nginx")):
+            return False
+        result = run("curl", "--fail", "--silent", "--show-error",
+                     "--max-time", "3", "http://127.0.0.1:18089/healthz")
+        return result.returncode == 0
+    return wait_ready(ready)
+
+
+def save_diagnostics(filename):
+    # Preserve failure evidence BEFORE containers are removed/recreated.
+    # Logs may contain sensitive data: keep them in the private backup only.
+    try:
+        target = BACKUP / filename
+        with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT |
+                               os.O_EXCL, 0o600), "w") as out:
+            for container in ("router-orchestrator-hub",
+                              "router-orchestrator-nginx"):
+                for command in (
+                    ("docker", "inspect", "--format",
+                     "{{json .State}}", container),
+                    ("docker", "logs", "--tail", "100", container),
+                ):
+                    try:
+                        result = run(*command, timeout=10)
+                        out.write(" ".join(command) + "\n")
+                        out.write(result.stdout + result.stderr + "\n")
+                    except Exception as exc:
+                        out.write(type(exc).__name__ + "\n")
+        print("PRIVATE DIAGNOSTICS:", target, flush=True)
+    except Exception as exc:
+        print("DIAGNOSTICS WARNING:", type(exc).__name__, flush=True)
 
 
 def restore_file(path, backup_file, existed):
@@ -228,6 +262,8 @@ assert reply.get("ok") is True and reply.get("active") is True
 
     except BaseException as error:
         print("CUTOVER ERROR:", error, flush=True)
+        if live_changed:
+            save_diagnostics("failed-candidate.log")
         print("===== RESTORE OLD HUB AND HOST ADAPTER =====", flush=True)
         if live_changed:
             # Restore the root Compose entry point before reusing old overlays.
@@ -252,9 +288,26 @@ assert reply.get("ok") is True and reply.get("active") is True
         old = run("docker", "compose", "up", "-d", "--no-build",
                   "--no-deps", "--force-recreate", "hub",
                   cwd=RELEASE, timeout=180)
-        if old.returncode == 0 and health("router-orchestrator-hub"):
+        def old_ready():
+            image = run("docker", "inspect", "--format",
+                        "{{.Config.Image}}", "router-orchestrator-hub")
+            return (image.returncode == 0 and
+                    image.stdout.strip() == image_before and
+                    health("router-orchestrator-hub"))
+
+        old_hub_ok = old.returncode == 0 and wait_ready(old_ready)
+        adapter_ok = run("systemctl", "is-active", "--quiet",
+                         SYSTEMD).returncode == 0
+        current_xray = run("docker", "inspect", "--format",
+                           "{{.Id}}", "router-orchestrator-xray")
+        xray_ok = (current_xray.returncode == 0 and
+                   current_xray.stdout.strip() == xray_id)
+        if old_hub_ok and adapter_ok and xray_ok:
+            (BACKUP / "cutover-state").write_text("ROLLBACK_CONFIRMED\n")
             print("ROLLBACK TO OLD HUB: PASS")
         else:
+            (BACKUP / "cutover-state").write_text("ROLLBACK_UNCONFIRMED\n")
+            save_diagnostics("failed-rollback.log")
             print("CRITICAL: old HUB rollback not confirmed", flush=True)
         raise
 
