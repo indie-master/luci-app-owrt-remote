@@ -404,6 +404,31 @@ class Adapter:
                 "restart_performed": False, "apply_performed": False,
                 "candidate_sha256": sha(data)}
 
+    def secure_catalog(self, request):
+        from secure_profile_store import connection, save_draft, list_revisions
+        from secure_profile_catalog import available_profiles, desired_profiles, set_desired_profiles
+        op = request["op"]
+        with connection() as db:
+            if op == "secure.catalog.list":
+                return {"ok": True, "revisions": list_revisions(db),
+                        "available": available_profiles(db)}
+            if op == "secure.catalog.draft":
+                config = json.loads(CONFIG.read_bytes())
+                occupied = [item.get("port") for item in config.get("inbounds", [])
+                            if isinstance(item, dict) and type(item.get("port")) is int]
+                draft = save_draft(db, profile=request.get("profile"),
+                                   label=request.get("label"), remote_host=request.get("remote_host"),
+                                   public_port=request.get("public_port"), occupied_ports=occupied)
+                return {"ok": True, "draft": draft}
+            router_id = request.get("router_id")
+            if op == "secure.catalog.preferences":
+                return {"ok": True, "desired": desired_profiles(db, router_id),
+                        "available": available_profiles(db), "applied": False}
+            if op == "secure.catalog.select":
+                set_desired_profiles(db, router_id, request.get("profiles"))
+                return {"ok": True, "desired": desired_profiles(db, router_id), "applied": False}
+            raise Rejected("unsupported catalog operation")
+
     def transport_preview(self, request):
         """Pure preview: no config write or live Xray restart.
 
@@ -821,6 +846,9 @@ class Adapter:
             return self.current()
         if op == "xray.preview":
             return self.xray_preview(request)
+        if op in ("secure.catalog.list", "secure.catalog.draft",
+                  "secure.catalog.preferences", "secure.catalog.select"):
+            return self.secure_catalog(request)
         if op == "xray.transport.preview":
             return self.transport_preview(request)
         if op == "xray.transport.canary.preview":
