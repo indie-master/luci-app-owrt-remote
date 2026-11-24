@@ -374,6 +374,9 @@ active_ssh_session() {
 xray_bin_path() {
 	local configured candidate
 	configured="$(uci_get xray_bin /usr/bin/xray)"
+	# A content-addressed persistent executable is an explicit operator pin.
+	# Never select an unrelated RAM or system binary when that pin is missing.
+	case "$configured" in /etc/owrt-remote/xray-boot/xray-*) printf '%s' "$configured"; return;; esac
 	if [ -x "$configured" ]; then
 		printf '%s' "$configured"
 		return
@@ -505,8 +508,18 @@ install_package() {
 }
 
 ensure_xray_available() {
-	local configured candidate found
+	local configured candidate found pinned
 	configured="$(uci_get xray_bin /usr/bin/xray)"
+	case "$configured" in
+		/etc/owrt-remote/xray-boot/xray-*)
+			pinned="${configured##*/xray-}"
+			case "$pinned" in ''|*[!0-9a-f]*) log 'Xray: некорректный SHA256 закреплённого ядра'; return 1;; esac
+			[ "${#pinned}" = 64 ] && [ -f "$configured" ] && [ ! -L "$configured" ] && [ -x "$configured" ] &&
+				[ "$(xray_digest "$configured")" = "$pinned" ] ||
+				{ log 'Xray: закреплённое ядро отсутствует или повреждено; автоматическая смена версии запрещена'; return 1; }
+			return 0
+			;;
+	esac
 	[ -x "$configured" ] && return 0
 
 	for candidate in /usr/bin/xray /usr/bin/xray-core /usr/local/bin/xray /opt/bin/xray /tmp/owrt-xray/xray /tmp/xray; do
