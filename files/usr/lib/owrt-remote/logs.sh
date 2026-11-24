@@ -61,12 +61,15 @@ EOF
 	# A tmpfs/root overlay and an unmounted /overlay are never persistent storage.
 	[ "$mount" != /overlay ] || [ -d /overlay ]
 }
-log_init() {
-	local candidate selected mount fs flags free
+log_runtime_init() {
 	umask 077
 	log_ram_storage || { printf 'Remote: runtime directory must be tmpfs.\n' >&2; return 1; }
 	mkdir -p "$RUN_DIR" || return 1
 	chmod 700 "$RUN_DIR" || return 1
+}
+log_init() {
+	local candidate selected mount fs flags free
+	# Storage selection runs only after acquiring the journal lock.
 	# Pin one storage choice for this boot; never interleave two journal IDs.
 	selected="$(cat "$RUN_DIR/storage" 2>/dev/null)"
 	if [ -n "$selected" ]; then
@@ -106,7 +109,7 @@ EOF
 }
 log_lock() {
 	local attempt owner
-	log_init || return 1
+	log_runtime_init || return 1
 	attempt=0
 	while ! mkdir "$RUN_DIR/lock" 2>/dev/null; do
 		owner="$(cat "$RUN_DIR/lock/pid" 2>/dev/null)"
@@ -119,12 +122,13 @@ log_lock() {
 		attempt=$((attempt + LOG_PAUSE_TENTHS)); [ "$attempt" -lt 100 ] || { log_diag lock-timeout; return 1; }
 	done
 	log_self_pid >"$RUN_DIR/lock/pid"
-	# Another first writer may have selected storage while we waited.
-	if [ -s "$RUN_DIR/storage" ]; then
-		LOG_DIR="$(cat "$RUN_DIR/storage")"
-		[ "$LOG_DIR" != "$RUN_DIR/fallback" ] || { PERSISTENT=0; LOG_LIMIT=65536; LOG_PART_LIMIT=8; }
-	else
-		printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage"
+	# Initialize storage and all associated limits together under the lock.
+	# A losing first writer must never carry a stale RAM-fallback flag.
+	log_init || { log_unlock; return 1; }
+	if [ ! -s "$RUN_DIR/storage" ]; then
+		printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage.new" &&
+			mv -f "$RUN_DIR/storage.new" "$RUN_DIR/storage" ||
+			{ log_unlock; return 1; }
 	fi
 	# Change storage only under the same append/export lock. On write/mount
 	# failure preserve the Flash queue and switch this boot to a bounded fallback.
@@ -172,7 +176,8 @@ log_reap_lock() {
 log_fallback_locked() {
 	LOG_DIR="$RUN_DIR/fallback"; PERSISTENT=0; LOG_LIMIT=65536; LOG_PART_LIMIT=8
 	mkdir -p "$LOG_DIR" || return 1
-	printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage"
+	printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage.new" &&
+		mv -f "$RUN_DIR/storage.new" "$RUN_DIR/storage" || return 1
 	rm -f "$RUN_DIR/recovered" "$RUN_DIR/recovered-v2" "$RUN_DIR/ack"
 }
 log_unlock() { rm -f "$RUN_DIR/lock/pid"; rmdir "$RUN_DIR/lock" 2>/dev/null || true; }
