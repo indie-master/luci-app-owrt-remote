@@ -12,12 +12,12 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 .note{border-left:3px solid #c8a661;padding:10px 14px;background:#26251d}.error{color:#ffaaa9}
 </style></head><body data-csrf="__TRANSPORT_CSRF__" data-stage-enabled="__TRANSPORT_STAGE_ENABLED__">
 <header><div><h1>Конфигуратор транспортов</h1><div class="muted">Router Orchestrator · Preview-only</div></div><a href="/">← HUB</a></header>
-<div class="note">Сейчас генератор только проверяет параметры и показывает безопасный предварительный результат. Применение к роутерам и замена действующих туннелей отключены до появления транзакционного переключения с откатом.</div>
+<div class="note">Новые профили требуют TLS или REALITY. Незашифрованный TCP сохраняется только для ранее подключённых устройств. Сейчас генератор проверяет параметры и показывает безопасный предварительный результат. Применение к роутерам и замена действующих туннелей отключены до появления транзакционного переключения с откатом.</div>
 <form class="panel" id="editor">
 <h2>Новый транспорт управления</h2>
 <div class="grid">
 <label>Название профиля<input name="name" value="pilot-transport" maxlength="64" required></label>
-<label>Транспорт<select name="transport" id="transport"><option value="tcp">TCP Legacy</option><option value="wss">WSS / TLS</option><option value="reality-tcp">TCP / REALITY</option><option value="xhttp">XHTTP / TLS</option><option value="grpc">gRPC / TLS</option></select></label>
+<label>Транспорт<select name="transport" id="transport"><option value="tcp-tls">TCP / TLS</option><option value="wss">WSS / TLS</option><option value="reality-tcp">TCP / REALITY</option><option value="xhttp">XHTTP / TLS</option><option value="grpc">gRPC / TLS</option></select></label>
 <label>Порт<input name="port" type="number" min="1" max="65535" value="18446" required></label>
 <label>Хост VPS для подключения роутера<input name="remote_host" value="router.example.org" maxlength="255"></label>
 <label>UUID роутера (необязательно; только для клиентского JSON)<input name="router_uuid" autocomplete="off" placeholder="UUID из карточки роутера"></label>
@@ -47,7 +47,7 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <div class="panel"><h2>Результат проверки</h2><pre id="output" aria-live="polite">Выбери транспорт и нажми «Проверить».</pre></div>
 <script>
 const form=document.getElementById('editor'),output=document.getElementById('output'),choice=document.getElementById('transport');
-const fields={tcp:[],wss:['server_name','path','certificate_file','key_file'],'reality-tcp':['server_name','target_host','target_port','short_ids','private_key','public_key'],xhttp:['server_name','path','certificate_file','key_file'],grpc:['server_name','service_name','certificate_file','key_file']};
+const fields={'tcp-tls':['server_name','certificate_file','key_file'],wss:['server_name','path','certificate_file','key_file'],'reality-tcp':['server_name','target_host','target_port','short_ids','private_key','public_key'],xhttp:['server_name','path','certificate_file','key_file'],grpc:['server_name','service_name','certificate_file','key_file']};
 function refresh(){const allowed=new Set(fields[choice.value]);for(const label of form.querySelectorAll('[data-field]'))label.hidden=!allowed.has(label.dataset.field)}
 choice.addEventListener('change',refresh);refresh();
 (async()=>{
