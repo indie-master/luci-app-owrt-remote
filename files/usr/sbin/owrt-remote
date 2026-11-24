@@ -1732,7 +1732,11 @@ xray_cache_save() (
 	digest="$(xray_digest "$bin")" || return 1
 	target="$store/$asset.$digest.gz"
 	# An existing valid copy requires no Flash writes, including after reboot.
-	if [ -s "$target" ] && gzip -t "$target" 2>/dev/null; then return 0; fi
+	# Recognize an identical cache regardless of the old release asset prefix.
+	for cached in "$store/"*."$digest".gz; do
+		[ -f "$cached" ] && [ ! -L "$cached" ] && [ -s "$cached" ] || continue
+		if gzip -t "$cached" 2>/dev/null; then return 0; fi
+	done
 	umask 077
 	mkdir -p "$store" || return 1
 	chmod 700 "$store" || return 1
@@ -1762,31 +1766,41 @@ xray_cache_save() (
 )
 xray_cache_restore() (
 	store="$(xray_cache_dir)" || return 1
-	asset="$(xray_release_asset)" || return 1
 	dir="$(xray_runtime_dir)"; mkdir -p "$dir" || return 1
+	# A confirmed local boot copy may have been produced by an older agent,
+	# a different release provider, or a manually selected softfloat binary.
+	# The archive filename's release asset is not the binary's identity.
+	# Recover only an unambiguous cache, never choose an arbitrary version.
+	count=0; cache=''
+	for item in "$store/"*.gz; do
+		[ -f "$item" ] && [ ! -L "$item" ] && [ -s "$item" ] || continue
+		count=$((count+1)); cache="$item"
+	done
+	[ "$count" = 1 ] || { [ "$count" = 0 ] || log 'Xray: несколько загрузочных копий; требуется явный выбор'; return 1; }
+	name="${cache##*/}"; digest="${name%.gz}"; digest="${digest##*.}"
+	case "$digest" in ''|*[!0-9a-f]*) return 1;; esac
+	[ "${#digest}" = 64 ] && [ "$(wc -c <"$cache")" -le 16777216 ] || return 1
+	configured="$(uci_get xray_bin /usr/bin/xray)"
+	case "$configured" in
+		"$dir/xray"|"$dir/xray_softfloat") target="$configured";;
+		*) target="$dir/xray";;
+	esac
 	temp="$(mktemp "$dir/.restore.XXXXXX")" || return 1
 	trap 'rm -f "$temp"' EXIT
 	trap 'exit 1' INT TERM
-	for cache in "$store/$asset."*.gz; do
-		[ -s "$cache" ] || continue
-		[ "$(wc -c <"$cache")" -le 16777216 ] || continue
-		digest="${cache#"$store/$asset."}"; digest="${digest%.gz}"
-		case "$digest" in ''|*[!0-9a-f]*) continue ;; esac
-		[ "${#digest}" = 64 ] || continue
-		# Bound even an invalid compressed file; verify bytes before execution.
-		gzip -t "$cache" 2>/dev/null || { log 'Xray: повреждён постоянный кэш; требуется повторная загрузка'; continue; }
-		gzip -dc "$cache" | head -c 67108865 >"$temp"
-		size="$(wc -c <"$temp")"
-		[ "$size" -le 67108864 ] && [ "$(xray_digest "$temp")" = "$digest" ] || continue
-		chmod 755 "$temp" && "$temp" version >/dev/null 2>&1 || continue
-		mv -f "$temp" "$dir/xray" || return 1
-		if [ "$(uci_get xray_bin '')" != "$dir/xray" ]; then
-			uci set "$CONFIG.$SECTION.xray_bin=$dir/xray" && uci commit "$CONFIG" || return 1
-		fi
-		log 'Xray: восстановлен из постоянного кэша без загрузки из интернета'
-		return 0
-	done
-	return 1
+	# One bounded decompression; the full executable hash detects truncated
+	# or corrupted output before execution. Do not decompress twice at boot.
+	gzip -dc "$cache" | head -c 67108865 >"$temp"
+	size="$(wc -c <"$temp")"
+	[ "$size" -gt 0 ] && [ "$size" -le 67108864 ] &&
+		[ "$(xray_digest "$temp")" = "$digest" ] || { log 'Xray: повреждена загрузочная копия'; return 1; }
+	chmod 755 "$temp" && "$temp" version >/dev/null 2>&1 || return 1
+	mv -f "$temp" "$target" || return 1
+	if [ "$configured" != "$target" ]; then
+		uci set "$CONFIG.$SECTION.xray_bin=$target" && uci commit "$CONFIG" || return 1
+	fi
+	log 'Xray: восстановлен из постоянного кэша без загрузки из интернета'
+	return 0
 )
 
 # Keep a finite wait even without BusyBox's optional timeout applet. The
