@@ -2120,6 +2120,9 @@ run_xray() {
 	# Missing WAN is a temporary condition, not a failed Xray configuration.
 	# Stay supervised instead of exhausting procd's six startup attempts.
 	wait_for_selected_wan || return 1
+	# After a reboot the transient pilot process is gone. Reap stale state
+	# before starting the primary procd Xray; never promote implicitly.
+	pilot_stop >/dev/null 2>&1 || true
 	ensure_xray_available_with_retry || die "cannot prepare Xray for tunnel"
 	xray_bin="$(xray_bin_path)"
 	xray_config="$(render_client_config)" || die "cannot create Xray configuration"
