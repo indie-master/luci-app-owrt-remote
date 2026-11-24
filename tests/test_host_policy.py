@@ -596,6 +596,33 @@ post_json http://hub.example/api/heartbeat test-token "$TEST_ROOT/payload"
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((self.directory / "owrt-remote-wan/lock").exists())
 
+    def test_reality_xhttp_and_grpc_render_both_reverse_links(self):
+        for transport, network, field, expected in (
+            ("reality-xhttp", "xhttp", "xhttpSettings", {"path": "/reverse/", "mode": "auto"}),
+            ("reality-grpc", "grpc", "grpcSettings", {"serviceName": "reverse"}),
+        ):
+            with self.subTest(transport=transport):
+                self.config(vps_host="hub.example", vps_port="443", vps_transport=transport,
+                            vps_sni="target.example", wan_direct="0",
+                            vps_reality_public_key="A"*43, vps_reality_short_id="ab12",
+                            vps_xhttp_path="/reverse/", vps_grpc_service="reverse",
+                            vless_uuid="11111111-1111-4111-8111-111111111111",
+                            ssh_vless_uuid="22222222-2222-4222-8222-222222222222")
+                before = (self.directory / "uci").read_bytes()
+                result = self.run_shell("render_client_config --stdout")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                links = [out for out in json.loads(result.stdout)["outbounds"]
+                         if out["tag"].startswith("vps-")]
+                self.assertEqual(len(links), 2)
+                for link in links:
+                    stream = link["streamSettings"]
+                    self.assertEqual(stream["network"], network)
+                    self.assertEqual(stream["security"], "reality")
+                    self.assertEqual(stream[field], expected)
+                    self.assertEqual(stream["realitySettings"]["shortId"], "ab12")
+                    self.assertNotIn("tlsSettings", stream)
+                self.assertEqual((self.directory / "uci").read_bytes(), before)
+
     def test_tcp_tls_renders_both_reverse_links_and_never_changes_uci(self):
         self.config(vps_host="hub.example", vps_port="443", vps_transport="tcp-tls",
                     vps_sni="hub.example", wan_direct="0",
