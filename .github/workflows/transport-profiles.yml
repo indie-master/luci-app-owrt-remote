@@ -74,6 +74,46 @@ jobs:
         run: |
           docker compose -f deploy/docker-compose.yml config --quiet
           test "$(docker compose -f deploy/docker-compose.yml config --services | sort | tr '\n' ' ')" = "hub nginx xray "
+      - name: Smoke test real nginx Compose runtime
+        env:
+          RO_HUB_IMAGE: router-orchestrator-hub:test
+          RO_XRAY_IMAGE: router-orchestrator-xray:test
+          RO_PUBLIC_URL: https://router.example.org
+          RO_STATE_DIR: /tmp/router-orchestrator-state
+          RO_TERMINAL_KEY_PATH: /tmp/router-orchestrator-key
+          RO_TERMINAL_KNOWN_HOSTS: /tmp/router-orchestrator-known
+          RO_TLS_DIR: /tmp/ro-test-tls
+        run: |
+          set -euo pipefail
+          override=$(mktemp)
+          printf 'services:\n  nginx:\n    network_mode: none\n' > "$override"
+          cleanup() { docker rm -f router-orchestrator-nginx >/dev/null 2>&1 || true; rm -f "$override"; }
+          trap cleanup EXIT
+          for profile in embedded embedded-stream-tls standalone; do
+            export RO_NGINX_CONF="$PWD/deploy/nginx/$profile.conf"
+            docker compose -f deploy/docker-compose.yml -f "$override" up -d --no-deps nginx
+            ready=0
+            for attempt in $(seq 1 30); do
+              if docker exec router-orchestrator-nginx wget -q -T 2 -O /dev/null http://127.0.0.1:18089/healthz; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" != 1 ]; then
+              docker logs router-orchestrator-nginx
+              exit 1
+            fi
+            if [ "$profile" != embedded ]; then
+              port=443
+              [ "$profile" != embedded-stream-tls ] || port=18445
+              # A TLS response, including upstream 502, proves the TLS worker accepted the request.
+              docker exec router-orchestrator-nginx wget --no-check-certificate -S -T 3 -O /dev/null "https://127.0.0.1:$port/" > /tmp/ro-nginx-tls-response 2>&1 || true
+              grep -Eq 'HTTP/1\.[01] (200|502)' /tmp/ro-nginx-tls-response
+            fi
+            echo "NGINX RUNTIME PASS: $profile"
+            docker rm -f router-orchestrator-nginx
+          done
       - name: Build portable HUB image
         run: |
           SHA=$(sha256sum vps/owrt-remote-hub.py | awk '{print $1}')
