@@ -386,8 +386,18 @@ recreation is required for the dedicated TLS mount. It refuses a dirty or
 unrelated candidate and checks that the active source, containers,
 environment and Xray configuration are unchanged after staging.
 
-This is preparation only. A controlled active-stack cutover with runtime
-fleet acceptance and rollback still must be implemented and tested.
+Preparation is separate from the guarded apply_active_upgrade.py cutover.
+The latter installs fixed units, switches the pinned source, recreates HUB
+and, if needed, recreates Xray with the same core image and TLS directory.
+It checks 100% of the captured recently online fleet and the unchanged
+external nginx configuration. A durable journal and explicit recovery
+command are provided; automatic rollback is attempted on ordinary failure.
+A process kill or host reboot during cutover requires operator recovery.
+The live database is not automatically overwritten during rollback; a
+fresh pre-cutover snapshot and failure-time snapshot are retained. The old
+HUB must pass acceptance using the retained live data. If it cannot,
+manual recovery is required. This upgrade does not enable publication.
+Real cutover acceptance is not yet established.
 Do not enable the publication marker or run the original initial
 apply_belt.py on the already-active stack. The old runtime Xray has no TLS
 mount, so the eventual upgrade needs one planned Xray recreation while
