@@ -277,3 +277,43 @@ and h2, with the selected SNI. This is a deliberately conservative gate
 for the three REALITY profiles, not proof of REALITY compatibility.
 REALITY wire tests and OpenWrt hardware acceptance remain outstanding.
 No profile is published or assigned by these tests.
+
+
+## Belt full secure wire matrix acceptance
+
+Operator output for 93811cc confirms the remaining 30 local tests and
+all three REALITY dual reverse rehearsals (TCP, XHTTP and gRPC) passed
+on the exact deployed Xray 26.3.27 image. The target swiftlessvpn.ru
+negotiated verified TLS 1.3 and h2. The combined isolated server matrix
+is therefore seven of seven passing. The production container identities,
+Xray and nginx config hashes, nginx syntax and HUB health were preserved;
+probe containers were removed. This does not authorize using an existing
+HTTP vhost SNI as a new live stream route or prove OpenWrt interoperability.
+
+## Publication commit and concurrency
+
+The host adapter's direct restart and legacy enrollment mutation now
+acquire the shared Xray lifecycle lock and recheck the maintenance hold.
+The file transaction supports a durable FILES_ACCEPTED decision and an
+idempotent forward-only metadata finalizer. Before this decision failures
+restore both original files. After it, recovery must not roll back files
+that might already be visible in the catalog. The finalizer checks the
+sealed artifact, exact installed inbound/map bytes, prevalidated complete
+nginx dump digest and explicit runtime evidence; writes the updated
+inventory first and commits catalog visibility last. Recovery tests cover
+interruption before and after the database commit. No router preferences
+are modified.
+
+The external nginx candidate can be tested using an isolated private mount
+namespace, temporarily overlaying only the managed include within that
+namespace. This supplies a complete candidate nginx -T digest without
+changing the host file or reloading nginx. The host worker must have
+mount-namespace privileges; do not add CAP_SYS_ADMIN to the HUB adapter.
+The current test suite mocks namespace execution, so a real Belt rehearsal
+of this preflight is required.
+
+The production activation/recovery worker, shared ingress lock integration,
+actual listener acceptance, and protection of published REALITY secrets
+in the legacy full-config adapter API remain release gates. Existing
+production Xray lacks the required TLS mount. No live publish endpoint
+has been enabled, and no production profile or router has been changed.
