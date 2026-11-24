@@ -46,6 +46,8 @@ jobs:
           python -m py_compile tools/router_fleet_prepare.py
           python -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
           python -m unittest discover -s tests -p 'test_router_fleet_prepare.py' -v
+          sh -n tools/router_client_transaction.sh
+          python -m unittest discover -s tests -p 'test_router_client_transaction.py' -v
       - name: Global Logs persistence and delivery regression
         run: |
           python -m unittest discover -s tests -p 'test_global_logs.py' -v
