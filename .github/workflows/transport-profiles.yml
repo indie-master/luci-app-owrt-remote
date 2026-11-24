@@ -47,6 +47,9 @@ jobs:
           python -m unittest discover -s tests -p 'test_secure_publication_commit.py' -v
           python -m unittest discover -s tests -p 'test_secure_publication_lock.py' -v
           python -m unittest discover -s tests -p 'test_secure_publication_worker.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_job.py' -v
+          python -m unittest discover -s tests -p 'test_active_upgrade_prepare.py' -v
+          python -m py_compile deploy/prepare_active_upgrade.py docker/secure_publication_job.py
           python -m py_compile docker/secure_publication_worker.py docker/secure_live_probe.py
           python -m unittest discover -s tests -p 'test_secure_nginx_preflight.py' -v
           python -m unittest discover -s tests -p 'test_secure_ingress_inventory.py' -v
@@ -79,7 +82,7 @@ jobs:
           grep -Fq 'vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc|reality-xhttp|reality-grpc)' files/usr/sbin/owrt-remote
       - name: Validate systemd worker and watchdog units
         run: |
-          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer deploy/systemd/router-orchestrator-transport-stage@.service deploy/systemd/router-orchestrator-transport-rollback.service deploy/systemd/router-orchestrator-publication-recovery.service deploy/systemd/router-orchestrator-publication-recovery.timer
+          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer deploy/systemd/router-orchestrator-transport-stage@.service deploy/systemd/router-orchestrator-transport-rollback.service deploy/systemd/router-orchestrator-publication-recovery.service deploy/systemd/router-orchestrator-publication-recovery.timer deploy/systemd/router-orchestrator-publication-job.service
       - name: Validate embedded nginx configuration
         run: |
           docker run --rm -v "$PWD/deploy/nginx/embedded.conf:/etc/nginx/nginx.conf:ro" nginx:1.29-alpine nginx -t
