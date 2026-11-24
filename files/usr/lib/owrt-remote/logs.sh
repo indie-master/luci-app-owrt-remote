@@ -943,7 +943,7 @@ log_collect() {
 case "${1:-}" in
 	check) log_open && log_close ;;
 	status) log_status ;;
-	diagnostics) log_init && { [ ! -f "$RUN_DIR/diagnostics" ] || cat "$RUN_DIR/diagnostics"; } ;;
+	diagnostics) log_runtime_init && { [ ! -f "$RUN_DIR/diagnostics" ] || cat "$RUN_DIR/diagnostics"; } ;;
 	migrate) log_migrate ;;
 	flush) log_flush "${2:-}" ;;
 	collect) log_collect ;;
