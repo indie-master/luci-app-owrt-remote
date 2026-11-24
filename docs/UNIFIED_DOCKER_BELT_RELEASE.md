@@ -142,7 +142,7 @@ router-side rollback are NOT yet implemented.
 
 
 **Applying a transport to a real router is intentionally disabled.**
-The current OpenWrt agent knows only TCP and WSS migrations. A new
+The source OpenWrt agent can generate additional transports and start a short-lived secondary Xray process, but production router installation and primary promotion are not yet accepted. A new
 reverse-bridge canary and durable fallback protocol are required before
 REALITY/XHTTP/gRPC should be deployed to customer routers. Do not
 manually paste preview-only client config as if it were a complete
@@ -164,6 +164,17 @@ backs up the exact original config, and checks that existing routers
 recover after the unavoidable Xray process restart. It will roll
 back on failure or after a 600-second lease; an independent systemd timer
 also expires it after a reboot.
+
+The owner-only transport page can now start the server shadow test via
+`/api/transports/stage/start`, but only when the operator explicitly sets
+`RO_ENABLE_TRANSPORT_STAGE=1` in the unified Compose environment.
+The default is **0 (disabled)**. This creates a root-only systemd job,
+rewrites only a validated additive Xray config, and performs one Docker
+Xray restart. An independent systemd timer restores the baseline after
+the ten-minute lease. The test does *not* enroll a router or promote
+the new transport, and a candidate port may require separate host
+firewall/provider ingress rules. Avoid enabling on Belt until a pilot
+router and out-of-band recovery are available.
 
 **This is not a complete transport migration.** The CLI currently
 requires an explicitly prepared root-owned profile, a reachable pilot
