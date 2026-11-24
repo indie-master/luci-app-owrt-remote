@@ -59,7 +59,10 @@ jobs:
         run: |
           openssl req -x509 -newkey rsa:2048 -keyout privkey.pem -out fullchain.pem -days 1 -nodes -subj '/CN=router.example.org' >/dev/null 2>&1
           mkdir -p /tmp/ro-test-tls
-          cp fullchain.pem privkey.pem /tmp/ro-test-tls/
+          # The hardened nginx master has no DAC override capability.
+          # Model deployment with a root-owned private key, not a runner-owned key.
+          sudo install -o root -g root -m 0644 fullchain.pem /tmp/ro-test-tls/fullchain.pem
+          sudo install -o root -g root -m 0600 privkey.pem /tmp/ro-test-tls/privkey.pem
           docker run --rm -v "$PWD/deploy/nginx/embedded-stream-tls.conf:/etc/nginx/nginx.conf:ro" -v "/tmp/ro-test-tls:/etc/router-orchestrator/tls:ro" nginx:1.29-alpine nginx -t
       - name: Validate consolidated Compose
         env:
