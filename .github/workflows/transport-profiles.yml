@@ -34,6 +34,7 @@ jobs:
       - name: Pure transport tests
         run: |
           python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
+          python -m unittest discover -s tests -p 'test_secure_ingress.py' -v
           python -m unittest discover -s tests -p 'test_transport_canary.py' -v
           python -m unittest discover -s tests -p 'test_transport_stage_recovery.py' -v
           python -m unittest discover -s tests -p 'test_openwrt_transport_pilot.py' -v
