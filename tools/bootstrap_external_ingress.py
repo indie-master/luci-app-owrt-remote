@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -36,42 +37,63 @@ STREAM = re.compile(r"(?m)^[ \t]*stream[ \t]*\{[ \t]*(?:#[^\n]*)?$")
 MAP = re.compile(r"(?m)^([ \t]*)map[ \t]+\$ssl_preread_server_name[ \t]+\$backend[ \t]*\{[ \t]*(?:#[^\n]*)?$")
 SERVER = re.compile(r"(?m)^[ \t]*server[ \t]*\{[ \t]*(?:#[^\n]*)?$")
 PAIR = re.compile(r"([A-Za-z0-9.-]+)[ \t]+(127\.0\.0\.1:[0-9]{1,5});")
-DIRECTIVE = re.compile(r"([a-z_]+)[ \t]+([^;{}]+);")
+
+
+def delimiters(text):
+    """Yield only unquoted/unescaped nginx structural delimiters."""
+    quote = None
+    escaped = False
+    comment = False
+    for i, char in enumerate(text):
+        if comment:
+            if char == "\n":
+                comment = False
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "#":
+            comment = True
+        elif char in "{};":
+            yield i, char
+    if quote or escaped:
+        raise ProfileError("unterminated quoted stream directive")
 
 
 def block_end(text, start):
-    # Restrict these specific stream blocks to plain braces, no quoted
-    # strings containing braces. Comments are excluded from brace counting.
     depth = 1
-    offset = start
-    for line in text[start:].splitlines(keepends=True):
-        code = line.split("#", 1)[0]
-        if '"' in code or "'" in code:
-            raise ProfileError("quoted stream syntax needs manual ownership review")
-        for index, char in enumerate(code):
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    if code[index+1:].strip():
-                        raise ProfileError("unsupported inline stream block syntax")
-                    return offset + index
-        offset += len(line)
+    for index, char in delimiters(text[start:]):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return start + index
     raise ProfileError("unterminated stream block")
 
 
 def simple_directives(text):
     result = {}
-    for line in text.splitlines():
-        value = line.split("#", 1)[0].strip()
-        if not value:
-            continue
-        match = DIRECTIVE.fullmatch(value)
-        if not match:
+    start = 0
+    for index, char in delimiters(text):
+        if char != ";":
+            raise ProfileError("unexpected nested stream block; review required")
+        words = shlex.split(text[start:index], comments=True, posix=True)
+        start = index + 1
+        if len(words) < 2 or not re.fullmatch(r"[a-z_]+", words[0]):
             raise ProfileError("unrecognized stream directive; review required")
-        key, val = match.groups()
-        result.setdefault(key, []).append(val.strip())
+        result.setdefault(words[0], []).append(" ".join(words[1:]))
+    if shlex.split(text[start:], comments=True, posix=True):
+        raise ProfileError("unterminated stream directive")
     return result
 
 
