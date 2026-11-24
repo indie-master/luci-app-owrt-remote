@@ -19228,6 +19228,14 @@ exit 127
                        for row in rows if not router_deleted(row)]
             self.send_json(200, {"ok": True, "routers": routers})
             return
+        if path == "/api/transports/stage/status":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                self.send_json(200, host_adapter_request("xray.transport.stage.status"))
+            except Exception:
+                self.send_json(503, {"ok": False, "error": "stage status unavailable"})
+            return
         if path.startswith("/api/transports/stage/job/"):
             if not self.require_owner(json_mode=True):
                 return
@@ -19842,6 +19850,28 @@ exit 127
                 ))
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/stage/rollback":
+            if not self.require_owner(json_mode=True):
+                return
+            if os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") != "1":
+                self.send_json(403, {"ok": False, "error": "shadow staging is disabled"})
+                return
+            csrf = self.headers.get("X-Transport-Action-CSRF", "")
+            if not secrets.compare_digest(csrf, TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                request = self.read_payload()
+                self.send_json(200, host_adapter_request(
+                    "xray.transport.stage.rollback",
+                    {"confirmed": request.get("confirmed") is True},
+                ))
+            except Exception:
+                self.send_json(409, {"ok": False, "error": "pilot rollback unavailable or already running"})
             return
         if path == "/api/transports/stage/start":
             if not self.require_owner(json_mode=True):
