@@ -19827,6 +19827,71 @@ exit 127
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})
             return
+        if path == "/api/transports/router/preflight":
+            if not self.require_owner(json_mode=True):
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                from transport_profiles import validate_profiles, render_router_outbound, _host
+                payload = self.read_payload()
+                profiles = payload.get("profiles")
+                if not isinstance(profiles, list) or len(profiles) != 1:
+                    raise ValueError("exactly one transport profile required")
+                validate_profiles(profiles)
+                profile = profiles[0]
+                router_id = clean_router_id(payload.get("router_id"))
+                with self.app.conn() as conn:
+                    row = get_active_router(conn, router_id)
+                if not row:
+                    raise ValueError("active router not found")
+                vps_host = _host(str(payload.get("remote_host") or row_str_value(row, "vps_host")))
+                # Validates reality public key as well as supported client stream.
+                render_router_outbound(
+                    profile, router_uuid=row_str_value(row, "vless_uuid"),
+                    remote_host=vps_host,
+                    reverse_tag=row_str_value(row, "reverse_tag", "reverse-in"),
+                )
+                script = (
+                    "set -eu\n"
+                    "export OWRT_REMOTE_CANDIDATE_TRANSPORT=\"$1\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_HOST=\"$2\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_PORT=\"$3\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_SNI=\"$4\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_WS_PATH=\"$5\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_XHTTP_PATH=\"$6\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_GRPC_SERVICE=\"$7\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY=\"$8\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID=\"$9\"\n"
+                    "exec /usr/sbin/owrt-remote transport-preflight\n"
+                )
+                values = [
+                    profile["transport"], vps_host, str(profile["port"]),
+                    profile.get("server_name", vps_host),
+                    profile.get("path", "/owrt-ws/"),
+                    profile.get("path", "/owrt-xhttp/"),
+                    profile.get("service_name", "owrt_remote"),
+                    profile.get("public_key", ""),
+                    (profile.get("short_ids") or [""])[0],
+                ]
+                if any(not isinstance(value, str) or
+                       not value or len(value) > 255 or
+                       any(char in value for char in "\\r\\n\\t ;$\\`'\\"&|<>")
+                       for value in values[:7]):
+                    raise ValueError("unsafe router preflight input")
+                output = self.run_router_ssh_script(
+                    row, script, values, timeout=35,
+                    ssh_password=str(payload.get("ssh_password") or "")
+                )
+                if "TRANSPORT PREFLIGHT: PASS" not in output:
+                    raise RuntimeError("OpenWrt candidate did not confirm validation")
+                self.send_json(200, {"ok": True, "router_id": router_id,
+                                     "validated_on_router": True,
+                                     "applied": False, "restarted": False})
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
         if path == "/api/transports/canary/preview":
             if not self.require_owner(json_mode=True):
                 return
