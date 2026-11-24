@@ -11,7 +11,14 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-SUPPORTED = ("tcp", "wss", "reality-tcp", "xhttp", "grpc")
+SUPPORTED = ("tcp", "tcp-tls", "wss", "reality-tcp", "xhttp", "grpc")
+# "tcp" is the historical plaintext wire ID, not a new enrollment choice.
+SECURE_PROFILES = ("tcp-tls", "wss", "reality-tcp", "xhttp", "grpc")
+
+
+def require_secure_profile(profile: dict) -> None:
+    if not isinstance(profile, dict) or profile.get("transport") not in SECURE_PROFILES:
+        raise ProfileError("new transport must use TLS or REALITY; legacy TCP is migration-only")
 _HOST_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SHORT_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{2}){0,8}$")
@@ -116,7 +123,10 @@ def render_stream_settings(profile: dict[str, Any]) -> dict[str, Any]:
             }]
         }
     }
-    if transport == "wss":
+    if transport == "tcp-tls":
+        settings["network"] = "tcp"
+    elif transport == "wss":
+        settings["tlsSettings"]["alpn"] = ["http/1.1"]
         settings.update({
             "network": "ws",
             "wsSettings": {"path": _path(_required_string(profile, "path"))}
@@ -209,9 +219,10 @@ def render_router_outbound(profile: dict[str, Any], *, router_uuid: str,
             }
         }
         if transport == "wss":
+            stream["tlsSettings"]["alpn"] = ["http/1.1"]
             stream["wsSettings"] = {
                 "path": server["wsSettings"]["path"],
-                "headers": {"Host": profile["server_name"]}
+                "host": profile["server_name"]
             }
         elif transport == "xhttp":
             stream["xhttpSettings"] = dict(server["xhttpSettings"])
