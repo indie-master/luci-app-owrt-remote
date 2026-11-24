@@ -38,7 +38,9 @@ UNIT_NAMES=(ADAPTER,"router-orchestrator-core-job@.service",
 HOLD=b"active stack upgrade v1\n"
 LEGACY_HOLD=Path("/var/lib/owrt-remote/.xray-maintenance-hold")
 LEGACY_SHA="1eeebf5600bf8b8abe5aa45fa66aed90376882fb4c400e27cea75a4b053112c5"
-INSTALLER_ONLY={"deploy/apply_active_upgrade.py","tests/test_active_upgrade_apply.py","docs/SECURE_TRANSPORT_AND_CORE_POLICY.md"}
+INSTALLER_ONLY={"deploy/apply_active_upgrade.py","deploy/active_upgrade_fleet.py",
+                "tests/test_active_upgrade_apply.py","tests/test_active_upgrade_fleet.py",
+                "docs/SECURE_TRANSPORT_AND_CORE_POLICY.md"}
 XRAY=Path("/etc/xray/owrt-remote.json")
 NGINX=Path("/etc/nginx/router-orchestrator-managed.map")
 EXTERNAL_NGINX=Path("/etc/nginx/nginx.conf")
