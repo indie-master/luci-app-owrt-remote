@@ -596,6 +596,24 @@ post_json http://hub.example/api/heartbeat test-token "$TEST_ROOT/payload"
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((self.directory / "owrt-remote-wan/lock").exists())
 
+    def test_tcp_tls_renders_both_reverse_links_and_never_changes_uci(self):
+        self.config(vps_host="hub.example", vps_port="443", vps_transport="tcp-tls",
+                    vps_sni="hub.example", wan_direct="0",
+                    vless_uuid="11111111-1111-4111-8111-111111111111",
+                    ssh_vless_uuid="22222222-2222-4222-8222-222222222222")
+        before = (self.directory / "uci").read_bytes()
+        result = self.run_shell("render_client_config --stdout")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        links = [out for out in config["outbounds"] if out["tag"].startswith("vps-")]
+        self.assertEqual(len(links), 2)
+        for link in links:
+            self.assertEqual(link["streamSettings"], {
+                "network": "tcp", "security": "tls",
+                "tlsSettings": {"serverName": "hub.example", "allowInsecure": False}})
+            self.assertEqual(link["settings"]["port"], 443)
+        self.assertEqual((self.directory / "uci").read_bytes(), before)
+
     def test_xray_only_reverse_sockets_are_bound_to_wan(self):
         self.config(vps_host="193.233.82.38", wan_direct="1", vless_uuid="11111111-1111-4111-8111-111111111111")
         result = self.run_shell("render_client_config --stdout")
