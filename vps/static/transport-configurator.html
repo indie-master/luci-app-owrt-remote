@@ -32,8 +32,8 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <label data-field="server_name">SNI / домен<input name="server_name" value="router.example.org"></label>
 <label data-field="path">URL path<input name="path" value="/owrt-remote"></label>
 <label data-field="service_name">gRPC service name<input name="service_name" value="owrt_remote"></label>
-<label data-field="certificate_file">Сертификат (путь внутри Xray)<input name="certificate_file" value="/etc/router-orchestrator/tls/fullchain.pem"></label>
-<label data-field="key_file">Ключ TLS (путь внутри Xray)<input name="key_file" value="/etc/router-orchestrator/tls/privkey.pem"></label>
+<label data-field="certificate_file">Сертификат (необязательно для черновика)<input name="certificate_file" placeholder="Автоподбор при сохранении"></label>
+<label data-field="key_file">Ключ TLS (необязательно для черновика)<input name="key_file" placeholder="Автоподбор при сохранении"></label>
 <label data-field="target_host">REALITY target host<input name="target_host" value="www.example.org"></label>
 <label data-field="target_port">REALITY target port<input name="target_port" type="number" value="443"></label>
 <label data-field="server_names">Дополнительные serverNames (через запятую или с новой строки)<textarea name="server_names" rows="3" placeholder="www.example.org"></textarea></label>
