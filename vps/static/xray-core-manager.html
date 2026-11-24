@@ -16,66 +16,94 @@ button{cursor:pointer}button.danger{background:#5f3037}button:disabled{opacity:.
 <h1>Xray Core Manager</h1>
 <div class="warning">Обновления ядра нарушают активные туннели на короткое время. Перед обновлением сохраняется предыдущий образ; новый считается исправным только после проверки heartbeat и SSH ранее активных роутеров. Для критичной инфраструктуры сначала проверь совместимость на пилотном роутере.</div>
 <section class="panel">
-<h2>Текущее состояние</h2><p id="running" class="muted">Загрузка…</p>
-<div class="actions"><button id="refresh">Обновить сведения</button><button class="danger" data-action="restart">Перезапустить Xray</button><button class="danger" data-action="rollback">Откатить ядро</button></div>
+<h2>Текущее состояние</h2><p id="running" class="muted">Загрузка состояния…</p><p id="maintenance" role="status" class="muted"></p>
+<div class="actions"><button id="refresh">Обновить сведения</button><button class="danger" data-action="restart" disabled>Перезапустить Xray</button><button class="danger" data-action="rollback" disabled>Откатить ядро</button></div>
 </section>
 <section class="panel">
 <h2>Стабильные выпуски</h2>
 <p>Предварительные релизы не предлагаются. Образ скачивается из официального GHCR, проверяется с действующим конфигом и закрепляется по digest.</p>
-<select id="version" aria-label="Стабильная версия Xray"><option value="">Загрузка версий…</option></select>
+<p id="releaseStatus" class="muted" role="status">Загрузка списка…</p><select id="version" disabled aria-label="Стабильная версия Xray"><option value="">Загрузка версий…</option></select>
 <div class="actions" style="margin-top:14px">
-<button data-action="prepare">Подготовить образ</button>
+<button id="retryVersions" type="button">Обновить список версий</button><button data-action="prepare" disabled>Подготовить образ</button>
 <button class="danger" data-action="upgrade" disabled id="upgrade">Установить подготовленную версию</button>
 </div>
 </section>
 <section class="panel"><h2>Операция</h2><pre id="job" aria-live="polite">Операций нет.</pre></section>
 <script>
-const csrf=document.body.dataset.csrf, version=document.getElementById('version'),job=document.getElementById('job'),info=document.getElementById('running'),upgrade=document.getElementById('upgrade');
-let currentJob=null, preparedVersion=null;
-async function api(path,options){const r=await fetch(path,Object.assign({credentials:'same-origin'},options||{}));let data;try{data=await r.json()}catch{throw Error('Сервер вернул не-JSON ответ')}if(!r.ok||!data.ok)throw Error(data.error||'Ошибка');return data}
-async function refresh(){
- try{
-  const status=await api('/api/xray/core/info');
-  info.textContent=(status.active?'Работает':'Недоступен')+' · '+(status.image||'неизвестный образ');
-  const data=await api('/api/xray/core/versions');
-  version.replaceChildren();
-  for(const tag of data.versions){const o=document.createElement('option');o.value=tag;o.textContent=tag;version.appendChild(o)}
- }catch(e){info.textContent=String(e.message||e)}
-}
-async function watch(id){
- currentJob=id;
- for(let i=0;i<120;i++){
-  try{
-   const data=await api('/api/xray/core/job/'+encodeURIComponent(id));
-   const state=data.job;
-   job.textContent=JSON.stringify(state,null,2);
-   if(['success','failed'].includes(state.status)){
-    if(state.status==='success' && state.action==='prepare'){
-     preparedVersion=state.version;upgrade.disabled=version.value!==preparedVersion;
-    }
-    await refreshStatus();return;
-   }
-  }catch(e){job.textContent=String(e.message||e);return}
-  await new Promise(resolve=>setTimeout(resolve,2000));
+const byId=id=>document.getElementById(id);
+const csrf=document.body.dataset.csrf,version=byId('version'),job=byId('job'),info=byId('running');
+let preparedVersion=null, statusKnown=false, active=false, held=true, busy=false, versionsReady=false, loadingVersions=false;
+function controls(){
+ for(const button of document.querySelectorAll('[data-action]')){
+  const action=button.dataset.action;
+  button.disabled=busy||!statusKnown||(action==='prepare'?!versionsReady||!version.value:
+   held||!active||(action==='upgrade'&&(!versionsReady||!version.value||preparedVersion!==version.value)));
  }
- job.textContent='Задание продолжается. Обнови страницу и проверь его статус позднее.';
+ version.disabled=busy||!versionsReady;byId('refresh').disabled=busy;
+ byId('retryVersions').disabled=busy||loadingVersions;
+}
+async function api(path,options){
+ const r=await fetch(path,Object.assign({credentials:'same-origin',cache:'no-store'},options||{}));
+ let data;try{data=await r.json()}catch{throw Error('Сервер вернул не-JSON ответ')}
+ if(!r.ok||!data.ok)throw Error(data.error||'Ошибка запроса');
+ return data;
 }
 async function refreshStatus(){
- try{const r=await api('/api/xray/core/info');info.textContent=(r.active?'Работает':'Недоступен')+' · '+(r.image||'неизвестный образ')}catch(e){info.textContent=e.message}
+ statusKnown=false;controls();
+ try{
+  const s=await api('/api/xray/core/info');
+  active=s.active===true;held=s.maintenance_hold!==false;statusKnown=true;
+  info.textContent=(active?'Работает':'Недоступен')+' · '+(s.image||'неизвестный образ');
+  byId('maintenance').textContent=held?'Включена защита конфигурации (maintenance HOLD). Просмотр и подготовка образа разрешены; перезапуск, обновление и откат заблокированы.':'Операции обслуживания доступны.';
+ }catch(e){info.textContent='Не удалось получить состояние: '+String(e.message||e);byId('maintenance').textContent='Изменения заблокированы до получения статуса.'}
+ finally{controls()}
 }
-document.getElementById('refresh').onclick=refresh;
-version.onchange=()=>{upgrade.disabled=version.value!==preparedVersion};
+async function refreshVersions(){
+ if(loadingVersions)return;
+ loadingVersions=true;versionsReady=false;controls();
+ const previous=version.value;
+ byId('releaseStatus').textContent='Получение стабильных версий GitHub…';
+ version.replaceChildren(new Option('Загрузка…',''));
+ try{
+  const data=await api('/api/xray/core/versions');
+  if(!Array.isArray(data.versions)||!data.versions.length)throw Error('Нет стабильных выпусков');
+  version.replaceChildren(...data.versions.map(tag=>new Option(tag,tag)));
+  if(data.versions.includes(previous))version.value=previous;
+  versionsReady=true;
+  byId('releaseStatus').textContent='Доступно стабильных версий: '+data.versions.length;
+ }catch(e){
+  version.replaceChildren(new Option('Список недоступен',''));
+  byId('releaseStatus').textContent='GitHub: '+String(e.message||e)+' · нажми «Обновить список версий».';
+ }finally{loadingVersions=false;controls()}
+}
+async function refresh(){await Promise.all([refreshStatus(),refreshVersions()])}
+async function watch(id){
+ for(let i=0;i<465;i++){
+  try{
+   const data=await api('/api/xray/core/job/'+encodeURIComponent(id)),state=data.job;
+   job.textContent=JSON.stringify(state,null,2);
+   if(['success','failed'].includes(state.status)){
+    if(state.status==='success'&&state.action==='prepare')preparedVersion=state.version;
+    await refreshStatus();return;
+   }
+  }catch(e){job.textContent='Статус задания недоступен: '+String(e.message||e)+' · ID '+id;return}
+  await new Promise(resolve=>setTimeout(resolve,2000));
+ }
+ job.textContent='Задание ещё не подтверждено · ID '+id;
+}
+byId('refresh').onclick=refreshStatus;
+byId('retryVersions').onclick=refreshVersions;
+version.onchange=controls;
 document.querySelectorAll('[data-action]').forEach(button=>button.onclick=async()=>{
+ if(button.disabled)return;
  const action=button.dataset.action,v=version.value;
- if((action==='prepare'||action==='upgrade')&&!v)return;
- if(action==='upgrade' && preparedVersion!==v)return;
- if(action!=='prepare'&&!confirm('Подтвердить действие: '+action+'? Активные соединения могут прерваться.'))return;
- for(const el of document.querySelectorAll('button'))el.disabled=true;
+ if(action!=='prepare'&&!confirm('Подтвердить операцию? Активные соединения могут прерваться.'))return;
+ busy=true;controls();
  try{
   const result=await api('/api/xray/core/start',{method:'POST',headers:{'Content-Type':'application/json','X-Core-Action-CSRF':csrf},body:JSON.stringify({action,version:(action==='prepare'||action==='upgrade')?v:''})});
   job.textContent='Операция запущена: '+result.job_id;await watch(result.job_id);
  }catch(e){job.textContent=String(e.message||e)}
- finally{for(const el of document.querySelectorAll('button'))el.disabled=false;upgrade.disabled=preparedVersion!==version.value}
+ finally{busy=false;controls()}
 });
-refresh();
+controls();refresh();
 </script></body></html>
