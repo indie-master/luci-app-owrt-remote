@@ -24,6 +24,10 @@ OVERRIDE = Path("/etc/systemd/system/router-orchestrator-host-adapter.service.d/
 CORE_UNIT = Path("/etc/systemd/system/router-orchestrator-core-job@.service")
 WATCHDOG_SERVICE = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.service")
 WATCHDOG_TIMER = Path("/etc/systemd/system/router-orchestrator-xray-watchdog.timer")
+TRANSPORT_SERVICE = Path("/etc/systemd/system/router-orchestrator-transport-expiry.service")
+TRANSPORT_TIMER = Path("/etc/systemd/system/router-orchestrator-transport-expiry.timer")
+MANAGED_RECOVERY_UNITS = (WATCHDOG_SERVICE, WATCHDOG_TIMER,
+                          TRANSPORT_SERVICE, TRANSPORT_TIMER)
 BACKUP = STAGE / "cutover-rollback"
 SYSTEMD = "router-orchestrator-host-adapter.service"
 
@@ -110,7 +114,7 @@ def main():
             "new host-adapter unit missing")
     require((SRC / "deploy/systemd/router-orchestrator-core-job@.service").is_file(),
             "new core worker unit missing")
-    for watchdog in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+    for watchdog in MANAGED_RECOVERY_UNITS:
         require((SRC / "deploy/systemd" / watchdog.name).is_file(),
                 "missing Xray watchdog unit: " + watchdog.name)
 
@@ -131,7 +135,7 @@ def main():
     if had_core_unit:
         shutil.copy2(CORE_UNIT, BACKUP / "core-job.service")
     watchdog_original = {}
-    for path in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+    for path in MANAGED_RECOVERY_UNITS:
         watchdog_original[path.name] = path.is_file()
         if path.is_file():
             require(not path.is_symlink(), "unexpected watchdog symlink")
@@ -150,7 +154,7 @@ def main():
         if had_override:
             OVERRIDE.unlink()
         shutil.copy2(SRC / "deploy/systemd/router-orchestrator-core-job@.service", CORE_UNIT)
-        for path in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+        for path in MANAGED_RECOVERY_UNITS:
             shutil.copy2(SRC / "deploy/systemd" / path.name, path)
         jobs = ROOT / "data/core-jobs"
         jobs.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -202,7 +206,8 @@ assert reply.get("ok") is True and reply.get("active") is True
         require(result.returncode == 0, "new HUB cannot reach Xray host adapter")
 
         started = run("systemctl", "enable", "--now",
-                      "router-orchestrator-xray-watchdog.timer")
+                      "router-orchestrator-xray-watchdog.timer",
+                      "router-orchestrator-transport-expiry.timer")
         require(started.returncode == 0,
                 "Xray watchdog timer could not be enabled")
         (BACKUP / "cutover-state").write_text("DOCKER_THREE_SERVICE_ACTIVE\n")
@@ -229,9 +234,10 @@ assert reply.get("ok") is True and reply.get("active") is True
         else:
             OVERRIDE.unlink(missing_ok=True)
         run("systemctl", "disable", "--now",
-            "router-orchestrator-xray-watchdog.timer", timeout=30)
+            "router-orchestrator-xray-watchdog.timer",
+            "router-orchestrator-transport-expiry.timer", timeout=30)
         restore_file(CORE_UNIT, BACKUP / "core-job.service", had_core_unit)
-        for path in (WATCHDOG_SERVICE, WATCHDOG_TIMER):
+        for path in MANAGED_RECOVERY_UNITS:
             restore_file(path, BACKUP / path.name,
                          watchdog_original[path.name])
         run("systemctl", "daemon-reload")
