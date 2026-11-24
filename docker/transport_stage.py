@@ -121,6 +121,8 @@ def restart():
 
 
 def rollback_impl(record):
+    require(not HOLD.exists() or HOLD.read_bytes() == b"shadow transport transaction\n",
+            "maintenance hold belongs to another transaction")
     require(ORIGINAL.is_file() and not ORIGINAL.is_symlink(),
             "baseline backup unavailable")
     original = ORIGINAL.read_bytes()
