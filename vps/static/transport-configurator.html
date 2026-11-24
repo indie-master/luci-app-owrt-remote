@@ -41,6 +41,7 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <h2>Активный серверный пилот</h2>
 <p class="muted" id="pilotStatus" aria-live="polite">Проверка статуса…</p>
 <button type="button" class="secondary" id="pilotRefresh">Обновить статус</button>
+<button type="button" class="secondary" id="clientPilot" disabled>Проверить shadow-транспорт на OpenWrt (3 мин)</button>
 <button type="button" class="secondary" id="pilotRollback" disabled>Немедленно откатить пилот</button>
 </div>
 <div class="panel"><h2>Результат проверки</h2><pre id="output" aria-live="polite">Выбери транспорт и нажми «Проверить».</pre></div>
@@ -90,7 +91,7 @@ preflight.addEventListener('click',async()=>{
  }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
  finally{preflight.disabled=!routerSelect.value}
 });
-const pilotStatus=document.getElementById('pilotStatus'),pilotRollback=document.getElementById('pilotRollback');
+const pilotStatus=document.getElementById('pilotStatus'),pilotRollback=document.getElementById('pilotRollback'),clientPilot=document.getElementById('clientPilot');
 async function refreshPilotStatus(){
  try{
   const response=await fetch('/api/transports/stage/status',{credentials:'same-origin',cache:'no-store'});
@@ -100,9 +101,29 @@ async function refreshPilotStatus(){
     ? 'Роутер: '+result.router_id+' · '+result.phase+' · осталось '+result.seconds_remaining+' с'
     : 'Активных пилотов нет · '+result.phase;
   pilotRollback.disabled=!(document.body.dataset.stageEnabled==='1'&&['STAGED','VERIFIED'].includes(result.phase));
- }catch(error){pilotStatus.textContent=String(error.message||error);pilotRollback.disabled=true}
+  clientPilot.disabled=!(document.body.dataset.stageEnabled==='1'&&result.phase==='STAGED'&&result.seconds_remaining>=100&&result.router_id===routerSelect.value);
+ }catch(error){pilotStatus.textContent=String(error.message||error);pilotRollback.disabled=true;clientPilot.disabled=true}
 }
 document.getElementById('pilotRefresh').addEventListener('click',refreshPilotStatus);
+clientPilot.addEventListener('click',async()=>{
+ if(clientPilot.disabled||!routerSelect.value)return;
+ if(!confirm('Запустить отдельное Xray-ядро на выбранном OpenWrt на 3 минуты и проверить обратный SSH-канал? Основная конфигурация останется без изменений.'))return;
+ clientPilot.disabled=true;
+ const fields=Object.fromEntries(new FormData(form).entries());
+ pilotStatus.textContent='Запускаю тестовый Xray на OpenWrt и проверяю shadow reverse SSH…';
+ try{
+  const response=await fetch('/api/transports/router/pilot/start',{
+   method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+   body:JSON.stringify({router_id:routerSelect.value,ssh_password:fields.ssh_password||''})
+  });
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'OpenWrt pilot failed');
+  pilotStatus.textContent='Проверка успешна: shadow SSH reverse работает. Основная UCI не изменена. Тестовый Xray на роутере завершится автоматически через 180 секунд.';
+ }catch(error){pilotStatus.textContent=String(error.message||error)}
+ finally{await refreshPilotStatus()}
+});
+
 pilotRollback.addEventListener('click',async()=>{
  if(pilotRollback.disabled)return;
  if(!confirm('Немедленно восстановить прежний Xray-конфиг и перезапустить Docker Xray? Текущие туннели кратковременно прервутся.'))return;
@@ -121,6 +142,7 @@ refreshPilotStatus();
 const stageButton=document.getElementById('stagePilot');
 stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value;
 routerSelect.addEventListener('change',()=>{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value});
+routerSelect.addEventListener('change',refreshPilotStatus);
 stageButton.addEventListener('click',async()=>{
  if(document.body.dataset.stageEnabled!=='1'||!routerSelect.value)return;
  const values=Object.fromEntries(new FormData(form).entries());
