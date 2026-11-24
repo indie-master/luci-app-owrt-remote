@@ -151,7 +151,14 @@ runtime_ok() {
     pid="$(ubus -t 3 call service list '{"name":"owrt-remote"}' | jq -er '.["owrt-remote"].instances.xray.pid')"
     number "$pid" && [ -r "/proc/$pid/cmdline" ] || return 1
     tr '\000' '\n' <"/proc/$pid/cmdline" | grep -Fxq -e "$XRAY" -e "-config=$XRAY" -e "--config=$XRAY" -e "-c=$XRAY" || return 1
-    case "$(readlink "/proc/$pid/exe")" in */xray|*/xray-core|*/xray_softfloat) ;; *) return 1;; esac
+    configured="$(uci -q get owrtremote.main.xray_bin || true)"
+    [ -n "$configured" ] || configured=/usr/bin/xray
+    [ -x "$configured" ] || return 1
+    [ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$configured")" ] || return 1
+    case "$configured" in
+        /etc/owrt-remote/xray-boot/xray-*)
+            [ "$(hash "$configured")" = "${configured##*/xray-}" ] || return 1;;
+    esac
     # Match both reverse links against the known-good transport, credential,
     # reverse identity and routing targets; resolved WAN IP may change.
     jq -e -s '
