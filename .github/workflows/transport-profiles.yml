@@ -40,6 +40,12 @@ jobs:
           python -m unittest discover -s tests -p 'test_ssh_command_quoting.py' -v
           python -m unittest discover -s tests -p 'test_web_ui_javascript.py' -v
           python -m unittest discover -s tests -p 'test_xray_core_manager.py' -v
+      - name: Validate guarded client preparation
+        run: |
+          sh -n tools/router_bundle_guard.sh
+          python -m py_compile tools/router_fleet_prepare.py
+          python -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+          python -m unittest discover -s tests -p 'test_router_fleet_prepare.py' -v
       - name: Global Logs persistence and delivery regression
         run: |
           python -m unittest discover -s tests -p 'test_global_logs.py' -v
