@@ -167,10 +167,11 @@ def validate_profiles(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rendered
 
 def render_router_outbound(profile: dict[str, Any], *, router_uuid: str,
-                           remote_host: str) -> dict[str, Any]:
+                           remote_host: str, reverse_tag: str = "reverse-in") -> dict[str, Any]:
     """Generate a *candidate* OpenWrt Xray VLESS outbound, never deploy it.
 
-    Bridge/reverse tags must be integrated by a separate canary transaction.
+    Use the custom Xray Reverse VLESS settings syntax used by this project,
+    not standard VLESS vnext (which cannot establish a reverse bridge).
     Server REALITY private key is never copied into the client structure.
     """
     import uuid as uuid_module
@@ -221,10 +222,12 @@ def render_router_outbound(profile: dict[str, Any], *, router_uuid: str,
         "tag": "ro-control-" + name,
         "protocol": "vless",
         "settings": {
-            "vnext": [{
-                "address": host, "port": port,
-                "users": [{"id": identity, "encryption": "none"}],
-            }]
+            "address": host,
+            "port": port,
+            "id": identity,
+            "encryption": "none",
+            "flow": "",
+            "reverse": {"tag": _name(reverse_tag, "reverse_tag")},
         },
         "streamSettings": stream,
     }
