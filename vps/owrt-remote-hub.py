@@ -19866,19 +19866,20 @@ exit 127
                     "export OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID=\"$9\"\n"
                     "exec /usr/sbin/owrt-remote transport-preflight\n"
                 )
+                if profile["transport"] == "reality-tcp" and not (profile.get("short_ids") or [""])[0]:
+                    raise ValueError("REALITY pilot requires a nonempty shortId")
                 values = [
                     profile["transport"], vps_host, str(profile["port"]),
                     profile.get("server_name", vps_host),
                     profile.get("path", "/owrt-ws/"),
                     profile.get("path", "/owrt-xhttp/"),
                     profile.get("service_name", "owrt_remote"),
-                    profile.get("public_key", ""),
-                    (profile.get("short_ids") or [""])[0],
+                    profile.get("public_key") or "none",
+                    (profile.get("short_ids") or [""])[0] or "none",
                 ]
                 if any(not isinstance(value, str) or
-                       not value or len(value) > 255 or
-                       any(char in value for char in "\\r\\n\\t ;$\\`'\\"&|<>")
-                       for value in values[:7]):
+                       not re.fullmatch(r"[A-Za-z0-9._:/~-]{1,255}", value)
+                       for value in values):
                     raise ValueError("unsafe router preflight input")
                 output = self.run_router_ssh_script(
                     row, script, values, timeout=35,
