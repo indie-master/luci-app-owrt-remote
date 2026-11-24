@@ -110,7 +110,7 @@ def build_publication(live, artifact, inventory, *, profile_id, revision):
     fragment = "".join(f"{domain(r['sni'])} {r['upstream']};\n" for r in combined)
     return {"candidate": candidate, "fragment": fragment, "tag": tag,
             "baseline_sha256": digest(live), "inventory_sha256": digest(inventory),
-            "artifact_sha256": digest(artifact), "routes": plan["routes"],
+            "artifact_sha256": hashlib.sha256(json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode()).hexdigest(), "routes": plan["routes"],
             "backend_port": plan["backend_port"], "public_port": public,
             "published": False, "applied": False}
 
