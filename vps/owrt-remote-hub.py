@@ -19191,11 +19191,13 @@ exit 127
             self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
                             [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
             return
-        if path in ("/api/secure-profiles", "/api/secure-profiles/router"):
+        if path in ("/api/secure-profiles", "/api/secure-profiles/router", "/api/secure-profiles/job"):
             if not self.require_owner(json_mode=True):
                 return
             try:
-                if path == "/api/secure-profiles":
+                if path == "/api/secure-profiles/job":
+                    result = host_adapter_request("secure.catalog.job")
+                elif path == "/api/secure-profiles":
                     result = host_adapter_request("secure.catalog.list")
                     with self.app.conn() as conn:
                         rows = list_router_rows(conn)
@@ -19550,7 +19552,7 @@ exit 127
 
     def do_POST(self):
         path = self.parsed().path
-        if path in ("/api/secure-profiles/draft", "/api/secure-profiles/select", "/api/secure-profiles/validate", "/api/secure-profiles/plan", "/api/secure-profiles/approve"):
+        if path in ("/api/secure-profiles/draft", "/api/secure-profiles/select", "/api/secure-profiles/validate", "/api/secure-profiles/plan", "/api/secure-profiles/approve", "/api/secure-profiles/publish"):
             if not self.require_owner(json_mode=True):
                 return
             if not secrets.compare_digest(self.headers.get("X-Transport-Action-CSRF", ""),
@@ -19566,6 +19568,11 @@ exit 127
                     result = host_adapter_request("secure.catalog.draft", {
                         "profile": payload.get("profile"), "label": payload.get("label"),
                         "remote_host": payload.get("remote_host"), "public_port": payload.get("public_port")})
+                elif path.endswith("/publish"):
+                    result = host_adapter_request("secure.catalog.publish", {
+                        "profile_id": payload.get("profile_id"), "revision": payload.get("revision"),
+                        "artifact_sha256": payload.get("artifact_sha256"),
+                        "confirmed": payload.get("confirmed") is True})
                 elif path.endswith("/approve"):
                     result = host_adapter_request("secure.catalog.approve", {
                         "profile_id": payload.get("profile_id"), "revision": payload.get("revision"),
