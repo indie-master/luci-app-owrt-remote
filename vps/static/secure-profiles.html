@@ -113,7 +113,18 @@ get('preferences').addEventListener('submit',async e=>{
      }catch(err){result.textContent=String(err.message||err)}
      finally{plan.disabled=false;validate.disabled=false}
     });
-    item.append(validate,plan,result);
+    const approve=document.createElement('button');
+    approve.type='button';approve.textContent='Разрешить SNI';
+    approve.addEventListener('click',async()=>{
+     if(!confirm('Разрешить точные SNI из этой сохранённой ревизии для будущей публикации? DNS, nginx и роутеры сейчас не изменятся.'))return;
+     approve.disabled=true;plan.disabled=true;
+     try{
+      const data=await api('/api/secure-profiles/approve',{profile_id:p.profile_id,revision:p.revision,confirmed:true});
+      result.textContent='Разрешены SNI: '+data.approved_names.join(', ')+' · Теперь можно проверить план публикации.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{approve.disabled=false;plan.disabled=false}
+    });
+    item.append(validate,approve,plan,result);
    }
    catalog.append(item);
   }
