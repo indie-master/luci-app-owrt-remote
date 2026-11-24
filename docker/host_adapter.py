@@ -8,6 +8,8 @@ mode-0660 Unix socket. Mount /run/router-orchestrator read-only in HUB.
 """
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
+import fcntl
 import datetime
 import uuid
 import re
@@ -29,6 +31,7 @@ CONFIG = Path("/etc/xray/owrt-remote.json")
 BINARY = "/usr/local/bin/xray"
 SERVICE = "owrt-remote-xray"
 HOLD = Path("/opt/router-orchestrator/data/.xray-maintenance-hold")
+LIFECYCLE_LOCK = HOLD.parent / "xray-lifecycle.lock"
 MAX_REQUEST = 2 * 1024 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
 
@@ -822,15 +825,39 @@ class Adapter:
         return {"ok": True, "job": record,
                 "running_image": docker_inspect_image()}
 
+    @contextmanager
+    def mutation_lock(self, enabled):
+        self.can_mutate(enabled)
+        fd = os.open(LIFECYCLE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0
+                    and info.st_nlink == 1 and not info.st_mode & 0o022,
+                    "unsafe Xray lifecycle lock")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Rejected("Xray lifecycle transaction is already running") from None
+            self.can_mutate(enabled)
+            yield
+        finally:
+            os.close(fd)
+
     def xray_restart(self):
-        self.can_mutate(self.allow_restart)
+        with self.mutation_lock(self.allow_restart):
+            return self._xray_restart_locked()
+
+    def _xray_restart_locked(self):
         require(restart_docker_xray(recovering=True).returncode == 0 and wait_xray(),
                 "Docker Xray restart/health failed; investigate container")
         self.last_restart = time.monotonic()
         return {"ok": True, "service": XRAY_CONTAINER, "runtime": "docker"}
 
     def xray_apply(self, request):
-        self.can_mutate(self.allow_apply)
+        with self.mutation_lock(self.allow_apply):
+            return self._xray_apply_locked(request)
+
+    def _xray_apply_locked(self, request):
         original = CONFIG.read_bytes()
         require(request.get("expected_sha256") == sha(original),
                 "Xray config changed concurrently")
