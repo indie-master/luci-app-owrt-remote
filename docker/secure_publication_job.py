@@ -80,8 +80,13 @@ def enqueue(profile_id, revision, digest, confirmed):
         job = {"id":str(uuid.uuid4()),"profile_id":profile_id,"revision":revision,
                "digest":digest,"status":"pending","created":int(time.time())}
         atomic(JOB,json.dumps(job).encode())
-        result = subprocess.run(["systemctl","start","--no-block",UNIT],
-                                capture_output=True,timeout=10)
+        try:
+            result = subprocess.run(["systemctl","start","--no-block",UNIT],
+                                    capture_output=True,timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            job.update(status="recovery_required",message="systemd job start could not be verified")
+            atomic(JOB,json.dumps(job).encode())
+            raise ProfileError("systemd job start could not be verified") from None
         if result.returncode:
             job.update(status="failed",message="systemd job start failed")
             atomic(JOB,json.dumps(job).encode())
@@ -126,5 +131,48 @@ def execute():
         os.close(fd)
 
 
+def reconcile():
+    """Explicit operator action after systemd/recovery has finished."""
+    from secure_publication_worker import locks, tx, STATE
+    import xray_lifecycle as life
+    require(os.geteuid()==0, "root required")
+    fd=lock_fd()
+    try:
+        unit=subprocess.run(["systemctl","show","-p","ActiveState","--value",UNIT],
+                            capture_output=True,text=True,timeout=10)
+        require(unit.returncode==0 and unit.stdout.strip() in ("inactive","failed"),
+                "publication service may still be running")
+        with locks():
+            require(not life.TRANSPORT_HOLD.exists() and not life.TRANSPORT_HOLD.is_symlink(),
+                    "maintenance hold still present")
+            job=read_job()
+            require(job and job["status"] in ("pending","running","recovery_required"),
+                    "no interrupted job")
+            record=tx()._record() if (STATE/"pending.json").exists() else None
+            require(record is None or record["phase"] in ("ACCEPTED","ROLLED_BACK"),
+                    "publication recovery has not finished")
+            with connection() as db:
+                _,digest,published=load_artifact(db,job["profile_id"],job["revision"])
+            require(digest==job["digest"], "revision digest changed")
+            if published:
+                binding=(record or {}).get("binding",{})
+                require(record and record["phase"]=="ACCEPTED" and
+                        (binding.get("profile_id"),binding.get("revision"),binding.get("artifact_sha256"))==
+                        (job["profile_id"],job["revision"],job["digest"]),
+                        "published job journal does not match")
+                job.update(status="success",message="publication recovered and verified")
+            else:
+                job.update(status="failed",message="publication not committed; recovery checked")
+            atomic(JOB,json.dumps(job).encode())
+            return status()
+    finally:
+        os.close(fd)
+
+
 if __name__=="__main__":
-    execute()
+    if sys.argv[1:]==["reconcile"]:
+        print(json.dumps(reconcile()))
+    elif not sys.argv[1:]:
+        execute()
+    else:
+        raise SystemExit("unsupported action")
