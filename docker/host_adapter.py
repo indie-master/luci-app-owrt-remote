@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import socket
 import stat
 import struct
@@ -464,6 +465,76 @@ class Adapter:
                 remote_host=request.get("remote_host"))
         return response
 
+    def transport_canary_preview(self, request):
+        """Prepare full router-specific shadow server/client candidate without writes.
+
+        The adapter reads the canonical SQLite identities itself, preventing
+        browser-origin profile fields from selecting arbitrary VLESS UUIDs.
+        """
+        from transport_canary import build_shadow_canary, assert_baseline_retained
+        from transport_profiles import render_router_outbound, _host
+        profiles = request.get("profiles")
+        require(isinstance(profiles, list) and len(profiles) == 1,
+                "exactly one transport candidate required")
+        router_id = request.get("router_id")
+        require(isinstance(router_id, str) and
+                re.fullmatch(r"[A-Za-z0-9_-]{1,64}", router_id),
+                "invalid router ID")
+        expected = request.get("expected_sha256")
+        original = CONFIG.read_bytes()
+        require(isinstance(expected, str) and expected == sha(original),
+                "Xray baseline changed during preview")
+        database = Path("/opt/router-orchestrator/data/hub.db")
+        require(database.is_file() and not database.is_symlink(),
+                "canonical HUB SQLite database unavailable")
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "select id,vless_uuid,ssh_vless_uuid,admin_host,admin_port,"
+                "ssh_host,ssh_port,vps_host from routers where id=? and deleted_at=0",
+                (router_id,)
+            ).fetchone()
+        require(row is not None, "router not found")
+        original_json = json.loads(original)
+        canary, pilot = build_shadow_canary(
+            original_json, profiles[0], dict(row),
+            admin_test_port=request.get("admin_test_port"),
+            ssh_test_port=request.get("ssh_test_port"),
+            listen="127.0.0.1"
+        )
+        assert_baseline_retained(original_json, canary)
+        data = (json.dumps(canary, separators=(",", ":")) + "\n").encode()
+        require(len(data) < MAX_REQUEST - 4096, "candidate exceeds maximum size")
+        fd, temp = tempfile.mkstemp(prefix=".ro-shadow-preview-",
+                                    suffix=".json", dir=CONFIG.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(data)
+                stream.flush()
+            validate_candidate_with_container(Path(temp))
+        finally:
+            Path(temp).unlink(missing_ok=True)
+        require(sha(CONFIG.read_bytes()) == expected,
+                "production Xray config changed while testing")
+        remote_host = _host(request.get("remote_host") or row["vps_host"])
+        admin_outbound = render_router_outbound(
+            profiles[0], router_uuid=pilot["vless_uuid"], remote_host=remote_host,
+            reverse_tag=pilot["reverse_tag"]
+        )
+        admin_outbound["tag"] = "vps-pilot-admin"
+        ssh_outbound = render_router_outbound(
+            profiles[0], router_uuid=pilot["ssh_vless_uuid"], remote_host=remote_host,
+            reverse_tag=pilot["ssh_reverse_tag"]
+        )
+        ssh_outbound["tag"] = "vps-pilot-ssh"
+        safe_pilot = {k:v for k,v in pilot.items()
+                      if k not in ("vless_uuid","ssh_vless_uuid")}
+        return {"ok": True, "validated_by_xray": True,
+                "pilot": safe_pilot, "client_outbounds": [admin_outbound, ssh_outbound],
+                "baseline_unchanged": True, "applied": False,
+                "candidate_sha256": sha(data)}
+
     def core_job_start(self, request):
         action = request.get("action")
         require(action in ("prepare", "upgrade", "restart", "rollback"),
@@ -623,6 +694,8 @@ class Adapter:
             return self.xray_preview(request)
         if op == "xray.transport.preview":
             return self.transport_preview(request)
+        if op == "xray.transport.canary.preview":
+            return self.transport_canary_preview(request)
         if op == "xray.core.info":
             return {"ok": True, "active": active_xray(),
                     "image": docker_inspect_image(),
