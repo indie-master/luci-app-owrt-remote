@@ -16,6 +16,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,22 @@ def image_identity():
     if len(parts)!=3 or parts[2]!="true" or not parts[1].startswith("sha256:"):
         raise ProfileError("production Xray image identity unavailable")
     return parts[0],parts[1]
+
+
+def check_reality_target(target, sni):
+    """Check the selected TLS 1.3/H2 target before spawning test containers."""
+    target, sni = domain(target), domain(sni)
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.set_alpn_protocols(["h2"])
+    try:
+        with socket.create_connection((target,443),timeout=8) as raw:
+            with context.wrap_socket(raw,server_hostname=sni) as tls:
+                if tls.version() != "TLSv1.3" or tls.selected_alpn_protocol() != "h2":
+                    raise ProfileError("REALITY target must negotiate TLS 1.3 and h2 for this trial")
+    except OSError:
+        raise ProfileError("REALITY target TLS handshake or certificate verification failed") from None
+    return {"target":target,"sni":sni,"tls":"TLSv1.3","alpn":"h2"}
 
 
 def reserve():
@@ -212,6 +229,9 @@ def main():
     modes=args.transport or ["tcp-tls","wss","xhttp","grpc"]
     if any(t in REALITY_PROFILES for t in modes) and not args.target:
         raise ProfileError("REALITY rehearsal requires an explicit target")
+    if any(t in REALITY_PROFILES for t in modes):
+        target = check_reality_target(args.target,name)
+        print("REALITY TARGET:",target["target"],"SNI:",target["sni"],"TLS 1.3 / h2: PASS",flush=True)
     before,image=image_identity()
     version=run(DOCKER,"run","--rm","--pull","never","--network","none",image,"version").splitlines()[0]
     print("EXACT CORE:",version,flush=True)
