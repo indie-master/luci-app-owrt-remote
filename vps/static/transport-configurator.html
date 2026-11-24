@@ -24,6 +24,7 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <label>Роутер для теневого reverse-пилота<select name="router_id" id="router_id"><option value="">Без роутера — проверка схемы</option></select></label>
 <label>Тестовый LuCI-порт VPS<input name="admin_test_port" type="number" value="21080" min="1024" max="65535"></label>
 <label>Тестовый SSH-порт VPS<input name="ssh_test_port" type="number" value="22080" min="1024" max="65535"></label>
+<label>SSH-пароль роутера (необязательно)<input name="ssh_password" type="password" autocomplete="off" placeholder="Если ключ SSH не настроен"></label>
 <label data-field="server_name">SNI / домен<input name="server_name" value="router.example.org"></label>
 <label data-field="path">URL path<input name="path" value="/owrt-remote"></label>
 <label data-field="service_name">gRPC service name<input name="service_name" value="owrt_remote"></label>
@@ -34,7 +35,7 @@ button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wra
 <label data-field="short_ids">REALITY short IDs, через запятую<input name="short_ids" value="aabbccdd"></label>
 <label data-field="private_key">REALITY private key<input name="private_key" type="password" autocomplete="off" placeholder="Вставить только для предварительной проверки"></label>
 <label data-field="public_key">REALITY public key (для роутера)<input name="public_key" autocomplete="off" placeholder="Публичный ключ из Xray"></label>
-</div><p><button type="submit">Проверить и сгенерировать</button> <button type="button" class="secondary" disabled title="Доступно после внедрения транзакционного применения">Применить к роутеру</button></p>
+</div><p><button type="submit">Проверить и сгенерировать</button> <button type="button" class="secondary" id="routerPreflight" disabled>Проверить на OpenWrt без изменений</button> <button type="button" class="secondary" disabled title="Доступно после внедрения транзакционного применения">Применить к роутеру</button></p>
 </form>
 <div class="panel"><h2>Результат проверки</h2><pre id="output" aria-live="polite">Выбери транспорт и нажми «Проверить».</pre></div>
 <script>
@@ -56,6 +57,33 @@ choice.addEventListener('change',refresh);refresh();
   }
  }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
 })();
+const routerSelect=document.getElementById('router_id'),preflight=document.getElementById('routerPreflight');
+routerSelect.addEventListener('change',()=>{preflight.disabled=!routerSelect.value});
+preflight.addEventListener('click',async()=>{
+ if(!routerSelect.value)return;
+ const values=Object.fromEntries(new FormData(form).entries());
+ const data={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])data[key]=values[key];
+ if(values.transport==='reality-tcp'){
+  data.target_port=Number(values.target_port);
+  data.short_ids=values.short_ids.split(',').map(x=>x.trim());
+  data.server_names=[values.server_name];
+ }
+ preflight.disabled=true;
+ output.classList.remove('error');
+ output.textContent='Проверка кандидата установленным Xray на OpenWrt (текущий туннель остаётся без изменений)…';
+ try{
+  const response=await fetch('/api/transports/router/preflight',{
+   method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',
+   body:JSON.stringify({profiles:[data],router_id:values.router_id,
+                        remote_host:values.remote_host,ssh_password:values.ssh_password})
+  });
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Router preflight failed');
+  output.textContent='OpenWrt Xray: PASS. UCI, работающий туннель и Xray не изменялись.';
+ }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
+ finally{preflight.disabled=!routerSelect.value}
+});
 form.addEventListener('submit',async e=>{
  e.preventDefault();output.classList.remove('error');output.textContent='Проверка…';
  const values=Object.fromEntries(new FormData(form).entries());
