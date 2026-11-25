@@ -7,6 +7,7 @@ of any already degraded recently online router before maintenance.
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 import socket
+import re
 import time
 import sys
 from pathlib import Path
@@ -25,12 +26,16 @@ def ssh_check(port):
             data=b""
             while len(data)<4096 and time.monotonic()<deadline:
                 sock.settimeout(max(.1,deadline-time.monotonic()))
-                chunk=sock.recv(512)
+                chunk=sock.recv(min(512,4096-len(data)))
                 if not chunk:
                     break
                 data+=chunk
-                if any(line.startswith(b"SSH-") for line in data.splitlines()):
-                    return True,"SSH banner"
+                # The last fragment is not a complete protocol identification.
+                # A truncated or malformed prefix must never pass a rollout gate.
+                for line in data.split(b"\n")[:-1]:
+                    if len(line)<=254 and re.fullmatch(
+                            rb"SSH-(?:2\.0|1\.99)-[!-~]+(?: [ -~]*)?\r?",line):
+                        return True,"SSH banner"
         return False,"no SSH banner"
     except OSError as exc:
         return False,type(exc).__name__
