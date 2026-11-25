@@ -67,6 +67,24 @@ class FleetTests(unittest.TestCase):
         with patch.object(fleet.socket,"create_connection",return_value=MagicMock(__enter__=lambda s:sock,__exit__=lambda *a:False)):
             self.assertTrue(fleet.ssh_check(19120)[0])
 
+    def test_truncated_or_malformed_banner_is_rejected(self):
+        for chunks in ([b"SSH-",b""],
+                       [b"SSH-2.0-dropbear",b""],
+                       [b"SSH-2.0-\r\n",b""],
+                       [b"SSH-1.5-obsolete\r\n",b""],
+                       [b"SSH-2.0-"+b"x"*250+b"\r\n",b""]):
+            with self.subTest(chunks=chunks):
+                sock=MagicMock()
+                sock.recv.side_effect=chunks
+                with patch.object(fleet.socket,"create_connection",return_value=MagicMock(__enter__=lambda s:sock,__exit__=lambda *a:False)):
+                    self.assertFalse(fleet.ssh_check(19120)[0])
+
+    def test_complete_ssh_banner_with_comment_and_fragmented_newline(self):
+        sock=MagicMock()
+        sock.recv.side_effect=[b"SSH-2.0-OpenSSH_9.0 Debian\r",b"\n"]
+        with patch.object(fleet.socket,"create_connection",return_value=MagicMock(__enter__=lambda s:sock,__exit__=lambda *a:False)):
+            self.assertTrue(fleet.ssh_check(19120)[0])
+
     def test_luci_root_error_retries_canonical_path(self):
         conn=MagicMock()
         conn.getresponse.side_effect=[MagicMock(status=404),MagicMock(status=200)]
