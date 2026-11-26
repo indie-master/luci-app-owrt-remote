@@ -108,7 +108,10 @@ class StoreTests(unittest.TestCase):
                  "grpc": {"service_name": "reverse"},
                  "reality-tcp": {"target_host": "target.example.org", "target_port": 443,
                                  "server_names": ["reality-tcp.example.org"]}}
-        with patch("unified_transport_catalog.protected", side_effect=lambda root: root), \
+        # Mock host ownership only for this catalog fixture; read_private still
+        # checks regular-file, link, mode and size metadata on the actual file.
+        with patch("stack_runtime.protected", side_effect=lambda path: path), \
+             patch("unified_transport_catalog.protected", side_effect=lambda root: root), \
              patch("unified_transport_catalog.live_tcp_ports", return_value=set()), \
              patch("unified_transport_catalog.mounted_certificate",
                    return_value={"certificate_file": "/etc/router-orchestrator/tls/fixture.crt",
@@ -167,7 +170,10 @@ class StoreTests(unittest.TestCase):
         container = "b" * 64
         adapter.owned_xray.return_value = container
         tls = {"certificate_file": "certificate-v1", "key_file": "key-v1"}
-        with patch("unified_transport_catalog.protected", side_effect=lambda root: root), \
+        # Mock host ownership only for this catalog fixture; read_private still
+        # checks regular-file, link, mode and size metadata on the actual file.
+        with patch("stack_runtime.protected", side_effect=lambda path: path), \
+             patch("unified_transport_catalog.protected", side_effect=lambda root: root), \
              patch("unified_transport_catalog.live_tcp_ports", return_value=set()) as ports, \
              patch("unified_transport_catalog.tls_binding", side_effect=lambda *_: dict(tls)), \
              patch("unified_transport_catalog.mounted_certificate",

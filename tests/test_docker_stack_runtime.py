@@ -63,11 +63,25 @@ class StackRuntimeTests(unittest.TestCase):
 
     def test_backup_blocks_running_stack_and_catalog_symlink(self):
         runtime = self.setup_stack()
-        runtime.path.touch()
-        runtime.journal.touch()
-        runtime.plan["nginx_conf"].parent.mkdir(exist_ok=True)
+        runtime.path.touch(mode=0o600)
+        runtime.journal.touch(mode=0o600)
+        runtime.plan["nginx_conf"].parent.mkdir(mode=0o700, exist_ok=True)
         runtime.plan["nginx_conf"].write_text("test configuration")
-        with patch.object(runtime, "verify_release"), \
+        runtime.plan["nginx_conf"].chmod(0o600)
+        # Simulate root ownership only inside this disposable fixture.
+        # Keep real modes, file types and path resolution checks intact.
+        real_lstat = Path.lstat
+
+        def fixture_lstat(path):
+            info = real_lstat(path)
+            if path.is_relative_to(self.root):
+                fields = list(info)
+                fields[4] = 0  # st_uid
+                return os.stat_result(fields)
+            return info
+
+        with patch.object(Path, "lstat", autospec=True, side_effect=fixture_lstat), \
+             patch.object(runtime, "verify_release"), \
              patch.object(runtime, "inspect") as inspect, \
              patch.object(manager, "backup_state") as archive:
             inspect.return_value = {"hub": {"State": {"Status": "running"}}}
