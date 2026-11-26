@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
 from docker_stack_integration_ci import AdapterCheckFailed, adapter_check, hub_check
 from stack_runtime import OWNER, REVISION, Stack
-from unified_xray_adapter import MAX_REQUEST, Adapter, parameters, read_request
+from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
 from unified_xray_state import XrayState, encode
 
 HUB_SPEC = importlib.util.spec_from_file_location("unified_xray_test_hub", ROOT / "vps/owrt-remote-hub.py")
@@ -154,7 +154,8 @@ class TransactionTests(unittest.TestCase):
         self.release = {"revision": "revision", "images": {"xray": "sha256:" + "1" * 64}}
         self.record = {
             "Image": self.release["images"]["xray"], "Id": "b" * 64, "Name": "/" + self.stack.name + "-xray",
-            "HostConfig": {"NetworkMode": "host", "ReadonlyRootfs": True, "Privileged": False},
+            "HostConfig": {"NetworkMode": "host", "ReadonlyRootfs": True, "Privileged": False,
+                           "Tmpfs": dict(XRAY_TMPFS)},
             "Config": {"Labels": {OWNER: self.stack.owner, REVISION: "revision",
                          "com.docker.compose.project": self.stack.name, "com.docker.compose.service": "xray"},
                        "User": f"{m.HUB_UID}:{m.HUB_GID}", "Cmd": ["run", "-config", "/etc/xray/owrt-remote.json"]},
@@ -282,6 +283,31 @@ class TransactionTests(unittest.TestCase):
             with patch.dict(mapping, {key: "foreign"}), self.assertRaises(m.Blocked):
                 self.call("restart")
         self.adapter.restart.assert_not_called()
+
+    def test_xray_image_volumes_must_be_explicitly_overridden(self):
+        host = self.record["HostConfig"]
+        self.assertEqual(self.adapter.owned_xray(self.stack, self.release, self.record), self.record["Id"])
+        for dest in ("/usr/local/etc/xray", "/var/log/xray"):
+            with self.subTest(dest=dest):
+                mounts = self.record["Mounts"]
+                mounts.append({"Type": "volume", "RW": True, "Destination": dest, "Source": "/foreign"})
+                try:
+                    with self.assertRaisesRegex(m.Blocked, "bind-mounts"):
+                        self.adapter.owned_xray(self.stack, self.release, self.record)
+                    mounts[-1] = {"Type": "tmpfs", "Destination": dest}
+                    self.assertEqual(self.adapter.owned_xray(self.stack, self.release, self.record), self.record["Id"])
+                finally:
+                    mounts.pop()
+                with patch.dict(host, {"Tmpfs": {p: v for p, v in XRAY_TMPFS.items() if p != dest}}):
+                    with self.assertRaisesRegex(m.Blocked, "tmpfs"):
+                        self.adapter.owned_xray(self.stack, self.release, self.record)
+        for tmpfs in (dict(XRAY_TMPFS, **{"/unexpected": "rw"}),
+                      dict(XRAY_TMPFS, **{"/usr/local/etc/xray": "rw"})):
+            with patch.dict(host, {"Tmpfs": tmpfs}), self.assertRaisesRegex(m.Blocked, "tmpfs"):
+                self.adapter.owned_xray(self.stack, self.release, self.record)
+        self.record["Mounts"].append({"Type": "tmpfs", "Destination": "/unexpected"})
+        with self.assertRaisesRegex(m.Blocked, "bind-mounts"):
+            self.adapter.owned_xray(self.stack, self.release, self.record)
 
     def test_hold_blocks_prepare_and_recovery(self):
         self.prepare()

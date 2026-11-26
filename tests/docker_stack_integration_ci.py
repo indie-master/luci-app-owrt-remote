@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
 from stack_runtime import Ingress, Stack, docker, websocket
 from orchestrator_stack_config import STREAM_MODULE, render_external, render_internal, stack_plan
-from unified_xray_adapter import Adapter, socket_address
+from unified_xray_adapter import Adapter, XRAY_TMPFS, socket_address
 from unified_xray_state import XrayState
 
 HUB = "hub.example.invalid"
@@ -483,6 +483,11 @@ def wrong_peer(runtime, uid):
 def test_adapter(env, config, project):
     runtime = Stack(env, config)
     state = XrayState(runtime)
+    with adapter_check("ipc-readiness", "upstream-image-volumes"):
+        volumes = json.loads(docker("image", "inspect", "--format", "{{json .Config.Volumes}}",
+                                    config["RO_XRAY_IMAGE"]))
+        assert set(volumes or {}) == {"/usr/local/etc/xray", "/var/log/xray"}
+        assert set(volumes) <= set(XRAY_TMPFS)
     port, ssh_port, edit_port, failing, abandoned, abandoned_ssh = choose_ports(6)
     crash_token = uuid.uuid4().hex
 
@@ -496,7 +501,13 @@ def test_adapter(env, config, project):
         @staticmethod
         def owned_xray(stack, release, record):
             with adapter_detail("ipc-readiness", "xray-ownership"):
-                return Adapter.owned_xray(stack, release, record)
+                try:
+                    return Adapter.owned_xray(stack, release, record)
+                except m.Blocked as error:
+                    for reason in ("identity", "runtime", "tmpfs", "bind-mounts"):
+                        if str(error) == "Xray ownership verification failed: " + reason:
+                            print("Xray ownership check failed:", reason, file=sys.stderr, flush=True)
+                    raise
 
         def test_config(self, stack, release, data):
             with adapter_detail("xray-validation", "candidate"):

@@ -17,6 +17,11 @@ from stack_runtime import OWNER, REVISION, Stack, open_settings, protected
 from unified_xray_state import BACKEND, MAX_CONFIG, ROUTER_ID, TOKEN, XrayState, read_private, router_spec
 
 MAX_REQUEST = 8192
+XRAY_TMPFS = {
+    "/tmp": "rw,nosuid,nodev,size=32m",
+    "/usr/local/etc/xray": "ro,nosuid,nodev,noexec,size=1m",
+    "/var/log/xray": "rw,nosuid,nodev,noexec,size=32m,uid=23088,gid=23088,mode=0700",
+}
 OPERATIONS = {
     "status": {frozenset()},
     "version": {frozenset()},
@@ -111,7 +116,7 @@ class Adapter:
         host, config = record["HostConfig"], record["Config"]
         labels = config["Labels"]
         mounts = [mount for mount in record["Mounts"]
-                  if not (mount["Type"] == "tmpfs" and mount["Destination"] == "/tmp")]
+                  if not (mount["Type"] == "tmpfs" and mount["Destination"] in XRAY_TMPFS)]
         expected = {"/etc/xray": stack.config["RO_XRAY_CONFIG_DIR"],
                     "/usr/local/share/xray": stack.config["RO_XRAY_ASSET_DIR"],
                     "/etc/router-orchestrator/tls": stack.config["RO_TLS_DIR"]}
@@ -120,16 +125,23 @@ class Adapter:
                   labels.get("com.docker.compose.project") == stack.name and
                   labels.get("com.docker.compose.service") == "xray" and
                   record["Name"] == "/" + stack.name + "-xray" and
-                  re.fullmatch(r"[a-f0-9]{64}", record["Id"]) and
-                  host["NetworkMode"] == "host" and host["ReadonlyRootfs"] is True and
+                  re.fullmatch(r"[a-f0-9]{64}", record["Id"]),
+                  "Xray ownership verification failed: identity")
+        m.require(host["NetworkMode"] == "host" and host["ReadonlyRootfs"] is True and
                   not host["Privileged"] and not host.get("CapAdd") and not host.get("Devices") and
                   host.get("PidMode", "") in {"", "private"} and config["User"] == f"{m.HUB_UID}:{m.HUB_GID}" and
-                  config["Cmd"] == ["run", "-config", "/etc/xray/owrt-remote.json"] and
-                  len(mounts) == len(expected) and
+                  config["Cmd"] == ["run", "-config", "/etc/xray/owrt-remote.json"],
+                  "Xray ownership verification failed: runtime")
+        tmpfs = host.get("Tmpfs") or {}
+        m.require(set(tmpfs) == set(XRAY_TMPFS) and
+                  all(set(options.split(",")) == set(XRAY_TMPFS[path].split(","))
+                      for path, options in tmpfs.items()),
+                  "Xray ownership verification failed: tmpfs")
+        m.require(len(mounts) == len(expected) and
                   all(mount["Type"] == "bind" and mount["RW"] is False and
                       expected.get(mount["Destination"]) == mount["Source"] for mount in mounts) and
                   {mount["Destination"] for mount in mounts} == expected.keys(),
-                  "Xray ownership verification failed")
+                  "Xray ownership verification failed: bind-mounts")
         return record["Id"]
 
     def probe(self, stack, release, routers):
@@ -167,6 +179,8 @@ class Adapter:
                    "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
                    "--pids-limit=64", "--memory=128m", "--user", f"{m.HUB_UID}:{m.HUB_GID}",
                    "--env", "XRAY_LOCATION_ASSET=/usr/local/share/xray",
+                   *(arg for path, options in XRAY_TMPFS.items()
+                     for arg in ("--tmpfs", path + ":" + options)),
                    *mounts, release["images"]["xray"], "run", "-test", "-config", "/etc/xray/owrt-remote.json")
 
     def handle(self, stack, release, records, request):

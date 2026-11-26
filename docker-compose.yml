@@ -55,6 +55,10 @@ services:
     command: ["run", "-config", "/etc/xray/owrt-remote.json"]
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=32m
+      # Override the official image's declared volumes; never create anonymous
+      # persistent mounts for its unused default config or log directory.
+      - /usr/local/etc/xray:ro,nosuid,nodev,noexec,size=1m
+      - /var/log/xray:rw,nosuid,nodev,noexec,size=32m,uid=23088,gid=23088,mode=0700
     volumes:
       - type: bind
         source: ${RO_XRAY_CONFIG_DIR:-./.unconfigured-xray}
