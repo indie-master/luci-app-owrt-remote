@@ -128,7 +128,8 @@ class Stack:
         m.require(self.state.parent == path.parent and self.state.name != "backups",
                   "HUB state must be a dedicated child of the stack env directory")
         m.require(not path.parent.stat().st_mode & 0o077, "Stack env directory must be private")
-        m.require(not self.state.is_relative_to(m.LOCK.parent / "data"),
+        m.require(not self.state.is_relative_to(m.LEGACY_HUB_STATE) and
+                  not m.LEGACY_HUB_STATE.is_relative_to(self.state),
                   "The existing HUB state is reserved")
         self.services = ("hub", "xray") if self.plan["mode"] == "external-only" else ("hub", "xray", "nginx")
         self.journal = path.parent / (".stack-" + self.name + ".json")
@@ -179,7 +180,7 @@ class Stack:
 
     def guard(self):
         holds = (self.state / ".xray-maintenance-hold",
-                 Path("/opt/router-orchestrator/data/.xray-maintenance-hold"))
+                 m.LEGACY_HUB_STATE / ".xray-maintenance-hold")
         m.require(not any(path.exists() or path.is_symlink() for path in holds),
                   "Xray maintenance HOLD is active")
         m.require(not m.status_service(), "Existing host HUB is active")

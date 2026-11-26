@@ -33,8 +33,10 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 ENV = ROOT / ".env"
 APP = ROOT / "vps" / "owrt-remote-hub.py"
-LOCK = Path("/opt/router-orchestrator/.deploy.lock")
-BACKUPS = Path("/opt/router-orchestrator/backups")
+HUB_DEPLOY_ROOT = Path("/opt/router-orchestrator")
+LEGACY_HUB_STATE = HUB_DEPLOY_ROOT / "data"
+LOCK = HUB_DEPLOY_ROOT / ".deploy.lock"
+BACKUPS = HUB_DEPLOY_ROOT / "backups"
 ALLOWED = {"RO_IMAGE", "RO_STATE_DIR", "RO_PORT", "RO_PUBLIC_URL", "RO_XRAY_BACKEND"}
 MAX_ARCHIVE = 2 * 1024**3
 MAX_DATA = 4 * 1024**3
@@ -240,7 +242,7 @@ def install(args):
     require(not ENV.exists() and not ENV.is_symlink(), "An installation already exists; never overwrite .env")
     require(call("docker", "compose", "version").returncode == 0, "Docker Compose missing")
     default_port = 18089
-    default_data = "/opt/router-orchestrator/data"
+    default_data = str(LEGACY_HUB_STATE)
     if args.non_interactive:
         require(args.public_url and args.port and args.state_dir,
                 "Noninteractive mode requires --public-url, --port and --state-dir")
@@ -272,14 +274,14 @@ def state_path():
     return value
 
 def require_new_destination(dest):
-    base = LOCK.parent
+    base = HUB_DEPLOY_ROOT
     require(dest.is_absolute() and base in dest.parents and dest == dest.resolve()
             and not dest.exists(), f"Require a new directory under {base} without path aliases")
 
 
 def create_private_parents(path):
     for parent in reversed(path.parents):
-        if LOCK.parent in parent.parents and not parent.exists():
+        if HUB_DEPLOY_ROOT in parent.parents and not parent.exists():
             parent.mkdir(mode=0o700)
             sync_directory(parent.parent)
 
@@ -539,7 +541,7 @@ def restore_members(tar, reader, dest):
         sync_directory(state)
         publish_restore(state, dest)
 
-RELEASE_STATE = Path("/opt/router-orchestrator/.releases.json")
+RELEASE_STATE = HUB_DEPLOY_ROOT / ".releases.json"
 
 
 def sync_directory(path):
@@ -666,7 +668,7 @@ def schema_fingerprint(config):
 
 
 def journal_path():
-    return LOCK.parent / ".transaction.json"
+    return HUB_DEPLOY_ROOT / ".transaction.json"
 
 
 def read_transaction():
@@ -745,7 +747,7 @@ def finish_install(tx):
     require(image_id(config["RO_IMAGE"]) == identifier, "Install image tag changed")
     state = Path(config["RO_STATE_DIR"])
     hub = observed_hub(config, {identifier})
-    require(state == state.resolve() and LOCK.parent in state.parents, "Unsafe install state path")
+    require(state == state.resolve() and HUB_DEPLOY_ROOT in state.parents, "Unsafe install state path")
     if not ENV.exists():
         require(hub is None, "Unexpected HUB during incomplete install")
         # Resume only an empty directory created before publishing .env.

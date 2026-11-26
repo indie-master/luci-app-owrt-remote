@@ -1,4 +1,5 @@
 """Offline regression coverage for the unified Docker Manager."""
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager
 import stack_runtime as stack
+from docker_stack_integration_ci import diagnose_gate
 
 
 def config_document():
@@ -32,6 +34,60 @@ class StackRuntimeTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         return stack.Stack(self.root / "stack.env", fixture(self.root, mode))
+
+    def test_ci_lock_does_not_reserve_isolated_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(manager, "LOCK", root / ".deploy.lock"):
+                self.assertEqual(manager.journal_path(),
+                                 Path("/opt/router-orchestrator/.transaction.json"))
+                for mode in stack.MODES:
+                    with self.subTest(mode=mode):
+                        runtime = stack.Stack(root / "stack.env", fixture(root, mode))
+                        self.assertEqual(runtime.state, root / "data")
+                        runtime.state_permissions(initializing=True)
+
+    def test_ci_lock_does_not_unreserve_legacy_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(manager, "LOCK", root / ".deploy.lock"), \
+                 patch.object(Path, "stat", autospec=True,
+                              return_value=Mock(st_mode=0o700)), \
+                 patch.object(Path, "resolve", autospec=True, side_effect=lambda path: path):
+                legacy = Path("/opt/router-orchestrator/data")
+                for parent in (legacy.parent, legacy, legacy / "nested"):
+                    with self.subTest(parent=parent), self.assertRaisesRegex(
+                        manager.Blocked, "The existing HUB state is reserved"
+                    ):
+                        stack.Stack(parent / "stack.env", fixture(parent, "standalone"))
+
+    def test_ci_gate_diagnostics_hide_raw_errors(self):
+        output = io.StringIO()
+        runtime = self.setup_stack()
+
+        def preflight(_stack, _release):
+            try:
+                raise subprocess.CalledProcessError(1, ["secret-argument"], stderr="secret-output")
+            except subprocess.CalledProcessError as error:
+                raise manager.Blocked("xray configuration test failed") from error
+
+        def await_ready(_stack, _release):
+            raise manager.Blocked("Readiness failed: hub, HTTPS routing")
+
+        def unexpected(_stack, _release):
+            raise manager.Blocked("Readiness failed: hub, secret-value")
+
+        with patch.object(sys, "stderr", output):
+            gates = [diagnose_gate(gate) for gate in (preflight, await_ready, unexpected)]
+        for gate in gates:
+            with self.assertRaises(manager.Blocked):
+                gate(runtime, {})
+        result = output.getvalue()
+        self.assertIn("preflight, mode=standalone", result)
+        self.assertIn("xray configuration test failed", result)
+        self.assertIn("Gate command exit status: 1", result)
+        self.assertIn("Failed readiness checks: hub, HTTPS routing", result)
+        self.assertNotIn("secret", result)
 
     def test_xray_checks_loopback_protocol_path_and_port_topology(self):
         runtime = self.setup_stack()
@@ -106,6 +162,24 @@ class StackRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(manager.Blocked, "HOLD"):
                 runtime.guard()
             check.assert_not_called()
+
+    def test_legacy_hold_and_configured_overlap_are_checked_with_isolated_lock(self):
+        runtime = self.setup_stack()
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        hold = legacy / ".xray-maintenance-hold"
+        hold.symlink_to("missing")
+        legacy_env = self.root / "legacy.env"
+        config = {key: runtime.config[key] for key in manager.ALLOWED}
+        config["RO_STATE_DIR"] = str(runtime.state / "nested")
+        with patch.multiple(manager, LOCK=self.root / ".deploy.lock", LEGACY_HUB_STATE=legacy,
+                            ENV=legacy_env), patch.object(manager, "status_service", return_value=False):
+            manager.save_env(config)
+            with self.assertRaisesRegex(manager.Blocked, "HOLD"):
+                runtime.guard()
+            hold.unlink()
+            with self.assertRaisesRegex(manager.Blocked, "overlaps the existing HUB-only installation"):
+                runtime.guard()
 
     def test_foreign_container_cannot_be_adopted(self):
         runtime = self.setup_stack()

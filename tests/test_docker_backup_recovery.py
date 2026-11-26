@@ -63,7 +63,7 @@ class TransactionTests(unittest.TestCase):
         self.health = True
         self.failure = None
         self.enterContext(patch.multiple(
-            manager, LOCK=root / ".lock", ENV=root / ".env", RELEASE_STATE=root / ".release",
+            manager, LOCK=root / ".lock", HUB_DEPLOY_ROOT=root, ENV=root / ".env", RELEASE_STATE=root / ".release",
             require_root=lambda: None, status_service=lambda: False,
             compose_signature=lambda config: self.model, image_id=self.images.__getitem__,
             observed_hub=self.observe, compose_up=self.up, compose_stop=self.stop,
@@ -257,7 +257,7 @@ class InstallTransactionTests(unittest.TestCase):
         self.starts = 0
         self.ready = True
         self.enterContext(patch.multiple(
-            manager, LOCK=root / ".lock", ENV=root / ".env", HUB_UID=os.getuid(),
+            manager, LOCK=root / ".lock", HUB_DEPLOY_ROOT=root, ENV=root / ".env", HUB_UID=os.getuid(),
             HUB_GID=os.getgid(), status_service=lambda: False,
             compose_signature=lambda config: "model", image_id=lambda image: self.identifier,
             health=lambda port, revision=None: self.ready, observed_hub=self.observe, compose_up=self.up,
@@ -333,6 +333,7 @@ class BackupArchiveTests(unittest.TestCase):
         (self.state / "nested").mkdir()
         (self.state / "nested" / "hub.db").write_bytes(b"auxiliary file")
         self.enterContext(patch.multiple(manager, BACKUPS=self.archives, LOCK=self.root / ".lock",
+                                         HUB_DEPLOY_ROOT=self.root,
                                          HUB_UID=os.getuid(), HUB_GID=os.getgid(),
                                          require_root=lambda: None, status_service=lambda: False,
                                          docker_hub_states=lambda: ["exited"],

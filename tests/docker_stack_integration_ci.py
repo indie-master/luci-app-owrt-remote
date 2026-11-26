@@ -1,5 +1,6 @@
 """Real unified-stack checks restricted to disposable GitHub-hosted runners."""
 import contextlib
+from functools import wraps
 import io
 import json
 import os
@@ -17,7 +18,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
-from stack_runtime import Ingress, docker, websocket
+from stack_runtime import Ingress, Stack, docker, websocket
 from orchestrator_stack_config import STREAM_MODULE, render_external, render_internal, stack_plan
 
 HUB = "hub.example.invalid"
@@ -26,10 +27,35 @@ WS_PATH = "/owrt-ws/"
 CI_LABEL = "org.router-orchestrator.integration"
 
 
+def diagnose_gate(gate):
+    diagnostics = sys.stderr
+
+    @wraps(gate)
+    def checked(stack, release):
+        try:
+            return gate(stack, release)
+        except Exception as error:
+            print(f"CI stack gate failed: {gate.__name__}, mode={stack.plan['mode']}",
+                  file=diagnostics, flush=True)
+            if isinstance(error, m.Blocked):
+                reason = str(error)
+                if reason in {"xray configuration test failed", "nginx configuration test failed"}:
+                    print(reason, file=diagnostics)
+                elif reason.startswith("Readiness failed: "):
+                    failed = reason.removeprefix("Readiness failed: ").split(", ")
+                    if set(failed) <= {"hub", "xray", "nginx", "HTTPS routing"}:
+                        print("Failed readiness checks:", ", ".join(failed), file=diagnostics)
+            command_error = error if isinstance(error, subprocess.CalledProcessError) else error.__cause__
+            if isinstance(command_error, subprocess.CalledProcessError):
+                print("Gate command exit status:", command_error.returncode, file=diagnostics)
+            raise
+    return checked
+
+
 def cli(path, *args, expected=0):
     output = io.StringIO()
     with patch.object(sys, "argv", ["manager.py", "stack", "--env-file", str(path), *map(str, args)]):
-        with contextlib.redirect_stdout(output):
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
             code = m.main()
     assert code == expected, (args[0], code, expected)
     return output.getvalue()
@@ -218,7 +244,6 @@ def test_release(root, env, config, project):
         write_env(proposal, dict(config, RO_IMAGE=candidate))
         update = ("update", "--candidate-env", proposal, "--acknowledge-schema-risk")
         # Kill the Manager while the candidate is ready, before the env commit.
-        from stack_runtime import Stack
         pid = os.fork()
         if pid == 0:
             try:
@@ -265,7 +290,10 @@ def main():
             assert m.build_image() == hub_image
             config, plan, module = fixture(root, mode, project, hub_image, nginx, xray)
             write_env(env, config)
-            with patch.object(m, "LOCK", root / ".deploy.lock"):
+            with patch.object(m, "LOCK", root / ".deploy.lock"), \
+                 patch.object(m, "HUB_DEPLOY_ROOT", root), \
+                 patch.object(Stack, "preflight", diagnose_gate(Stack.preflight)), \
+                 patch.object(Stack, "await_ready", diagnose_gate(Stack.await_ready)):
                 cli(env, "validate")
                 cli(env, "start")
                 expected = {"hub": True, "xray": True}

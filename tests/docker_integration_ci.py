@@ -225,6 +225,7 @@ def run(root):
     manager.PROJECT = project
     manager.ENV = root / ".env"
     manager.LOCK = root / ".lock"
+    manager.HUB_DEPLOY_ROOT = root
     manager.BACKUPS = root / "backups"
     manager.RELEASE_STATE = root / ".releases.json"
     state = root / "state"
