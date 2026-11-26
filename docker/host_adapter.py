@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Host-only Router Orchestrator capability adapter.
 
-No docker.sock, no arbitrary shell command, no dynamic paths or systemd units.
-The write capabilities are OFF unless explicitly enabled by the operator.
-Requests are accepted only from a dedicated Docker HUB peer UID over a
-mode-0660 Unix socket. Mount /run/router-orchestrator read-only in HUB.
+The legacy mode uses a mode-0660 Unix socket and explicit write flags.
+Unified mode uses a private stack env and verifies the calling HUB container.
+Both modes expose fixed operations without granting HUB access to Docker or
+arbitrary host commands.
 """
 from __future__ import annotations
 import argparse
@@ -1083,10 +1083,21 @@ class Adapter:
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--socket", default=str(SOCKET))
+    p.add_argument("--stack-env", type=Path, help="Private env for one managed unified Docker project")
     p.add_argument("--peer-uid", type=int, default=23088)
     p.add_argument("--allow-xray-restart", action="store_true")
     p.add_argument("--allow-xray-apply", action="store_true")
     args = p.parse_args()
+    if args.stack_env is not None:
+        if args.socket != str(SOCKET) or args.peer_uid != 23088 or args.allow_xray_restart or args.allow_xray_apply:
+            p.error("Unified stack mode cannot be combined with legacy adapter settings")
+        from manager import Blocked
+        from unified_xray_adapter import Adapter as UnifiedAdapter
+        try:
+            UnifiedAdapter(args.stack_env).run()
+        except (Blocked, OSError, ValueError):
+            raise SystemExit("Unified Xray adapter startup refused") from None
+        raise SystemExit(0)
     require(Path(args.socket) == SOCKET, "custom socket paths are forbidden")
     require(0 < args.peer_uid < 65535, "invalid HUB peer UID")
     require(os.geteuid() == 0, "Host adapter requires root service")

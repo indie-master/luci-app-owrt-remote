@@ -189,7 +189,7 @@ class StackRuntimeTests(unittest.TestCase):
                        "com.docker.compose.service": "xray",
                        stack.REVISION: "revision", stack.OWNER: "wrong-owner",
                    }}}
-        with patch.object(stack, "docker", side_effect=lambda *args:
+        with patch.object(stack, "docker", side_effect=lambda *args, **_:
                           json.dumps([foreign]) if args[0] == "container" else "foreign-id"):
             with self.assertRaisesRegex(manager.Blocked, "Unexpected container"):
                 runtime.inspect({"images": {"xray": "image"}, "revision": "revision"})

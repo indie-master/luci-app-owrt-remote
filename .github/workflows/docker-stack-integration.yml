@@ -11,6 +11,7 @@ on:
       - 'tools/orchestrator_setup_profiles.py'
       - 'tests/docker_stack_integration_ci.py'
       - 'tests/test_docker_stack_runtime.py'
+      - 'tests/test_unified_xray_adapter.py'
       - 'vps/**'
   workflow_dispatch:
 permissions:
@@ -23,6 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         mode: [standalone, external-stream, external-only]
+        backend: [external_readonly, unified_adapter]
     env:
       PATH: /usr/local/bin:/usr/bin:/bin
       RO_CI_COMPOSE_VERSION: v2.39.4
@@ -39,6 +41,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p test_docker_stack_runtime.py
           python3 -m unittest discover -s tests -p test_orchestrator_stack_config.py
+          sudo env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_unified_xray_adapter.py
       - name: Verify pinned Docker Compose plugin
         run: |
           set -euo pipefail
@@ -80,10 +83,12 @@ jobs:
       - name: Run the real stack and isolated ingress fixture
         env:
           RO_CI_MODE: ${{ matrix.mode }}
+          RO_CI_BACKEND: ${{ matrix.backend }}
         run: |
           sudo env -i HOME=/root PATH="$PATH" DOCKER_CONFIG="$DOCKER_CONFIG" \
             PYTHONDONTWRITEBYTECODE=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" \
             RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
             GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$GITHUB_WORKSPACE" \
             RO_CI_XRAY_IMAGE="$RO_CI_XRAY_IMAGE" RO_CI_NGINX_IMAGE="$RO_CI_NGINX_IMAGE" \
+            RO_CI_BACKEND="$RO_CI_BACKEND" RO_CI_XRAY_VERSION="$RO_CI_XRAY_VERSION" \
             python3 tests/docker_stack_integration_ci.py "$RO_CI_MODE"

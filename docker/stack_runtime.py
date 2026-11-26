@@ -18,6 +18,7 @@ import manager as m
 
 sys.path.insert(0, str(m.ROOT / "tools"))
 from orchestrator_stack_config import MODES, STACK_KEYS, render_external, render_internal, stack_plan
+from unified_xray_state import XrayState
 
 OWNER = "org.router-orchestrator.stack-owner"
 REVISION = "org.router-orchestrator.stack-revision"
@@ -55,9 +56,9 @@ def open_settings(path):
     return config
 
 
-def docker(*args):
+def docker(*args, timeout=120):
     return m.call("docker", "--host", "unix:///var/run/docker.sock", *args,
-                  env=m.local_docker_env(), timeout=120).stdout
+                  env=m.local_docker_env(), timeout=timeout).stdout
 
 
 def websocket(conn, host, path):
@@ -115,7 +116,8 @@ def verify_certificate(directory, host):
 
 
 class Stack:
-    def __init__(self, path, config):
+    def __init__(self, path, config, *, command_timeout=120):
+        self.command_timeout = command_timeout
         self.path = path
         self.config = config
         m.require(config.get("RO_STACK_MODE") in MODES and "RO_STACK_NAME" in config,
@@ -148,20 +150,20 @@ class Stack:
                 config["RO_NGINX_IMAGE"] = release["images"]["nginx"]
             runtime = release["images"]["hub"]
         return m.compose(*args, config=config, runtime_image=runtime, project=self.name,
-                         profile=self.plan["mode"], local=True).stdout
+                         profile=self.plan["mode"], local=True, timeout=self.command_timeout).stdout
 
     def model(self, release):
         model = json.loads(self.compose("config", "--format", "json", release=release))
         m.require(set(model["services"]) == set(self.services), "Unexpected Compose services")
         hub = model["services"]["hub"]
         mounts = hub.get("volumes", [])
-        m.require(hub["environment"].get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "external_readonly" and
+        m.require(hub["environment"].get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == self.config["RO_XRAY_BACKEND"] and
                   hub.get("read_only") is True and not hub.get("privileged") and
                   hub.get("user") == f"{m.HUB_UID}:{m.HUB_GID}" and
                   len(mounts) == 1 and mounts[0]["type"] == "bind" and
                   mounts[0]["source"] == str(self.state) and
                   mounts[0]["target"] == "/var/lib/owrt-remote",
-                  "Compose HUB must have only its private state mount and read-only Xray control")
+                  "Compose HUB must have only its private state mount and the configured Xray backend")
         return digest(model)
 
     def owns_hub(self, item):
@@ -171,19 +173,21 @@ class Stack:
                 item["HostConfig"]["NetworkMode"] == "host" and
                 not item["HostConfig"].get("Privileged") and
                 item["Config"]["User"] == f"{m.HUB_UID}:{m.HUB_GID}" and
-                environment.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "external_readonly" and
+                environment.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == self.config["RO_XRAY_BACKEND"] and
                 environment.get("OWRT_REMOTE_BIND") == "127.0.0.1" and
                 environment.get("OWRT_REMOTE_PORT") == str(self.plan["hub"]) and
                 len(mounts) == 1 and mounts[0]["Type"] == "bind" and mounts[0]["RW"] is True and
                 mounts[0]["Source"] == str(self.state) and
                 mounts[0]["Destination"] == "/var/lib/owrt-remote")
 
-    def guard(self):
+    def xray_hold(self):
         holds = (self.state / ".xray-maintenance-hold",
                  m.LEGACY_HUB_STATE / ".xray-maintenance-hold")
-        m.require(not any(path.exists() or path.is_symlink() for path in holds),
-                  "Xray maintenance HOLD is active")
-        m.require(not m.status_service(), "Existing host HUB is active")
+        return any(path.exists() or path.is_symlink() for path in holds)
+
+    def guard(self):
+        m.require(not self.xray_hold(), "Xray maintenance HOLD is active")
+        m.require(not m.status_service(timeout=self.command_timeout), "Existing host HUB is active")
         legacy = m.ENV
         if legacy.exists() or legacy.is_symlink():
             other = Path(m.settings()["RO_STATE_DIR"]).resolve()
@@ -200,13 +204,22 @@ class Stack:
                    (initializing and owner == (0, 0) and not any(self.state.iterdir()))),
                   "HUB state requires a private directory owned by 23088:23088")
 
-    def material(self):
+    def material(self, *, recover_xray=False):
         paths = [Path(self.config[key]) for key in ("RO_XRAY_CONFIG_DIR", "RO_XRAY_ASSET_DIR", "RO_TLS_DIR")]
+        state = XrayState(self)
+        baseline = state.baseline(recover=recover_xray)
+        staging = None
+        if self.config["RO_XRAY_BACKEND"] == "unified_adapter" and (
+                state.staging.exists() or state.staging.is_symlink()):
+            m.require(recover_xray and baseline is not None, "Unexpected Xray staging directory")
+            staging = state.check_staging()
         files = {}
         total = 0
         for directory in paths:
             m.require(protected(directory).is_dir(), "Expected an Xray or TLS directory")
             for item in (directory, *sorted(directory.rglob("*"))):
+                if staging is not None and item.is_relative_to(staging):
+                    continue
                 protected(item)
                 info = item.stat()
                 m.require(len(files) < 256, "Too many stack input paths")
@@ -219,7 +232,9 @@ class Stack:
         m.require(config.is_file() and config.stat().st_size <= 4 * 1024**2 and
                   not config.stat().st_mode & 0o007,
                   "Xray configuration must be private and no larger than 4 MiB")
-        check_xray(json.loads(config.read_text()), self.plan)
+        if baseline is not None:
+            files[str(config)][0] = hashlib.sha256(baseline).hexdigest()
+        check_xray(json.loads(config.read_bytes() if baseline is None else baseline), self.plan)
         nginx = self.plan["nginx_conf"]
         if nginx is not None:
             m.require(not nginx.is_relative_to(self.state), "nginx config overlaps HUB state")
@@ -229,11 +244,11 @@ class Stack:
             files[str(nginx)] = [m.file_hash(nginx), stat.S_IMODE(nginx.stat().st_mode)]
         return digest(files)
 
-    def release(self):
+    def release(self, *, recover_xray=False):
         images = {}
         for service in self.services:
             reference = self.config[IMAGES[service]]
-            records = json.loads(docker("image", "inspect", reference))
+            records = json.loads(self.inspect_docker("image", "inspect", reference))
             info, = records
             m.require(info["Os"] == "linux" and info["Architecture"] == "amd64" and
                       re.fullmatch(r"sha256:[0-9a-f]{64}", info["Id"]),
@@ -246,13 +261,13 @@ class Stack:
                 m.require(re.fullmatch(r"[0-9a-f]{64}", (info["Config"].get("Labels") or {}).get(
                     m.SOURCE_LABEL, "")), "HUB image is missing its source revision")
             images[service] = info["Id"]
-        release = {"config": self.config, "images": images, "material": self.material()}
+        release = {"config": self.config, "images": images, "material": self.material(recover_xray=recover_xray)}
         release["revision"] = digest(release)
         release["model"] = self.model(release)
         return release
 
-    def verify_release(self, release):
-        m.require(self.config == release["config"] and self.release() == release,
+    def verify_release(self, release, *, recover_xray=False):
+        m.require(self.config == release["config"] and self.release(recover_xray=recover_xray) == release,
                   "Stack images, configuration or rendered model changed")
 
     def preflight(self, release):
@@ -269,15 +284,18 @@ class Stack:
                     raise m.Blocked(service + " configuration test failed") from exc
         self.verify_release(release)
 
+    def inspect_docker(self, *args):
+        return docker(*args, timeout=self.command_timeout)
+
     def inspect(self, *releases):
         project_label = "com.docker.compose.project"
         service_label = "com.docker.compose.service"
-        ids = docker("ps", "-aq", "--filter", "label=" + project_label + "=" + self.name).split()
+        ids = self.inspect_docker("ps", "-aq", "--filter", "label=" + project_label + "=" + self.name).split()
         names = {self.name + "-" + service for service in self.services}
         # Detect foreign containers occupying a reserved name before Compose acts.
         for name in names:
-            ids.extend(docker("ps", "-aq", "--filter", "name=^/" + name + "$").split())
-        containers = json.loads(docker("container", "inspect", *sorted(set(ids)))) if ids else []
+            ids.extend(self.inspect_docker("ps", "-aq", "--filter", "name=^/" + name + "$").split())
+        containers = json.loads(self.inspect_docker("container", "inspect", *sorted(set(ids)))) if ids else []
         result = {}
         for item in containers:
             labels = item["Config"]["Labels"] or {}
@@ -296,7 +314,8 @@ class Stack:
     def ports(self):
         plan = self.plan
         ports = {"hub": [("127.0.0.1", plan["hub"])],
-                 "xray": [("127.0.0.1", port) for port in {plan["wss"], *plan["routes"].values()}]}
+                 "xray": [("127.0.0.1", port) for port in
+                          {plan["wss"], *plan["routes"].values(), *XrayState(self).managed_ports()}]}
         if "nginx" in self.services:
             ports["nginx"] = [("127.0.0.1", plan["tls"]), ("127.0.0.1", plan["health"])]
         if plan["mode"] == "standalone":
@@ -332,9 +351,18 @@ class Stack:
         revision = item["Config"]["Labels"][m.SOURCE_LABEL]
         return m.health(self.plan["hub"], attempts=1, revision=revision)
 
-    def xray_ready(self, _item):
+    def xray_ready(self, _item, extra_ports=None):
+        if extra_ports is None:
+            extra_ports = XrayState(self).managed_ports()
         for port in set(self.plan["routes"].values()):
             with socket.create_connection(("127.0.0.1", port), timeout=2):
+                pass
+        deadline = time.monotonic() + 3
+        for port in extra_ports:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            with socket.create_connection(("127.0.0.1", port), timeout=min(0.5, remaining)):
                 pass
         return websocket(http.client.HTTPConnection("127.0.0.1", self.plan["wss"], timeout=2),
                          self.plan["host"], self.plan["wss_path"])
@@ -465,6 +493,9 @@ def update(stack, record, candidate, *, rollback=False, acknowledge=False):
     m.require({key: value for key, value in candidate.config.items() if key not in UPDATE_KEYS} ==
               {key: value for key, value in stack.config.items() if key not in UPDATE_KEYS},
               "Update cannot change project, endpoints, mode or HUB state")
+    if XrayState(stack).exists():
+        m.require(candidate.config["RO_XRAY_CONFIG_DIR"] == stack.config["RO_XRAY_CONFIG_DIR"],
+                  "An enrolled stack must retain its managed Xray config directory")
     stack.verify_release(source)
     target = candidate.release()
     m.require(source["material"] != target["material"] or source["images"] != target["images"],
@@ -534,6 +565,9 @@ def run(args):
         m.require(record.get("version") == 1, "Unsupported stack journal")
     current, pending = record["current"], record["pending"]
     action = args.operation
+    state = XrayState(stack)
+    if state.exists():
+        state.baseline()
     m.require(not pending or action in {"recover", "status"}, "Pending stack transaction: run stack recover")
     if not pending and current:
         m.require(current["config"] == stack.config, "Active env changed outside Docker Manager")

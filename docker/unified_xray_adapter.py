@@ -1,0 +1,303 @@
+"""Opt-in Xray control service for one root-configured unified Compose stack."""
+
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import socketserver
+import struct
+import subprocess
+import tempfile
+import time
+
+import manager as m
+from stack_runtime import OWNER, REVISION, Stack, open_settings, protected
+from unified_xray_state import BACKEND, MAX_CONFIG, ROUTER_ID, TOKEN, XrayState, read_private, router_spec
+
+MAX_REQUEST = 8192
+OPERATIONS = {
+    "status": {frozenset()},
+    "version": {frozenset()},
+    "health": {frozenset()},
+    "validate_config": {frozenset({"router_id", "router"})},
+    "apply_config": {frozenset({"router_id", "router", "transaction"}), frozenset({"commit"})},
+    "restart": {frozenset()},
+    "rollback": {frozenset({"transaction"})},
+}
+
+
+def docker(*args, timeout=12):
+    return m.call("docker", "--host", "unix:///var/run/docker.sock", *args,
+                  env=m.local_docker_env(), timeout=timeout).stdout
+
+
+def socket_address(stack):
+    return "\0router-orchestrator-xray-" + str(stack.plan["hub"])
+
+
+def peer_is_hub(pid, uid, gid, hub):
+    if (uid, gid) != (m.HUB_UID, m.HUB_GID) or pid <= 0:
+        return False
+    init = hub["State"]["Pid"]
+    if hub["State"]["Status"] != "running" or init <= 0:
+        return False
+    try:
+        client_proc, hub_proc = Path(f"/proc/{pid}"), Path(f"/proc/{init}")
+        return (os.path.samefile(client_proc / "ns/pid", hub_proc / "ns/pid") and
+                not os.path.samefile(hub_proc / "ns/pid", "/proc/self/ns/pid") and
+                (client_proc / "cgroup").read_bytes() == (hub_proc / "cgroup").read_bytes())
+    except OSError:
+        return False
+
+
+def read_request(channel):
+    # An idle timeout alone lets a slow peer hold the listener indefinitely.
+    deadline = time.monotonic() + 4
+    raw = bytearray()
+    while len(raw) < MAX_REQUEST:
+        remaining = deadline - time.monotonic()
+        m.require(remaining > 0, "IPC deadline exceeded")
+        channel.settimeout(remaining)
+        block = channel.recv(MAX_REQUEST - len(raw))
+        if not block:
+            break
+        raw.extend(block)
+        if b"\n" in block:
+            m.require(raw.count(b"\n") == 1 and raw.endswith(b"\n"), "Invalid IPC framing")
+            return json.loads(raw)
+    raise m.Blocked("Invalid IPC framing")
+
+
+def parameters(request):
+    m.require(isinstance(request, dict), "Invalid request")
+    args = dict(request)
+    op = args.pop("op", None)
+    m.require(isinstance(op, str) and frozenset(args) in OPERATIONS.get(op, ()),
+              "Operation or parameters denied")
+    for name in ("transaction", "commit"):
+        if name in args:
+            m.require(isinstance(args[name], str) and TOKEN.fullmatch(args[name]),
+                      "Invalid transaction identifier")
+    if "router_id" in args:
+        name = args["router_id"]
+        m.require(isinstance(name, str) and ROUTER_ID.fullmatch(name), "Invalid router ID")
+        if args["router"] is not None:
+            m.require(router_spec(args["router"])["id"] == name, "Router IDs differ")
+    return op, args
+
+
+class Adapter:
+    def __init__(self, env):
+        self.env = env
+
+    def open_project(self):
+        stack = Stack(self.env, open_settings(self.env), command_timeout=6)
+        m.require(stack.config["RO_XRAY_BACKEND"] == BACKEND, "Xray adapter is disabled")
+        journal = json.loads(read_private(stack.journal, 256 * 1024))
+        m.require(journal["version"] == 1 and journal["pending"] is None and journal["current"],
+                  "Stack release unavailable or pending")
+        release = journal["current"]
+        m.require(release["config"] == stack.config, "Active stack env changed")
+        records = stack.inspect(release)
+        hub = records["hub"]
+        m.require(hub["HostConfig"].get("PidMode", "") in {"", "private"},
+                  "HUB requires a private PID namespace")
+        return stack, release, records
+
+    @staticmethod
+    def owned_xray(stack, release, record):
+        host, config = record["HostConfig"], record["Config"]
+        labels = config["Labels"]
+        mounts = [mount for mount in record["Mounts"]
+                  if not (mount["Type"] == "tmpfs" and mount["Destination"] == "/tmp")]
+        expected = {"/etc/xray": stack.config["RO_XRAY_CONFIG_DIR"],
+                    "/usr/local/share/xray": stack.config["RO_XRAY_ASSET_DIR"],
+                    "/etc/router-orchestrator/tls": stack.config["RO_TLS_DIR"]}
+        m.require(record["Image"] == release["images"]["xray"] and
+                  labels.get(OWNER) == stack.owner and labels.get(REVISION) == release["revision"] and
+                  labels.get("com.docker.compose.project") == stack.name and
+                  labels.get("com.docker.compose.service") == "xray" and
+                  record["Name"] == "/" + stack.name + "-xray" and
+                  re.fullmatch(r"[a-f0-9]{64}", record["Id"]) and
+                  host["NetworkMode"] == "host" and host["ReadonlyRootfs"] is True and
+                  not host["Privileged"] and not host.get("CapAdd") and not host.get("Devices") and
+                  host.get("PidMode", "") in {"", "private"} and config["User"] == f"{m.HUB_UID}:{m.HUB_GID}" and
+                  config["Cmd"] == ["run", "-config", "/etc/xray/owrt-remote.json"] and
+                  len(mounts) == len(expected) and
+                  all(mount["Type"] == "bind" and mount["RW"] is False and
+                      expected.get(mount["Destination"]) == mount["Source"] for mount in mounts) and
+                  {mount["Destination"] for mount in mounts} == expected.keys(),
+                  "Xray ownership verification failed")
+        return record["Id"]
+
+    def probe(self, stack, release, routers):
+        try:
+            item, = json.loads(docker("container", "inspect", stack.name + "-xray", timeout=4))
+            self.owned_xray(stack, release, item)
+            ports = [port for spec in routers.values() for port in spec["ports"]]
+            return item["State"]["Status"] == "running" and stack.xray_ready(item, ports)
+        except (OSError, http.client.HTTPException):
+            return False
+
+    def restart(self, stack, release, container, routers):
+        stack.guard()
+        m.require(self.owned_xray(stack, release, stack.inspect(release)["xray"]) == container,
+                  "Xray container changed")
+        docker("restart", "--time", "3", container)
+        deadline = time.monotonic() + 12
+        while not self.probe(stack, release, routers):
+            m.require(time.monotonic() < deadline, "Xray readiness failed")
+            time.sleep(0.2)
+
+    def test_config(self, stack, release, data):
+        with tempfile.TemporaryDirectory(prefix=".xray-test-", dir=stack.path.parent) as directory:
+            candidate = Path(directory) / "candidate.json"
+            candidate.write_bytes(data)
+            os.chown(candidate, 0, m.HUB_GID)
+            candidate.chmod(0o640)
+            mounts = []
+            for source, target in ((stack.config["RO_XRAY_CONFIG_DIR"], "/etc/xray"),
+                                   (candidate, "/etc/xray/owrt-remote.json"),
+                                   (stack.config["RO_XRAY_ASSET_DIR"], "/usr/local/share/xray"),
+                                   (stack.config["RO_TLS_DIR"], "/etc/router-orchestrator/tls")):
+                mounts.extend(("--mount", f"type=bind,src={source},dst={target},readonly"))
+            docker("run", "--rm", "--pull=never", "--network=none", "--read-only",
+                   "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
+                   "--pids-limit=64", "--memory=128m", "--user", f"{m.HUB_UID}:{m.HUB_GID}",
+                   "--env", "XRAY_LOCATION_ASSET=/usr/local/share/xray",
+                   *mounts, release["images"]["xray"], "run", "-test", "-config", "/etc/xray/owrt-remote.json")
+
+    def handle(self, stack, release, records, request):
+        op, args = parameters(request)
+        container = self.owned_xray(stack, release, records["xray"])
+        state = XrayState(stack)
+        record = state.load()
+        pending = record["pending"]
+        stack.verify_release(release, recover_xray=pending is not None)
+        hold = stack.xray_hold()
+        if op == "status":
+            operations = {"status", "version", "health"}
+            if not hold:
+                operations.update({"apply_config", "rollback"} if pending else
+                                  {"validate_config", "apply_config", "restart"})
+            return {"backend": BACKEND, "maintenance_hold": hold,
+                    "pending": pending["token"] if pending else None,
+                    "ready": not pending and self.probe(stack, release, record["routers"]),
+                    "operations": sorted(operations),
+                    "public_port": stack.plan["public"], "wss_path": stack.plan["wss_path"]}
+        if op == "health":
+            return {"ready": not pending and self.probe(stack, release, record["routers"])}
+        if op == "version":
+            output = docker("exec", container, "xray", "version")
+            version = re.match(r"Xray ([0-9]+\.[0-9]+\.[0-9]+)\b", output)
+            m.require(version, "Xray version unavailable")
+            return {"version": version[1], "image": release["images"]["xray"]}
+
+        stack.guard()
+        m.require(not m.pending_transaction(), "Pending HUB-only deployment")
+        if op == "rollback" or "commit" in args:
+            token = args.get("commit", args.get("transaction"))
+            if "commit" in args and record.get("committed") == token:
+                return {}
+            m.require(pending and pending["token"] == token, "Xray transaction is not pending")
+            if op == "rollback":
+                self.restore(stack, release, container, state, record)
+            else:
+                routers = pending["routers"]
+                m.require(read_private(state.config, MAX_CONFIG) == state.render(record, routers),
+                          "Prepared Xray configuration is missing")
+                # The commit receipt in SQLite is authoritative after a HUB crash.
+                self.ensure_ready(stack, release, container, routers)
+                state.save(dict(record, routers=routers, previous=record["routers"],
+                                committed=token, pending=None))
+            return {}
+        m.require(not pending, "Pending Xray transaction")
+        if op == "restart":
+            self.restart(stack, release, container, record["routers"])
+            return {"ready": True}
+
+        routers = dict(record["routers"])
+        name, router = args["router_id"], args["router"]
+        if router is None:
+            m.require(name in routers, "Router is outside adapter ownership")
+            del routers[name]
+        else:
+            routers[name] = router
+        candidate = state.render(record, routers)
+        old_ports = {port for spec in record["routers"].values() for port in spec["ports"]}
+        if router:
+            for port in set(router["ports"]) - old_ports:
+                with socket.socket() as probe:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    probe.bind(("127.0.0.1", port))
+        self.test_config(stack, release, candidate)
+        if op == "validate_config" or routers == record["routers"]:
+            return {"changed": False}
+        # The baseline and prior router inputs are durable before replacing the config.
+        state.save(dict(record, pending={"token": args["transaction"], "routers": routers}))
+        try:
+            stack.guard()
+            state.replace(candidate)
+            self.restart(stack, release, container, routers)
+        except Exception:
+            self.restore(stack, release, container, state, record)
+            raise
+        return {"changed": True}
+
+    def ensure_ready(self, stack, release, container, routers):
+        if not self.probe(stack, release, routers):
+            self.restart(stack, release, container, routers)
+
+    def restore(self, stack, release, container, state, record):
+        stack.guard()
+        state.replace(state.render(record, record["routers"]))
+        self.restart(stack, release, container, record["routers"])
+        state.save(dict(record, pending=None))
+
+    def serve(self, channel):
+        channel.settimeout(4)
+        authenticated = False
+        try:
+            pid, uid, gid = struct.unpack("3i", channel.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            if (uid, gid) != (m.HUB_UID, m.HUB_GID):
+                return
+            stack, _, records = self.open_project()
+            if not peer_is_hub(pid, uid, gid, records["hub"]):
+                return
+            authenticated = True
+            request = read_request(channel)
+            with m.deployment_lock():
+                stack, release, records = self.open_project()
+                if not peer_is_hub(pid, uid, gid, records["hub"]):
+                    return
+                result = self.handle(stack, release, records, request)
+            response = {"ok": True, **result}
+        except (m.Blocked, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError,
+                subprocess.SubprocessError):
+            if not authenticated:
+                return
+            response = {"ok": False, "error": "Xray adapter request failed"}
+        channel.settimeout(4)
+        try:
+            channel.sendall(json.dumps(response).encode() + b"\n")
+        except OSError:
+            pass
+
+    def run(self):
+        m.require_root()
+        m.require(os.getegid() == 0, "Adapter requires root group")
+        stack = Stack(self.env, open_settings(self.env))
+        m.require(stack.config["RO_XRAY_BACKEND"] == BACKEND, "Xray adapter is disabled")
+        protected(m.LOCK.parent)
+        adapter = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                adapter.serve(self.request)
+
+        with socketserver.UnixStreamServer(socket_address(stack), Handler) as server:
+            server.serve_forever()
+

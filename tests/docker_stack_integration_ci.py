@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
 from stack_runtime import Ingress, Stack, docker, websocket
 from orchestrator_stack_config import STREAM_MODULE, render_external, render_internal, stack_plan
+from unified_xray_adapter import Adapter, socket_address
+from unified_xray_state import XrayState
 
 HUB = "hub.example.invalid"
 PASSTHROUGH = "pass.example.invalid"
@@ -82,7 +84,8 @@ def write_env(path, config):
     m.durable_write(path, "".join(f"{key}={value}\n" for key, value in config.items()))
 
 
-def fixture(root, mode, project, hub_image, nginx, xray):
+def fixture(root, mode, project, hub_image, nginx, xray, backend="external_readonly"):
+    ws_path = "/ci-unified-wss/" if backend == "unified_adapter" else WS_PATH
     hub, ws, stream, tls, health, public, http = choose_ports(7)
     cert(root / "tls", HUB)
     cert(root / "tls" / "passthrough", PASSTHROUGH)
@@ -95,7 +98,7 @@ def fixture(root, mode, project, hub_image, nginx, xray):
     xray_config = {
         "log": {"loglevel": "warning"},
         "inbounds": [
-            dict(loopback, port=ws, streamSettings={"network": "ws", "wsSettings": {"path": WS_PATH}}),
+            dict(loopback, port=ws, streamSettings={"network": "ws", "wsSettings": {"path": ws_path}}),
             dict(loopback, port=stream, streamSettings={
                 "network": "raw", "security": "tls",
                 "tlsSettings": {"certificates": [{"certificateFile": xray_tls + "fullchain.pem",
@@ -110,9 +113,9 @@ def fixture(root, mode, project, hub_image, nginx, xray):
 
     config = {
         "RO_STACK_NAME": project, "RO_STACK_MODE": mode, "RO_PORT": str(hub),
-        "RO_WSS_PORT": str(ws), "RO_WSS_PATH": WS_PATH, "RO_IMAGE": hub_image,
+        "RO_WSS_PORT": str(ws), "RO_WSS_PATH": ws_path, "RO_IMAGE": hub_image,
         "RO_STATE_DIR": str(root / "data"), "RO_PUBLIC_URL": f"https://{HUB}:{public}",
-        "RO_XRAY_BACKEND": "external_readonly", "RO_XRAY_IMAGE": xray,
+        "RO_XRAY_BACKEND": backend, "RO_XRAY_IMAGE": xray,
         "RO_XRAY_CONFIG_DIR": str(root / "xray"), "RO_XRAY_ASSET_DIR": str(root / "assets"),
         "RO_TLS_DIR": str(root / "tls"), "RO_NGINX_IMAGE": nginx,
         "RO_NGINX_CONF": str(root / "nginx.conf"), "RO_HTTP_PORT": str(http),
@@ -182,7 +185,7 @@ def verify_ingress(root, plan):
                 conn.request("GET", "/api/auth/meta")
                 with conn.getresponse() as response:
                     assert response.status == 200 and json.load(response)["ok"] is True
-            assert websocket(Ingress(HUB, plan["public"], hub_tls), HUB, WS_PATH)
+            assert websocket(Ingress(HUB, plan["public"], hub_tls), HUB, plan["wss_path"])
             with contextlib.closing(Ingress(PASSTHROUGH, plan["public"], other_tls)) as conn:
                 conn.connect()
             break
@@ -269,12 +272,196 @@ def test_release(root, env, config, project):
             docker("image", "rm", candidate)
 
 
+@contextlib.contextmanager
+def adapter_process(runtime, adapter_type=Adapter):
+    pid = os.fork()
+    if pid == 0:
+        try:
+            adapter_type(runtime.path).run()
+        finally:
+            os._exit(1)
+    try:
+        for attempt in range(50):
+            try:
+                with socket.socket(socket.AF_UNIX) as conn:
+                    conn.settimeout(1)
+                    conn.connect(socket_address(runtime))
+                break
+            except ConnectionRefusedError:
+                if attempt == 49:
+                    raise
+                time.sleep(0.1)
+        yield
+    finally:
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+
+
+def wrong_peer(runtime, uid):
+    pid = os.fork()
+    if pid:
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        return
+    try:
+        os.setgroups([])
+        os.setgid(m.HUB_GID)
+        os.setuid(uid)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(4)
+            conn.connect(socket_address(runtime))
+            try:
+                conn.sendall(b'{"op":"status"}\n')
+                assert conn.recv(4096) == b""
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+
+
+def test_adapter(env, config, project):
+    runtime = Stack(env, config)
+    state = XrayState(runtime)
+    port, ssh_port, edit_port, failing, abandoned, abandoned_ssh = choose_ports(6)
+    crash_token = uuid.uuid4().hex
+
+    class FaultAdapter(Adapter):
+        def restart(self, stack, release, container, routers):
+            super().restart(stack, release, container, routers)
+            if any(failing in router["ports"] for router in routers.values()):
+                docker("stop", container)
+                raise m.Blocked("CI injected runtime failure")
+
+        def handle(self, stack, release, records, request):
+            result = super().handle(stack, release, records, request)
+            if request.get("transaction") == crash_token:
+                os.kill(os.getpid(), signal.SIGKILL)
+            return result
+    prefix = """
+import http.client
+import json
+import os
+import runpy
+import uuid
+hub = runpy.run_path('/opt/owrt-remote/owrt-remote-hub.py')
+ipc = hub['unified_xray_request']
+"""
+    with adapter_process(runtime, FaultAdapter):
+        wrong_peer(runtime, 65534)
+        wrong_peer(runtime, m.HUB_UID)
+        with m.deployment_lock():
+            docker("exec", project + "-hub", "python", "-c", prefix + """
+try:
+    ipc('restart')
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('Deployment lock did not block Xray restart')
+""")
+        program = prefix + f"""
+def request(method, path, body=None, auth=False, csrf=None):
+    headers = {{'Content-Type': 'application/json'}}
+    if auth:
+        headers['Cookie'] = hub['SESSION_COOKIE'] + '=' + hub['session_token']()
+    if csrf is not None:
+        headers['X-Unified-Xray-CSRF'] = csrf
+    conn = http.client.HTTPConnection('127.0.0.1', int(os.environ['OWRT_REMOTE_PORT']), timeout=90)
+    try:
+        conn.request(method, path, json.dumps(body) if body is not None else None, headers)
+        with conn.getresponse() as reply:
+            raw = reply.read()
+            return reply.status, raw
+    finally:
+        conn.close()
+
+assert request('GET', '/api/xray/status')[0] == 401
+assert request('POST', '/api/xray/restart', auth=True)[0] == 403
+_, auth = request('GET', '/api/auth/meta', auth=True)
+csrf = json.loads(auth)['auth']['unified_xray_csrf']
+assert json.loads(request('GET', '/api/xray/status', auth=True)[1])['ready']
+assert ipc('version')['version'] == {os.environ["RO_CI_XRAY_VERSION"]!r}
+assert ipc('health')['ready']
+for op, payload in [('shell', {{}}), ('restart', {{'container': 'unowned'}})]:
+    try:
+        ipc(op, **payload)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('Forbidden IPC request succeeded')
+data = {{'id': 'ci-router', 'entry_port': {port}, 'ssh_entry_port': {ssh_port}}}
+assert request('POST', '/api/router', data, auth=True)[0] == 403
+assert request('POST', '/api/router', data, auth=True, csrf=csrf)[0] == 200
+assert request('POST', '/api/router/ci-router/xray/edit', {{'entry_port': {edit_port}}},
+               auth=True, csrf=csrf)[0] == 200
+assert request('POST', '/api/router/ci-router/xray/edit', {{'entry_port': {ssh_port}}},
+               auth=True, csrf=csrf)[0] == 409
+assert request('POST', '/api/router/ci-router/xray/edit', {{'entry_port': {failing}}},
+               auth=True, csrf=csrf)[0] == 409
+assert ipc('health')['ready']
+with hub['connect']() as db:
+    row = hub['get_router'](db, 'ci-router')
+    assert row['entry_port'] == {edit_port} and row['vless_port'] == {runtime.plan["public"]}
+    assert hub['make_router_xray_config'](row)['outbounds'][2]['streamSettings']['wsSettings']['path'] == {runtime.plan["wss_path"]!r}
+    assert ipc('validate_config', router_id='ci-router', router=hub['unified_router_spec'](row))['changed'] is False
+assert request('POST', '/api/router/ci-router/delete', auth=True, csrf=csrf)[0] == 200
+assert request('POST', '/api/router', data, auth=True, csrf=csrf)[0] == 200
+assert request('POST', '/api/xray/restart', auth=True, csrf=csrf)[0] == 200
+"""
+        docker("exec", project + "-hub", "python", "-c", program)
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            pass
+        holds = runtime.state / ".xray-maintenance-hold"
+        holds.touch()
+        try:
+            docker("exec", project + "-hub", "python", "-c", prefix + """
+assert ipc('status')['maintenance_hold']
+try:
+    ipc('restart')
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('HOLD bypassed')
+""")
+        finally:
+            holds.unlink()
+        before = state.config.read_bytes()
+        docker("exec", project + "-hub", "python", "-c", prefix + f"""
+router = {{'id': 'abandoned', 'ports': [{abandoned}, {abandoned_ssh}],
+          'clients': [str(uuid.uuid4()), str(uuid.uuid4())],
+          'targets': [['127.0.0.1', 80], ['127.0.0.1', 22]]}}
+try:
+    ipc('apply_config', router_id='abandoned', router=router, transaction={crash_token!r})
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('CI adapter did not crash before responding')
+""")
+    assert state.load()["pending"]["token"] == crash_token
+    assert state.config.read_bytes() != before
+    cli(env, "start", expected=2)
+    with adapter_process(runtime):
+        docker("exec", project + "-hub", "python", "-c", prefix + """
+with hub['_XRAY_RELOAD_LOCK'], hub['connect']() as db:
+    hub['reconcile_unified_xray'](db)
+    assert hub['get_router'](db, 'abandoned') is None
+    assert hub['get_active_router'](db, 'ci-router') is not None
+assert ipc('health')['ready']
+""")
+    assert state.config.read_bytes() == before
+    assert state.load()["pending"] is None
+    cli(env, "validate")
+
+
 def main():
     assert os.geteuid() == 0 and os.getenv("GITHUB_ACTIONS") == "true"
     assert os.getenv("RUNNER_ENVIRONMENT") == "github-hosted"
     mode = sys.argv[1]
     assert mode in {"standalone", "external-stream", "external-only"}
     project = "ro-stack-ci-" + uuid.uuid4().hex[:12]
+    backend = os.environ.get("RO_CI_BACKEND", "external_readonly")
+    assert backend in {"external_readonly", "unified_adapter"}
     nginx, xray = os.environ["RO_CI_NGINX_IMAGE"], os.environ["RO_CI_XRAY_IMAGE"]
 
     def interrupted(signum, _frame):
@@ -288,7 +475,7 @@ def main():
         env = root / "stack.env"
         try:
             assert m.build_image() == hub_image
-            config, plan, module = fixture(root, mode, project, hub_image, nginx, xray)
+            config, plan, module = fixture(root, mode, project, hub_image, nginx, xray, backend)
             write_env(env, config)
             with patch.object(m, "LOCK", root / ".deploy.lock"), \
                  patch.object(m, "HUB_DEPLOY_ROOT", root), \
@@ -313,6 +500,8 @@ def main():
                 cli(env, "recover")
                 marker(project)
                 verify_ingress(root, plan)
+                if backend == "unified_adapter":
+                    test_adapter(env, config, project)
                 if mode == "standalone":
                     test_release(root, env, config, project)
         finally:
@@ -321,7 +510,7 @@ def main():
             finally:
                 if m.call("docker", "image", "inspect", hub_image, check=False).returncode == 0:
                     docker("image", "rm", hub_image)
-    print("Real Docker integration passed:", mode)
+    print("Real Docker integration passed:", mode, backend)
 
 
 if __name__ == "__main__":

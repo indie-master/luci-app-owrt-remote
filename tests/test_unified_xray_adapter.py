@@ -1,0 +1,299 @@
+"""Offline transaction and IPC contract regressions using private synthetic state."""
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sqlite3
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+import uuid
+
+from test_docker_stack_runtime import config_document
+from test_orchestrator_stack_config import fixture
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "docker"))
+import manager as m
+from stack_runtime import OWNER, REVISION, Stack
+from unified_xray_adapter import MAX_REQUEST, Adapter, parameters, read_request
+from unified_xray_state import XrayState, encode
+
+HUB_SPEC = importlib.util.spec_from_file_location("unified_xray_test_hub", ROOT / "vps/owrt-remote-hub.py")
+hub = importlib.util.module_from_spec(HUB_SPEC)
+sys.modules[HUB_SPEC.name] = hub
+with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OWRT_REMOTE_STATE_DIR": directory}):
+    HUB_SPEC.loader.exec_module(hub)
+
+
+def router(port=30100):
+    return {"id": "demo", "clients": [str(uuid.uuid4()), str(uuid.uuid4())],
+            "ports": [port, port + 1], "targets": [["127.0.0.1", 80], ["127.0.0.1", 22]]}
+
+
+class ContractTests(unittest.TestCase):
+    def test_allowlist(self):
+        for op in ("status", "health", "version", "restart"):
+            self.assertEqual(parameters({"op": op}), (op, {}))
+        for request in ({"op": "shell"}, {"op": "restart", "container": "other"},
+                        {"op": "apply_config", "config": {}}, {"op": "status", "path": "/tmp"},
+                        {"op": "rollback", "transaction": "../x"}, {"op": ["restart"]},
+                        {"op": "validate_config", "router_id": "demo", "router": dict(router(), ports=[True, 1])},
+                        {"op": "validate_config", "router_id": "demo", "router": dict(router(), targets=[["/tmp", 80], ["localhost", 22]])}):
+            with self.subTest(op=request["op"]), self.assertRaises(m.Blocked):
+                parameters(request)
+
+    def test_ipc_framing_size_and_single_request(self):
+        for parts in ([b"x" * MAX_REQUEST], [b'{}\n{}\n'], [b'{"op":"status"}', b""]):
+            channel = Mock()
+            channel.recv.side_effect = parts
+            with self.subTest(parts=len(parts)), self.assertRaises(m.Blocked):
+                read_request(channel)
+        channel = Mock()
+        channel.recv.side_effect = [b'{"op":', b'"status"}\n']
+        self.assertEqual(read_request(channel), {"op": "status"})
+
+    def test_unauthorized_socket_peer_reads_no_payload(self):
+        adapter = Adapter(Path("/unused"))
+        channel = Mock()
+        channel.getsockopt.return_value = struct.pack("3i", 123, 21000, m.HUB_GID)
+        with patch.object(adapter, "open_project") as open_project:
+            adapter.serve(channel)
+        channel.recv.assert_not_called()
+        channel.sendall.assert_not_called()
+        open_project.assert_not_called()
+
+    def test_correct_uid_outside_hub_reads_no_payload(self):
+        adapter = Adapter(Path("/unused"))
+        channel = Mock()
+        channel.getsockopt.return_value = struct.pack("3i", 123, m.HUB_UID, m.HUB_GID)
+        with patch.object(adapter, "open_project", return_value=(None, None, {"hub": {}})),              patch("unified_xray_adapter.peer_is_hub", return_value=False):
+            adapter.serve(channel)
+        channel.recv.assert_not_called()
+        channel.sendall.assert_not_called()
+
+    def test_hub_only_cannot_opt_in(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = fixture(Path(folder), "external-only")
+            base = {key: config[key] for key in m.ALLOWED}
+            m.validate_settings(base)
+            with self.assertRaises(m.Blocked):
+                m.validate_settings(dict(base, RO_XRAY_BACKEND="unified_adapter"))
+
+    def test_lock_contention(self):
+        if os.geteuid() != 0:
+            self.skipTest("Root ownership required by the real deployment lock")
+        with tempfile.TemporaryDirectory() as folder, patch.object(m, "LOCK", Path(folder) / ".deploy.lock"):
+            with m.deployment_lock(), self.assertRaisesRegex(m.Blocked, "Another"):
+                with m.deployment_lock():
+                    self.fail("a concurrent operation took the deployment lock")
+
+
+@unittest.skipUnless(os.geteuid() == 0, "Root ownership required by production path validation")
+class TransactionTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.env = self.root / "stack.env"
+        config = fixture(self.root, "external-only")
+        config["RO_XRAY_BACKEND"] = "unified_adapter"
+        self.stack = Stack(self.env, config)
+        self.state = XrayState(self.stack)
+        self.stack.state.mkdir()
+        self.state.config.parent.mkdir(mode=0o755)
+        (self.root / "assets").mkdir(mode=0o755)
+        (self.root / "tls").mkdir(mode=0o755)
+        base = config_document()
+        base["inbounds"][0]["settings"] = {"clients": [], "decryption": "none"}
+        self.baseline = encode(base)
+        self.state.config.write_bytes(self.baseline)
+        self.state.config.chmod(0o640)
+        self.release = {"revision": "revision", "images": {"xray": "sha256:" + "1" * 64}}
+        self.record = {
+            "Image": self.release["images"]["xray"], "Id": "b" * 64, "Name": "/" + self.stack.name + "-xray",
+            "HostConfig": {"NetworkMode": "host", "ReadonlyRootfs": True, "Privileged": False},
+            "Config": {"Labels": {OWNER: self.stack.owner, REVISION: "revision",
+                         "com.docker.compose.project": self.stack.name, "com.docker.compose.service": "xray"},
+                       "User": f"{m.HUB_UID}:{m.HUB_GID}", "Cmd": ["run", "-config", "/etc/xray/owrt-remote.json"]},
+            "Mounts": [{"Type": "bind", "RW": False, "Destination": dest, "Source": config[key]}
+                       for dest, key in (("/etc/xray", "RO_XRAY_CONFIG_DIR"),
+                                         ("/usr/local/share/xray", "RO_XRAY_ASSET_DIR"),
+                                         ("/etc/router-orchestrator/tls", "RO_TLS_DIR"))],
+        }
+        self.adapter = Adapter(self.env)
+        self.spec = router()
+        self.token = "b" * 32
+        for owner, name, kwargs in (
+            (self.stack, "verify_release", {}), (self.adapter, "test_config", {}),
+            (self.adapter, "restart", {}), (self.adapter, "probe", {"return_value": True}),
+            (m, "LEGACY_HUB_STATE", {"new": self.root / "legacy-data"}),
+            (m, "ENV", {"new": self.root / "hub-only.env"}),
+            (m, "HUB_DEPLOY_ROOT", {"new": self.root}),
+            (m, "status_service", {"return_value": False}),
+            ("unified_xray_adapter.socket.socket", None, {}),
+        ):
+            hook = patch(owner, **kwargs) if name is None else patch.object(owner, name, **kwargs)
+            hook.start()
+            self.addCleanup(hook.stop)
+
+    def call(self, op, **args):
+        return self.adapter.handle(self.stack, self.release, {"xray": self.record}, {"op": op, **args})
+
+    def prepare(self):
+        self.token = uuid.uuid4().hex
+        return self.call("apply_config", router_id="demo", router=self.spec, transaction=self.token)
+
+    def test_validate_apply_commit_delete_and_restore(self):
+        initial_material = self.stack.material()
+        self.call("validate_config", router_id="demo", router=self.spec)
+        self.assertFalse(self.state.exists())
+        self.assertTrue(self.prepare()["changed"])
+        with self.assertRaisesRegex(m.Blocked, "Pending Xray"):
+            self.state.baseline()
+        with self.assertRaisesRegex(m.Blocked, "Pending"):
+            self.call("restart")
+        self.assertFalse(self.call("status")["ready"])
+        self.assertEqual(self.state.baseline(recover=True), self.baseline)
+        self.call("apply_config", commit=self.token)
+        self.call("apply_config", commit=self.token)
+        self.assertEqual(self.state.baseline(), self.baseline)
+        self.assertEqual(self.stack.material(), initial_material)
+        self.assertIn(("127.0.0.1", self.spec["ports"][0]), self.stack.ports()["xray"])
+        inbounds = json.loads(self.state.config.read_bytes())["inbounds"]
+        self.assertEqual(inbounds[-1]["port"], self.spec["ports"][1])
+        self.spec["ports"] = [30110, 30111]
+        self.prepare()
+        self.call("apply_config", commit=self.token)
+        self.assertEqual(self.state.load()["routers"]["demo"]["ports"], [30110, 30111])
+        self.call("apply_config", router_id="demo", router=None, transaction=self.token)
+        self.call("rollback", transaction=self.token)
+        self.assertEqual(set(self.state.load()["routers"]), {"demo"})
+        delete_token = uuid.uuid4().hex
+        self.call("apply_config", router_id="demo", router=None, transaction=delete_token)
+        self.call("apply_config", commit=delete_token)
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+
+    def test_recovery_while_only_journal_exists(self):
+        self.state.save(dict(self.state.load(), pending={"token": self.token, "routers": {"demo": self.spec}}))
+        self.call("rollback", transaction=self.token)
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+        self.assertIsNone(self.state.load()["pending"])
+
+    def test_sigkill_after_atomic_replace_recovers_durable_prepare(self):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                self.adapter.restart.side_effect = lambda *_: os.kill(os.getpid(), signal.SIGKILL)
+                self.prepare()
+            finally:
+                os._exit(1)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFSIGNALED(status))
+        self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+        pending = self.state.load()["pending"]
+        self.assertNotEqual(self.state.config.read_bytes(), self.baseline)
+        self.call("rollback", transaction=pending["token"])
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+
+    def test_staging_crash_keeps_release_identity_and_reserves_staging_path(self):
+        original = self.stack.material()
+        self.state.staging.mkdir(mode=0o700)
+        with self.assertRaisesRegex(m.Blocked, "staging"):
+            self.stack.material()
+        candidate = self.state.staging / "candidate"
+        candidate.write_text("incomplete")
+        candidate.chmod(0o600)
+        self.state.save(dict(self.state.load(), pending={"token": self.token, "routers": {"demo": self.spec}}))
+        self.assertEqual(self.stack.material(recover_xray=True), original)
+        self.call("rollback", transaction=self.token)
+        self.assertFalse(self.state.staging.exists())
+        self.assertEqual(self.stack.material(), original)
+
+    def test_runtime_failure_restores_bytes(self):
+        self.adapter.restart.side_effect = [m.Blocked("Xray did not start"), None]
+        with self.assertRaisesRegex(m.Blocked, "did not start"):
+            self.prepare()
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+        self.assertIsNone(self.state.load()["pending"])
+
+    def test_validation_failure_is_write_free(self):
+        self.adapter.test_config.side_effect = subprocess.CalledProcessError(1, "xray")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.prepare()
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+
+    def test_foreign_mount_image_and_labels_fail_closed(self):
+        for mapping, key in ((self.record, "Image"), (self.record["Mounts"][0], "Source"),
+                             (self.record["Config"]["Labels"], OWNER)):
+            with patch.dict(mapping, {key: "foreign"}), self.assertRaises(m.Blocked):
+                self.call("restart")
+        self.adapter.restart.assert_not_called()
+
+    def test_hold_blocks_prepare_and_recovery(self):
+        self.prepare()
+        (self.stack.state / ".xray-maintenance-hold").symlink_to(self.root / "missing")
+        self.assertTrue(self.call("status")["maintenance_hold"])
+        self.assertNotIn("restart", self.call("status")["operations"])
+        with self.assertRaisesRegex(m.Blocked, "HOLD"):
+            self.call("rollback", transaction=self.token)
+        self.assertEqual(self.state.load()["pending"]["token"], self.token)
+
+    def test_symlink_and_out_of_band_config_refused(self):
+        self.prepare()
+        self.call("apply_config", commit=self.token)
+        self.state.config.write_text("{}")
+        with self.assertRaisesRegex(m.Blocked, "differs"):
+            self.state.baseline()
+        self.state.config.unlink()
+        self.state.config.symlink_to(self.state.path)
+        with self.assertRaisesRegex(m.Blocked, "alias"):
+            self.state.baseline()
+
+
+class SQLiteTests(unittest.TestCase):
+    def setUp(self):
+        self.hub_db = sqlite3.connect(":memory:")
+        self.addCleanup(self.hub_db.close)
+        self.hub_db.row_factory = sqlite3.Row
+        with patch.object(hub, "unified_xray_enabled", return_value=True):
+            hub.init_db(self.hub_db)
+        self.host = Mock()
+        hook = patch.object(hub, "unified_xray_request", self.host)
+        hook.start()
+        self.addCleanup(hook.stop)
+        self.status = {"public_port": 9443, "pending": None}
+
+    def test_failed_prepare_rolls_back_sqlite_enrollment(self):
+        self.host.side_effect = [self.status, RuntimeError("no ready"), self.status]
+        with self.assertRaises(RuntimeError):
+            hub.unified_router_edit(self.hub_db, "demo", {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        self.assertIsNone(hub.get_router(self.hub_db, "demo"))
+        self.assertIsNone(self.hub_db.execute("select token from xray_receipt").fetchone())
+
+    def test_commit_response_loss_reconciles_using_receipt(self):
+        self.host.side_effect = [self.status, {"changed": True}, RuntimeError("lost")]
+        with self.assertRaises(RuntimeError):
+            hub.unified_router_edit(self.hub_db, "demo", {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        self.assertEqual(hub.get_router(self.hub_db, "demo")["vless_port"], 9443)
+        token = self.hub_db.execute("select token from xray_receipt").fetchone()[0]
+        self.host.side_effect = [{"pending": token}, {}]
+        hub.reconcile_unified_xray(self.hub_db)
+        self.host.assert_called_with("apply_config", commit=token)
+
+    def test_no_receipt_reconciles_by_rollback(self):
+        token = uuid.uuid4().hex
+        self.host.side_effect = [{"pending": token}, {}]
+        hub.reconcile_unified_xray(self.hub_db)
+        self.host.assert_called_with("rollback", transaction=token)
+
+    def test_unified_heartbeat_cannot_resurrect_deleted_router(self):
+        with patch.object(hub, "unified_xray_enabled", return_value=True):
+            with self.assertRaisesRegex(ValueError, "Register"):
+                hub.heartbeat(self.hub_db, {"id": "unknown"})

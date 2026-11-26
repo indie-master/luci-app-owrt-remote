@@ -44,7 +44,7 @@ def bind_path(value, key):
 
 
 def stack_plan(config):
-    validate_settings({key: value for key, value in config.items() if key in ALLOWED})
+    validate_settings({key: value for key, value in config.items() if key in ALLOWED}, unified=True)
     mode = config.get("RO_STACK_MODE")
     check(mode in MODES, "Invalid RO_STACK_MODE")
     name = config.get("RO_STACK_NAME", "router-orchestrator")

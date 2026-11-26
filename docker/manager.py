@@ -114,11 +114,12 @@ def read_env(path, allowed):
         out[k] = v
     return out
 
-def validate_settings(out):
+def validate_settings(out, *, unified=False):
     require(ALLOWED == out.keys(), "Incomplete or unexpected settings")
     require(all(not re.search(r"\s|['\"\x00\x60$]", value) for value in out.values()),
             "Unquoted/simple .env values required")
-    require(out["RO_XRAY_BACKEND"] == "external_readonly",
+    require(out["RO_XRAY_BACKEND"] in ({"external_readonly", "unified_adapter"}
+                                      if unified else {"external_readonly"}),
             "Only external_readonly is approved for this release")
     require(out["RO_PORT"].isdigit() and 1024 <= int(out["RO_PORT"]) <= 65535,
             "Invalid port")
@@ -135,9 +136,9 @@ def save_env(data):
     durable_write(ENV, body, exclusive=True)
 
 
-def status_service():
+def status_service(*, timeout=None):
     result = call("systemctl", "list-units", "--all", "--plain", "--no-legend", "--no-pager",
-                  "owrt-remote.service", check=False)
+                  "owrt-remote.service", check=False, timeout=timeout)
     units = result.stdout.splitlines()
     require(result.returncode == 0 and len(units) <= 1, "Cannot verify host HUB service state")
     if not units:
@@ -154,7 +155,7 @@ def local_docker_env():
             {"DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"}}
 
 
-def compose(*args, config=None, runtime_image=None, project=None, profile=None, local=False):
+def compose(*args, config=None, runtime_image=None, project=None, profile=None, local=False, timeout=120):
     # Only the validated manager configuration selects the Compose model and its inputs.
     if config is None:
         config = settings()
@@ -172,7 +173,7 @@ def compose(*args, config=None, runtime_image=None, project=None, profile=None, 
          "--project-name", project, "--env-file", "/dev/null",
          *(("--profile", profile) if profile else ()), *args],
         cwd=ROOT, env=env, check=True, text=True, pass_fds=inherited_lock(),
-        timeout=120 if local else None,
+        timeout=timeout if local else None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
