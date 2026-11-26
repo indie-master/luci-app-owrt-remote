@@ -1,7 +1,9 @@
 """Runtime safety checks with no Docker daemon or VPS required."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,15 @@ mgr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mgr)
 
 class DockerRuntimeContracts(unittest.TestCase):
+    def test_hub_dockerfile_copy_sources_are_in_build_context(self):
+        dockerfile = (REPO / "docker/hub/Dockerfile").read_text()
+        allowlist = (REPO / ".dockerignore").read_text().splitlines()
+        for line in dockerfile.splitlines():
+            if line.startswith("COPY "):
+                words = line.removeprefix("COPY ").split()
+                source = next(word for word in words if not word.startswith("--"))
+                self.assertIn("!" + source, allowlist)
+
     def test_compose_requires_explicit_readonly_xray(self):
         compose = (REPO / "docker-compose.yml").read_text()
         self.assertIn("network_mode: host", compose)
@@ -52,6 +63,65 @@ class DockerRuntimeContracts(unittest.TestCase):
                          "RO_XRAY_BACKEND=external_readonly\n")
             with patch.object(mgr, "ENV", p):
                 self.assertEqual(mgr.settings()["RO_PORT"], "18089")
+
+    def test_compose_preflight_uses_explicit_model_and_validated_settings(self):
+        argv = SimpleNamespace(non_interactive=True, public_url="https://hub.example.invalid",
+                               port=18089, state_dir="/opt/router-orchestrator/local-fixture")
+        with patch.dict(os.environ, {"COMPOSE_FILE": "other.yml", "COMPOSE_PROJECT_NAME": "other",
+                                     "RO_PORT": "12345", "RO_XRAY_BACKEND": "other"}), \
+             patch.multiple(mgr, require_root=lambda: None, status_service=lambda: False,
+                            free_port=lambda _: True, require_new_destination=lambda _: None,
+                            build_image=lambda: "router-orchestrator-hub:fixture"), \
+             patch.object(mgr, "ENV", Path("/unused/.env")), \
+             patch.object(mgr.subprocess, "run") as run, \
+             patch.object(mgr, "save_env") as save, patch.object(Path, "mkdir") as mkdir:
+            run.side_effect = [SimpleNamespace(returncode=0), OSError("invalid model")]
+            with self.assertRaisesRegex(OSError, "invalid model"):
+                mgr.install(argv)
+            args, kwargs = run.call_args
+            self.assertEqual(args[0][-2:], ["config", "--quiet"])
+            self.assertIn(str(REPO / "docker-compose.yml"), args[0])
+            self.assertEqual(kwargs["env"]["RO_PORT"], "18089")
+            self.assertEqual(kwargs["env"]["RO_XRAY_BACKEND"], "external_readonly")
+            self.assertFalse(any(k.startswith("COMPOSE_") for k in kwargs["env"]))
+            mkdir.assert_not_called()
+            save.assert_not_called()
+
+    def test_start_uses_id_even_when_local_tag_is_reassigned(self):
+        identifier = "sha256:" + "a" * 64
+        config = {"RO_IMAGE": "router-orchestrator-hub:fixture"}
+        with patch.object(mgr, "settings", return_value=config), \
+             patch.object(mgr.subprocess, "run") as run:
+            mgr.compose_up(identifier)
+        args, kwargs = run.call_args
+        self.assertIn("never", args[0])
+        self.assertEqual(kwargs["env"]["RO_HUB_RUNTIME_IMAGE"], identifier)
+        self.assertEqual(kwargs["env"]["RO_IMAGE"], config["RO_IMAGE"])
+
+    def test_health_rejects_a_different_hub_revision(self):
+        with patch.object(mgr.http.client, "HTTPConnection") as connection:
+            response = connection.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = b'{"ok":true,"revision":"unexpected"}'
+            self.assertFalse(mgr.health(18089, attempts=1, revision="expected"))
+            connection.return_value.request.assert_called_once_with("GET", "/health?panel-update=1")
+            response.read.return_value = b'{"ok":true,"revision":"expected"}'
+            self.assertTrue(mgr.health(18089, attempts=1, revision="expected"))
+
+    def test_host_service_errors_and_transition_fail_closed(self):
+        for stdout, code, active in (
+            ("", 0, False), ("owrt-remote.service loaded inactive dead", 0, False),
+            ("owrt-remote.service loaded deactivating stop", 0, True),
+            ("", 1, None),
+        ):
+            with self.subTest(stdout=stdout, code=code), patch.object(
+                mgr, "call", return_value=SimpleNamespace(stdout=stdout, returncode=code)
+            ):
+                if active is None:
+                    with self.assertRaises(mgr.Blocked):
+                        mgr.status_service()
+                else:
+                    self.assertEqual(mgr.status_service(), active)
 
     def test_manager_operations_are_serialized(self):
         # No production paths are accessed by this test.

@@ -148,13 +148,12 @@ def _is_ip(host: str) -> bool:
         return False
 
 
-def _locations(plan: dict, *, upstream: str) -> str:
-    path = plan["wss_path"]
+def proxy_locations(path: str, *, upstream: str, hub_port: int, wss_port: int) -> str:
     # This is a location snippet for manual import by an existing vhost,
     # not a fully managed arbitrary virtual host.
     return (
         f"    location ^~ {path} {{\n"
-        f"        proxy_pass http://{upstream}:18444;\n"
+        f"        proxy_pass http://{upstream}:{wss_port};\n"
         "        proxy_http_version 1.1;\n"
         "        proxy_set_header Upgrade $http_upgrade;\n"
         '        proxy_set_header Connection "upgrade";\n'
@@ -163,11 +162,16 @@ def _locations(plan: dict, *, upstream: str) -> str:
         "        proxy_send_timeout 3600s;\n"
         "    }\n"
         "    location / {\n"
-        f"        proxy_pass http://{upstream}:8088;\n"
+        f"        proxy_pass http://{upstream}:{hub_port};\n"
+        "        proxy_http_version 1.1;\n"
         "        proxy_set_header Host $host;\n"
         "        proxy_set_header X-Real-IP $remote_addr;\n"
         "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
         "        proxy_set_header X-Forwarded-Proto $scheme;\n"
+        "        proxy_set_header Upgrade $http_upgrade;\n"
+        '        proxy_set_header Connection "upgrade";\n'
+        "        proxy_read_timeout 3600s;\n"
+        "        proxy_send_timeout 3600s;\n"
         "    }\n"
     )
 
@@ -177,9 +181,8 @@ def render_external_nginx_snippet(plan: dict) -> str:
     check(plan["nginx_mode"] == "external_nginx", "not external Nginx mode")
     # The host proxy connects to loopback-published Docker ports. Its
     # certificate and any existing vhost remain owned by the operator.
-    lines = _locations(plan, upstream="127.0.0.1")
-    lines = lines.replace("127.0.0.1:18444", "127.0.0.1:" + str(plan["wss_host_port"]))
-    lines = lines.replace("127.0.0.1:8088", "127.0.0.1:" + str(plan["hub_host_port"]))
+    lines = proxy_locations(plan["wss_path"], upstream="127.0.0.1", hub_port=plan["hub_host_port"],
+                       wss_port=plan["wss_host_port"])
     return (
         "# REVIEW ONLY: include only in the chosen HTTPS server{} block.\n"
         "# Never replace an existing Nginx vhost automatically.\n"
@@ -216,7 +219,8 @@ def render_bundled_nginx(plan: dict) -> str:
         f"    ssl_certificate {cert};\n"
         f"    ssl_certificate_key {key};\n"
         "    ssl_protocols TLSv1.2 TLSv1.3;\n"
-        + _locations(plan, upstream="ro-core") +
+        + proxy_locations(plan["wss_path"], upstream="ro-core", hub_port=plan["hub_container_port"],
+                     wss_port=plan["wss_container_port"]) +
         "}\n"
     )
 

@@ -19,6 +19,7 @@
 - [Безопасная регистрация одного нового WSS-роутера в Xray](docs/NEW_ROUTER_WSS_ENROLLMENT.md)
 - [Планирование собственной установки: домен, WSS/REALITY, версии Xray и откат](docs/ORCHESTRATOR_SETUP_XRAY_PROFILES.md)
 - [Два режима Nginx/Docker и безопасный выбор резервных профилей](docs/ORCHESTRATOR_DOCKER_TLS_FAILOVER.md)
+- [Транзакции Docker Manager и профили единого Compose](docs/DOCKER_TRANSACTION_AND_STACK.md)
 - [Belt → Docker: сохранность всех данных, история, аудит и двухэтапный перенос](docs/BELT_DOCKER_DATA_CONTINUITY_GATE.md)
 - [Изолированный Docker HUB: восстановление полного снимка, проверка SHA и запуск без сети](docs/DOCKER_HUB_SHADOW_REHEARSAL.md)
 - [Контракт финального релиза: все функции, Docker, Xray и безопасная миграция Belt](docs/ROUTER_ORCHESTRATOR_RELEASE_ACCEPTANCE.md)

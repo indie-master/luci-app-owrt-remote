@@ -2,6 +2,7 @@
 # SHA is supplied by docker/manager.py; a mismatched source fails the build.
 FROM python:3.10-slim@sha256:6ff506466f8b1e981719b468cc0023b8ef000b983cdec0eafe119d01f379e31d
 ARG HUB_SOURCE_SHA256
+LABEL org.router-orchestrator.hub-source-sha256=$HUB_SOURCE_SHA256
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
     OWRT_REMOTE_STATE_DIR=/var/lib/owrt-remote
 WORKDIR /opt/owrt-remote

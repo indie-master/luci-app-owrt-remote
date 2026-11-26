@@ -110,16 +110,21 @@ make_key() {
 	key_dir="$(target_path etc/owrt-remote)"
 	key_file="$key_dir/web.key"
 	mkdir -p "$key_dir"
+	[ ! -L "$key_dir" ] && [ ! -L "$key_file" ] || die "unsafe web key path"
 	if [ ! -s "$key_file" ]; then
 		if command -v hexdump >/dev/null 2>&1; then
 			key="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '16/1 "%02x"')"
+		elif command -v od >/dev/null 2>&1; then
+			key="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 		else
-			key="$(date +%s)-$$"
+			die "cannot generate a secure web key: hexdump or od required"
 		fi
-		printf '%s\n' "$key" >"$key_file"
+		case "$key" in *[!0-9a-f]*|'') die "secure web key generation failed" ;; esac
+		[ "${#key}" -eq 32 ] || die "secure web key generation failed"
+		(umask 077; set -C; printf '%s\n' "$key" >"$key_file") ||
+			die "cannot create web key"
 	fi
 	chmod 0600 "$key_file"
-	cat "$key_file"
 }
 
 router_ip() {
@@ -256,6 +261,7 @@ install_xray_runtime() {
 
 # Abort before changing any installed component if transport state is unsafe.
 transport_preflight
+make_key
 
 # The journal requires a kernel lock. Do not replace the installed agent
 # on systems without the necessary command or silently use unsafe PID locks.
@@ -303,7 +309,6 @@ fi
 
 install_xray_runtime
 
-key="$(make_key)"
 ip="$(router_ip)"
 ui_version="$(installed_ui_version)"
 owrt_version="$(openwrt_version)"
@@ -316,6 +321,6 @@ if [ -n "$ui_version" ]; then
 	info "UI:     $ui_version"
 fi
 info "LuCI:   Службы -> OpenWrt Remote"
-info "Панель: http://$ip/cgi-bin/owrt-remote?key=$key"
+info "Панель: http://$ip/cgi-bin/owrt-remote (ключ хранится в /etc/owrt-remote/web.key)"
 info "CLI:    owrt-remote doctor"
 info "Xray:   если пишет 'нет Xray', нажми в панели 'Поставить Xray в /tmp' или выполни: owrt-remote install-xray-tmp"

@@ -43,6 +43,23 @@ class DockerEdgePlanTests(unittest.TestCase):
         self.assertIn("REVIEW ONLY", conf)
         self.assertIn("Certificate bootstrap/renewal: REQUIRED", edge.preview(plan))
 
+    def test_hub_terminal_upgrade_and_wss_route_keep_distinct_upstreams(self):
+        external = edge.new_edge_plan("hub.example.org", hub_port=18444, wss_port=8088)
+        bundled = edge.new_edge_plan("hub.example.org", mode="bundled_nginx",
+                                     acme_email="admin@example.org")
+        for config, hub, wss in (
+            (edge.render_external_nginx_snippet(external), "127.0.0.1:18444", "127.0.0.1:8088"),
+            (edge.render_bundled_nginx(bundled), "ro-core:8088", "ro-core:18444"),
+        ):
+            with self.subTest(hub=hub):
+                wss_location, hub_location = config.split("location ^~ /owrt-ws/ {", 1)[1].split("location / {")
+                self.assertIn(f"proxy_pass http://{wss};", wss_location)
+                self.assertIn(f"proxy_pass http://{hub};", hub_location)
+                self.assertIn("proxy_http_version 1.1;", hub_location)
+                self.assertIn("proxy_set_header Upgrade $http_upgrade;", hub_location)
+                self.assertIn('proxy_set_header Connection "upgrade";', hub_location)
+                self.assertIn("proxy_read_timeout 3600s;", hub_location)
+
     def test_bundled_reuses_existing_pem_without_copying_private_key(self):
         plan = edge.new_edge_plan("my.example.net", mode="bundled_nginx",
                                   tls_mode="existing_pem",

@@ -1,0 +1,26 @@
+name: Stabilization offline regression
+on:
+  pull_request:
+  push:
+    branches: [feature/router-orchestrator-unified-docker-transports-20261123]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.2'
+      - run: sh tools/staging_offline_check.sh
+      - name: Validate clean install Compose model
+        run: |
+          docker compose version
+          set -a
+          . ./.env.example
+          set +a
+          docker compose --file docker-compose.yml --project-name router-orchestrator \
+            --env-file /dev/null config --quiet

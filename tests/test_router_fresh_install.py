@@ -52,9 +52,11 @@ class FreshInstallTests(unittest.TestCase):
             actual=(self.router/rel).read_bytes()
             expected=(BASE/"files"/rel).read_bytes()
             self.assertEqual(actual,expected,rel)
-        key=(self.router/"etc/owrt-remote/web.key").read_text().strip()
-        self.assertGreater(len(key),16)
+        key_file = self.router / "etc/owrt-remote/web.key"
+        key = key_file.read_text().strip()
+        self.assertRegex(key, r"^[0-9a-f]{32}$")
         self.assertNotIn(key,x.stdout+x.stderr)
+        self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
         # The same script is strictly fresh-only, never repeats an installation.
         second=self.script("--install",PIN)
         self.assertNotEqual(second.returncode,0)
@@ -96,6 +98,31 @@ class FreshInstallTests(unittest.TestCase):
                 x=self.script(*argv)
                 self.assertNotEqual(x.returncode,0)
         self.assertFalse((self.router/"usr").exists())
+
+    def run_make_key(self, stub):
+        source = (BASE / "install.sh").read_text()
+        make_key = source[source.index("make_key() {"):source.index("\nrouter_ip() {")]
+        harness = '''set -eu
+target_path() { printf '%s/%s' "$TEST_ROOT" "$1"; }
+die() { printf '%s\\n' "$*" >&2; exit 1; }
+''' + stub + '\n' + make_key + '\nmake_key\n'
+        return subprocess.run(["sh", "-c", harness], env={**self.env, "TEST_ROOT": str(self.router)},
+                              text=True, capture_output=True, timeout=10)
+
+    def test_short_random_output_fails_closed_without_creating_key(self):
+        result = self.run_make_key("hexdump() { printf 1234; }")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("secure web key generation failed", result.stderr)
+        self.assertFalse((self.router / "etc/owrt-remote/web.key").exists())
+
+    def test_make_key_preserves_existing_nonempty_key_without_printing_it(self):
+        key_file = self.router / "etc/owrt-remote/web.key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("existing-fixture\n")
+        result = self.run_make_key("hexdump() { die unexpected; }")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(key_file.read_text(), "existing-fixture\n")
 
     def test_missing_file_refuses_before_modifying_router(self):
         outside=self.tmp/"missing-source"
