@@ -1,11 +1,14 @@
 """Real Docker lifecycle test for the disposable GitHub-hosted runner."""
 import contextlib
+import http.client
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
@@ -86,6 +89,94 @@ def resources(project):
         "networks": docker("network", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"),
         "volumes": docker("volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={project}"),
     }
+
+
+def startup_signals(log):
+    # Emit fixed labels only. Tracebacks and request logs can contain secrets.
+    markers = {
+        "auth initialization": ("in load_auth", "in save_auth"),
+        "traceback": ("Traceback (most recent call last):",),
+        "permission denied": ("PermissionError:", "Permission denied"),
+        "read-only filesystem": ("Read-only file system",),
+        "SQLite error": ("sqlite3.OperationalError:", "sqlite3.DatabaseError:"),
+        "import error": ("ImportError:", "ModuleNotFoundError:"),
+        "address in use": ("Address already in use",),
+        "listening on loopback": ("Router Orchestrator listening on http://127.0.0.1:",),
+        "health probe failed": ("AssertionError", "ConnectionRefusedError:", "URLError:"),
+    }
+    return [label for label, patterns in markers.items() if any(p in log for p in patterns)]
+
+
+def health_snapshot(port, path):
+    try:
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            result = {"status": response.status}
+            try:
+                payload = json.loads(response.read(4096))
+            except ValueError:
+                return {**result, "body": "invalid JSON"}
+            if not isinstance(payload, dict):
+                return {**result, "body": "unexpected JSON type"}
+            result["ok"] = payload.get("ok") is True
+            revision = payload.get("revision")
+            if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{64}", revision):
+                result["revision_matches_source"] = revision == manager.file_hash(manager.APP)
+            elif "revision" in payload:
+                result["revision_matches_source"] = False
+            return result
+    except (OSError, http.client.HTTPException):
+        return {"error": "HTTP probe failed"}
+
+
+def diagnose_hub(project, port):
+    def capture(*args):
+        return subprocess.run(["docker", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, errors="replace", timeout=5)
+
+    name = project + "-hub"
+    report = {"container": name}
+    commands = {
+        "state": ("container", "inspect", "--format",
+                  "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.RestartCount}}", name),
+        "healthcheck": ("container", "inspect", "--format",
+                        "{{json .State.Health}}", name),
+        "startup": ("logs", "--tail", "80", name),
+    }
+    for field, command in commands.items():
+        try:
+            result = capture(*command)
+            if result.returncode:
+                report[field] = "unavailable"
+            elif field == "state":
+                state = result.stdout.strip()
+                if re.fullmatch(r"(created|running|paused|restarting|removing|exited|dead) "
+                                r"-?[0-9]{1,10} (true|false) [0-9]{1,10}", state):
+                    status, exit_code, oom, restarts = state.split()
+                    report[field] = {"status": status, "exit_code": int(exit_code),
+                                     "oom_killed": oom == "true", "restarts": int(restarts)}
+                else:
+                    report[field] = "unavailable"
+            elif field == "healthcheck":
+                health = json.loads(result.stdout) or {}
+                status = health.get("Status")
+                if status in ("starting", "healthy", "unhealthy"):
+                    probes = health.get("Log") or []
+                    streak = health.get("FailingStreak")
+                    report[field] = {"status": status,
+                                     "failing_streak": streak if type(streak) is int else None,
+                                     "probes": [{"exit_code": p["ExitCode"],
+                                                 "signals": startup_signals(p["Output"])}
+                                                for p in probes[-5:] if type(p.get("ExitCode")) is int]}
+                else:
+                    report[field] = "unavailable"
+            else:
+                report[field] = startup_signals(result.stdout + result.stderr)
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+            report[field] = "unavailable"
+    report["http"] = {path: health_snapshot(port, path) for path in ("/health", "/health?panel-update=1")}
+    print("HUB failure diagnostics " + json.dumps(report, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def cleanup(project, config, images):
@@ -215,6 +306,12 @@ def run(root):
         with database(state) as db:
             assert db.execute("SELECT * FROM ro_ci_marker").fetchall() == [
                 ("synthetic-row", "keep-latest")]
+    except BaseException:
+        try:
+            diagnose_hub(project, port)
+        except Exception:
+            print("HUB failure diagnostics unavailable", file=sys.stderr, flush=True)
+        raise
     finally:
         cleanup(project, config, images)
 

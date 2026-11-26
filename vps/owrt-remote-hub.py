@@ -1742,7 +1742,8 @@ def save_auth(username, password):
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
     try:
-        data = normalize_auth_state(load_auth())
+        # On first boot load_auth() itself calls save_auth().
+        data = normalize_auth_state(json.loads(AUTH_FILE.read_text(encoding="utf-8")))
     except Exception:
         data = normalize_auth_state({"username": username})
     data["username"] = username

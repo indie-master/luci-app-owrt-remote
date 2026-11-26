@@ -10,6 +10,7 @@ on:
       - 'tools/orchestrator_edge_plan.py'
       - 'vps/**'
       - 'tests/docker_integration_ci.py'
+      - 'tests/test_docker_hub_readiness.py'
       - 'tests/test_docker_backup_recovery.py'
       - 'tests/test_orchestrator_stack_config.py'
   workflow_dispatch:
@@ -45,6 +46,7 @@ jobs:
           echo "DOCKER_CONFIG=$config" >> "$GITHUB_ENV"
       - name: Offline fault and configuration regressions
         run: |
+          python3 -m unittest discover -s tests -p test_docker_hub_readiness.py
           python3 -m unittest discover -s tests -p test_docker_backup_recovery.py
           python3 -m unittest discover -s tests -p test_orchestrator_stack_config.py
       - name: Real clean install, restart, backup, restore, update and recovery
