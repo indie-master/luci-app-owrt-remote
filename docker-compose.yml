@@ -39,6 +39,9 @@ services:
     image: ${RO_XRAY_IMAGE:-router-orchestrator-xray:unconfigured}
     pull_policy: never
     container_name: ${RO_STACK_NAME:-router-orchestrator}-xray
+    labels:
+      org.router-orchestrator.stack-owner: "${RO_STACK_OWNER:-}"
+      org.router-orchestrator.stack-revision: "${RO_STACK_REVISION:-}"
     network_mode: host
     restart: unless-stopped
     user: "23088:23088"
@@ -77,6 +80,9 @@ services:
     image: ${RO_NGINX_IMAGE:-router-orchestrator-nginx:unconfigured}
     pull_policy: never
     container_name: ${RO_STACK_NAME:-router-orchestrator}-nginx
+    labels:
+      org.router-orchestrator.stack-owner: "${RO_STACK_OWNER:-}"
+      org.router-orchestrator.stack-revision: "${RO_STACK_REVISION:-}"
     network_mode: host
     restart: unless-stopped
     read_only: true
@@ -103,7 +109,7 @@ services:
       - /var/run:rw,nosuid,nodev,size=4m
       - /tmp:rw,nosuid,nodev,size=8m
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -T 2 -O /dev/null http://127.0.0.1:${RO_NGINX_HEALTH_PORT:-18189}/healthz"]
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:${RO_NGINX_HEALTH_PORT:-18189}/healthz"]
       interval: 20s
       timeout: 4s
       retries: 3

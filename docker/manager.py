@@ -85,9 +85,10 @@ def inherited_lock():
     return () if fd is None else (fd,)
 
 
-def call(*args, check=True):
+def call(*args, check=True, env=None, timeout=None):
     return subprocess.run(args, cwd=ROOT, check=check, text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=inherited_lock())
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=inherited_lock(),
+                          env=env, timeout=timeout)
 
 def require_root():
     require(os.geteuid() == 0, "Run as root")
@@ -146,19 +147,30 @@ def status_service():
     return fields[2] not in {"inactive", "failed"}
 
 
-def compose(*args, config=None, runtime_image=None):
+def local_docker_env():
+    return {key: value for key, value in os.environ.items() if key not in
+            {"DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"}}
+
+
+def compose(*args, config=None, runtime_image=None, project=None, profile=None, local=False):
     # Only the validated manager configuration selects the Compose model and its inputs.
     if config is None:
         config = settings()
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("COMPOSE_", "RO_"))}
-    env.update(config, RO_STACK_NAME=PROJECT)
+    if project is None:
+        project = PROJECT
+    parent_env = local_docker_env() if local else os.environ
+    env = {key: value for key, value in parent_env.items() if not key.startswith(("COMPOSE_", "RO_"))}
+    env.update(config, RO_STACK_NAME=project)
     if runtime_image is not None:
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_image), "Invalid immutable HUB image ID")
         env["RO_HUB_RUNTIME_IMAGE"] = runtime_image
     return subprocess.run(
-        ["docker", "compose", "--file", str(ROOT / "docker-compose.yml"),
-         "--project-name", PROJECT, "--env-file", "/dev/null", *args],
+        ["docker", *(("--host", "unix:///var/run/docker.sock") if local else ()),
+         "compose", "--file", str(ROOT / "docker-compose.yml"),
+         "--project-name", project, "--env-file", "/dev/null",
+         *(("--profile", profile) if profile else ()), *args],
         cwd=ROOT, env=env, check=True, text=True, pass_fds=inherited_lock(),
+        timeout=120 if local else None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
@@ -387,20 +399,23 @@ def backup():
     require(not status_service(), "Host HUB active: refuse mixed-writer backup")
     require(set(docker_hub_states()) <= {"created", "exited"},
             "Stop Docker HUB before consistency backup")
-    state = state_path()
-    require(BACKUPS == BACKUPS.resolve() and not BACKUPS.is_relative_to(state.resolve())
-            and not state.resolve().is_relative_to(BACKUPS),
+    return backup_state(state_path(), BACKUPS)
+
+
+def backup_state(state, directory):
+    require(directory == directory.resolve() and not directory.is_relative_to(state.resolve())
+            and not state.resolve().is_relative_to(directory),
             "Backup directory overlaps state or has path aliases")
-    BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(BACKUPS, 0o700)
-    sync_directory(BACKUPS.parent)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    sync_directory(directory.parent)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    dest = BACKUPS / f"router-orchestrator-{stamp}-{uuid.uuid4().hex}.tar.gz"
+    dest = directory / f"router-orchestrator-{stamp}-{uuid.uuid4().hex}.tar.gz"
     files = {}
     manifest = {"format": 1, "files": files, "hub_source_sha256": file_hash(APP)}
     manifest_size = len(json.dumps(manifest, separators=(",", ":")))
     total = 0
-    with tempfile.TemporaryDirectory(prefix=".router-backup-", dir=BACKUPS) as td:
+    with tempfile.TemporaryDirectory(prefix=".router-backup-", dir=directory) as td:
         dbpath = Path(td) / "hub.db"
         with sqlite_read(state / "hub.db") as src, contextlib.closing(sqlite3.connect(dbpath)) as dst:
             src.execute("BEGIN")
@@ -432,7 +447,7 @@ def backup():
             out.flush()
             os.fsync(out.fileno())
         os.link(pending, dest)
-        sync_directory(BACKUPS)
+        sync_directory(directory)
     print("BACKUP:", dest)
     print("SHA256:", limited.digest.hexdigest())
     return dest
@@ -909,6 +924,8 @@ def status():
     print("Docker HUB running:", docker_running() if ENV.exists() else "unconfigured")
 
 def main():
+    # Keep a single manager module instance when invoked as a script.
+    sys.modules.setdefault("manager", sys.modules[__name__])
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="action", required=True)
     ins = subs.add_parser("install")
@@ -927,9 +944,21 @@ def main():
     restore_parser = subs.add_parser("restore")
     restore_parser.add_argument("archive")
     restore_parser.add_argument("--destination", required=True)
+    stack_parser = subs.add_parser("stack")
+    stack_parser.add_argument("--env-file", type=Path, required=True)
+    stack_actions = stack_parser.add_subparsers(dest="operation", required=True)
+    for operation in ("validate", "start", "stop", "status", "recover", "rollback"):
+        stack_actions.add_parser(operation)
+    update = stack_actions.add_parser("update")
+    update.add_argument("--candidate-env", type=Path, required=True)
+    update.add_argument("--acknowledge-schema-risk", action="store_true")
     args = parser.parse_args()
     try:
-        if args.action == "status":
+        if args.action == "stack":
+            from stack_runtime import run
+            with deployment_lock():
+                run(args)
+        elif args.action == "status":
             status()
         else:
             with deployment_lock():
@@ -950,7 +979,7 @@ def main():
                 elif args.action == "rollback":
                     rollback(args)
         return 0
-    except (Blocked, OSError, EOFError, subprocess.CalledProcessError, ValueError,
+    except (Blocked, OSError, EOFError, subprocess.SubprocessError, ValueError,
             sqlite3.DatabaseError, tarfile.TarError, zlib.error, KeyError, TypeError) as exc:
         print("BLOCKED:", str(exc)[:350], file=sys.stderr)
         return 2
