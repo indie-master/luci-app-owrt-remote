@@ -19343,7 +19343,8 @@ exit 127
             self.send_json(400, {"ok": False, "error": str(exc)})
 
     def unified_xray_csrf(self):
-        if (not secrets.compare_digest(self.headers.get("X-Unified-Xray-CSRF", ""), UNIFIED_XRAY_CSRF) or
+        if (not secrets.compare_digest(self.headers.get("X-Unified-Xray-CSRF", "").encode("utf-8"),
+                                       UNIFIED_XRAY_CSRF.encode("ascii")) or
                 (self.headers.get("Origin") and self.headers["Origin"] != self.request_origin())):
             self.send_json(403, {"ok": False, "error": "invalid CSRF or origin"})
             return False

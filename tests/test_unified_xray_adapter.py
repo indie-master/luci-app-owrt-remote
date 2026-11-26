@@ -20,6 +20,7 @@ from test_orchestrator_stack_config import fixture
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
+from docker_stack_integration_ci import AdapterCheckFailed, adapter_check, hub_check
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, Adapter, parameters, read_request
 from unified_xray_state import XrayState, encode
@@ -34,6 +35,42 @@ with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"OWRT_R
 def router(port=30100):
     return {"id": "demo", "clients": [str(uuid.uuid4()), str(uuid.uuid4())],
             "ports": [port, port + 1], "targets": [["127.0.0.1", 80], ["127.0.0.1", 22]]}
+
+
+class CIDiagnosticsTests(unittest.TestCase):
+    def test_http_status_survives_failed_docker_exec(self):
+        body = "with check('registration', 'create-wss'):\n    pass"
+        error = subprocess.CalledProcessError(
+            1, ["docker", "sensitive-command"],
+            output="RO_ADAPTER_CHECK stage=registration check=create-wss expected_http=200 actual_http=409\n",
+            stderr="sensitive-stderr",
+        )
+        with patch("docker_stack_integration_ci.docker", side_effect=error) as docker:
+            with self.assertRaises(AdapterCheckFailed) as caught:
+                hub_check("fixture", body)
+        self.assertEqual(str(caught.exception),
+                         "stage=registration check=create-wss expected_http=200 actual_http=409")
+        compile(docker.call_args.args[-1], "<container-check>", "exec")
+
+    def test_untrusted_child_output_is_never_forwarded(self):
+        body = "with check('registration', 'create-wss'):\n    pass"
+        for output in ("RO_ADAPTER_CHECK stage=registration check=undeclared error=timeout\n",
+                       "RO_ADAPTER_CHECK stage=registration check=create-wss error=timeout\nsensitive-output"):
+            error = subprocess.CalledProcessError(1, ["docker", "sensitive-command"],
+                                                  output=output, stderr="sensitive-stderr")
+            with self.subTest(output=output), patch("docker_stack_integration_ci.docker", side_effect=error):
+                with self.assertRaises(AdapterCheckFailed) as caught:
+                    with adapter_check("hub-api", "exec"):
+                        hub_check("fixture", body)
+                self.assertEqual(str(caught.exception), "stage=hub-api check=exec error=command_exit=1")
+                self.assertTrue(caught.exception.__suppress_context__)
+
+
+class WebAuthorizationTests(unittest.TestCase):
+    def test_malformed_csrf_header_receives_403(self):
+        handler = Mock(headers={"X-Unified-Xray-CSRF": "\xff"})
+        self.assertFalse(hub.Handler.unified_xray_csrf(handler))
+        handler.send_json.assert_called_once_with(403, {"ok": False, "error": "invalid CSRF or origin"})
 
 
 class ContractTests(unittest.TestCase):
@@ -222,6 +259,16 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(self.state.config.read_bytes(), self.baseline)
         self.assertIsNone(self.state.load()["pending"])
 
+    def test_failed_rollback_restart_leaves_recoverable_prepare(self):
+        self.adapter.restart.side_effect = [m.Blocked("candidate failed"), m.Blocked("restore failed"), None]
+        with self.assertRaisesRegex(m.Blocked, "restore failed"):
+            self.prepare()
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+        self.assertEqual(self.state.load()["pending"]["token"], self.token)
+        self.call("rollback", transaction=self.token)
+        self.assertIsNone(self.state.load()["pending"])
+        self.assertEqual(self.state.config.read_bytes(), self.baseline)
+
     def test_validation_failure_is_write_free(self):
         self.adapter.test_config.side_effect = subprocess.CalledProcessError(1, "xray")
         with self.assertRaises(subprocess.CalledProcessError):
@@ -276,6 +323,17 @@ class SQLiteTests(unittest.TestCase):
             hub.unified_router_edit(self.hub_db, "demo", {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
         self.assertIsNone(hub.get_router(self.hub_db, "demo"))
         self.assertIsNone(self.hub_db.execute("select token from xray_receipt").fetchone())
+
+    def test_failed_edit_keeps_existing_row_and_receipt(self):
+        self.host.side_effect = [self.status, {"changed": True}, {}]
+        hub.unified_router_edit(self.hub_db, "demo", {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        before = hub.get_active_router(self.hub_db, "demo")
+        receipt = self.hub_db.execute("select token from xray_receipt").fetchone()
+        self.host.side_effect = [self.status, RuntimeError("no ready"), self.status]
+        with self.assertRaises(RuntimeError):
+            hub.unified_router_edit(self.hub_db, "demo", {"entry_port": 30110})
+        self.assertEqual(hub.get_active_router(self.hub_db, "demo"), before)
+        self.assertEqual(self.hub_db.execute("select token from xray_receipt").fetchone(), receipt)
 
     def test_commit_response_loss_reconciles_using_receipt(self):
         self.host.side_effect = [self.status, {"changed": True}, RuntimeError("lost")]

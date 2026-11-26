@@ -4,6 +4,7 @@ from functools import wraps
 import io
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -54,12 +55,15 @@ def diagnose_gate(gate):
     return checked
 
 
-def cli(path, *args, expected=0):
+def cli(path, *args, expected=0, expected_error=None):
     output = io.StringIO()
+    errors = io.StringIO()
     with patch.object(sys, "argv", ["manager.py", "stack", "--env-file", str(path), *map(str, args)]):
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             code = m.main()
     assert code == expected, (args[0], code, expected)
+    if expected_error is not None:
+        assert errors.getvalue().strip() == expected_error
     return output.getvalue()
 
 
@@ -272,30 +276,185 @@ def test_release(root, env, config, project):
             docker("image", "rm", candidate)
 
 
+class AdapterCheckFailed(Exception):
+    """Only fixed identifiers and sanitized outcomes reach the CI log."""
+
+
+def error_category(error):
+    if isinstance(error, subprocess.CalledProcessError):
+        return f"command_exit={error.returncode}"
+    if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+        return "timeout"
+    if isinstance(error, PermissionError):
+        return "permission_denied"
+    if isinstance(error, ConnectionError):
+        return "connection_failed"
+    if isinstance(error, OSError):
+        return "os_error"
+    if isinstance(error, m.Blocked):
+        return "blocked"
+    if isinstance(error, AssertionError):
+        return "assertion_failed"
+    return "unexpected_error"
+
+
 @contextlib.contextmanager
-def adapter_process(runtime, adapter_type=Adapter):
-    pid = os.fork()
+def adapter_check(stage, check):
+    try:
+        yield
+    except AdapterCheckFailed:
+        raise
+    except Exception as error:
+        raise AdapterCheckFailed(f"stage={stage} check={check} error={error_category(error)}") from None
+
+
+@contextlib.contextmanager
+def adapter_detail(stage, check):
+    # Preserve the real adapter's exception handling and IPC response.
+    try:
+        yield
+    except Exception as error:
+        print(f"stage={stage} check={check} error={error_category(error)}", file=sys.stderr, flush=True)
+        raise
+
+
+# Executed inside the real HUB container. Never emit response bodies, exceptions,
+# or Python tracebacks. The host validates this record before forwarding it.
+HUB_CHECKS = """
+import contextlib
+import http.client
+import json
+import os
+import runpy
+import uuid
+
+@contextlib.contextmanager
+def check(stage, name):
+    global current
+    current = (stage, name)
+    yield
+
+def fail(outcome):
+    print("RO_ADAPTER_CHECK stage=%s check=%s %s" % (*current, outcome), flush=True)
+    raise SystemExit(1)
+
+def request(expected, method, path, body=None, auth=False, csrf=None):
+    headers = {'Content-Type': 'application/json'}
+    if auth:
+        headers['Cookie'] = hub['SESSION_COOKIE'] + '=' + hub['session_token']()
+    if csrf is not None:
+        headers['X-Unified-Xray-CSRF'] = csrf
+    conn = http.client.HTTPConnection('127.0.0.1', int(os.environ['OWRT_REMOTE_PORT']), timeout=90)
+    try:
+        conn.request(method, path, json.dumps(body) if body is not None else None, headers)
+        with conn.getresponse() as reply:
+            if reply.status != expected:
+                fail(f'expected_http={expected} actual_http={reply.status}')
+            return reply.read()
+    finally:
+        conn.close()
+
+def rejected(op, **payload):
+    try:
+        ipc(op, **payload)
+    except RuntimeError as error:
+        if str(error) != "Xray adapter rejected the operation":
+            fail("error=ipc_unavailable")
+    else:
+        fail("error=unexpected_success")
+
+current = ("adapter-start", "hub-import")
+"""
+
+
+def hub_check(project, body):
+    program = HUB_CHECKS + """
+try:
+    hub = runpy.run_path('/opt/owrt-remote/owrt-remote-hub.py')
+    ipc = hub['unified_xray_request']
+""" + "".join("    " + line + "\n" for line in body.splitlines()) + """
+except AssertionError:
+    fail("error=assertion_failed")
+except TimeoutError:
+    fail("error=timeout")
+except (OSError, http.client.HTTPException):
+    fail("error=connection_failed")
+except RuntimeError:
+    fail("error=runtime_error")
+except (ValueError, KeyError, TypeError):
+    fail("error=invalid_response")
+except Exception:
+    fail("error=unexpected_error")
+"""
+    try:
+        docker("exec", project + "-hub", "python", "-c", program)
+    except subprocess.CalledProcessError as error:
+        # Do not forward stderr, command arguments, or arbitrary stdout. Only
+        # identifiers declared by the local test body may be reported.
+        declared = {("adapter-start", "hub-import")}
+        declared.update(re.findall(r"^with check\('([a-z-]+)', '([a-z0-9-]+)'\):$", body, re.M))
+        match = re.fullmatch(
+            r"RO_ADAPTER_CHECK stage=([a-z-]+) check=([a-z0-9-]+) "
+            r"(expected_http=[1-5][0-9]{2} actual_http=[0-9]{3}|"
+            r"error=(?:assertion_failed|timeout|connection_failed|runtime_error|invalid_response|"
+            r"unexpected_error|ipc_unavailable|unexpected_success))\n?",
+            error.stdout or "",
+        )
+        if match and (match[1], match[2]) in declared:
+            raise AdapterCheckFailed(f"stage={match[1]} check={match[2]} {match[3]}") from None
+        raise
+
+
+@contextlib.contextmanager
+def adapter_process(runtime, adapter_type=Adapter, *, expect_crash=False):
+    with adapter_check("adapter-start", "fork"):
+        pid = os.fork()
     if pid == 0:
         try:
             adapter_type(runtime.path).run()
+        except Exception as error:
+            print(f"stage=adapter-start check=child error={error_category(error)}",
+                  file=sys.stderr, flush=True)
         finally:
             os._exit(1)
+    status = None
     try:
-        for attempt in range(50):
-            try:
-                with socket.socket(socket.AF_UNIX) as conn:
-                    conn.settimeout(1)
-                    conn.connect(socket_address(runtime))
-                break
-            except ConnectionRefusedError:
-                if attempt == 49:
-                    raise
-                time.sleep(0.1)
+        with adapter_check("adapter-start", "listen"):
+            deadline = time.monotonic() + 5
+            while True:
+                waited, result = os.waitpid(pid, os.WNOHANG)
+                if waited:
+                    status = result
+                    raise AdapterCheckFailed("stage=adapter-start check=listen error=child_exited")
+                try:
+                    with socket.socket(socket.AF_UNIX) as conn:
+                        conn.settimeout(1)
+                        conn.connect(socket_address(runtime))
+                    break
+                except ConnectionRefusedError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError from None
+                    time.sleep(0.1)
         yield
+        if expect_crash:
+            with adapter_check("sigkill-recovery", "child-signal"):
+                # The IPC read returning EOF implies the crashing child closed
+                # its end. Reap it without sending a signal that could mask a failure.
+                deadline = time.monotonic() + 5
+                while True:
+                    waited, result = os.waitpid(pid, os.WNOHANG)
+                    if waited:
+                        status = result
+                        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError
+                    time.sleep(0.1)
     finally:
-        os.kill(pid, signal.SIGKILL)
-        _, status = os.waitpid(pid, 0)
-        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+        if status is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
 
 
 def wrong_peer(runtime, uid):
@@ -327,11 +486,32 @@ def test_adapter(env, config, project):
     port, ssh_port, edit_port, failing, abandoned, abandoned_ssh = choose_ports(6)
     crash_token = uuid.uuid4().hex
 
-    class FaultAdapter(Adapter):
+    runtime_fault = runtime.path.parent / ".ci-runtime-fault"
+
+    class DiagnosticAdapter(Adapter):
+        def open_project(self):
+            with adapter_detail("ipc-peers", "active-project"):
+                return super().open_project()
+
+        @staticmethod
+        def owned_xray(stack, release, record):
+            with adapter_detail("ipc-readiness", "xray-ownership"):
+                return Adapter.owned_xray(stack, release, record)
+
+        def test_config(self, stack, release, data):
+            with adapter_detail("xray-validation", "candidate"):
+                return super().test_config(stack, release, data)
+
+        def restart(self, stack, release, container, routers):
+            with adapter_detail("xray-runtime", "restart"):
+                super().restart(stack, release, container, routers)
+
+    class FaultAdapter(DiagnosticAdapter):
         def restart(self, stack, release, container, routers):
             super().restart(stack, release, container, routers)
             if any(failing in router["ports"] for router in routers.values()):
                 docker("stop", container)
+                runtime_fault.touch()
                 raise m.Blocked("CI injected runtime failure")
 
         def handle(self, stack, release, records, request):
@@ -339,119 +519,152 @@ def test_adapter(env, config, project):
             if request.get("transaction") == crash_token:
                 os.kill(os.getpid(), signal.SIGKILL)
             return result
-    prefix = """
-import http.client
-import json
-import os
-import runpy
-import uuid
-hub = runpy.run_path('/opt/owrt-remote/owrt-remote-hub.py')
-ipc = hub['unified_xray_request']
-"""
-    with adapter_process(runtime, FaultAdapter):
-        wrong_peer(runtime, 65534)
-        wrong_peer(runtime, m.HUB_UID)
-        with m.deployment_lock():
-            docker("exec", project + "-hub", "python", "-c", prefix + """
-try:
-    ipc('restart')
-except RuntimeError:
-    pass
-else:
-    raise AssertionError('Deployment lock did not block Xray restart')
-""")
-        program = prefix + f"""
-def request(method, path, body=None, auth=False, csrf=None):
-    headers = {{'Content-Type': 'application/json'}}
-    if auth:
-        headers['Cookie'] = hub['SESSION_COOKIE'] + '=' + hub['session_token']()
-    if csrf is not None:
-        headers['X-Unified-Xray-CSRF'] = csrf
-    conn = http.client.HTTPConnection('127.0.0.1', int(os.environ['OWRT_REMOTE_PORT']), timeout=90)
-    try:
-        conn.request(method, path, json.dumps(body) if body is not None else None, headers)
-        with conn.getresponse() as reply:
-            raw = reply.read()
-            return reply.status, raw
-    finally:
-        conn.close()
 
-assert request('GET', '/api/xray/status')[0] == 401
-assert request('POST', '/api/xray/restart', auth=True)[0] == 403
-_, auth = request('GET', '/api/auth/meta', auth=True)
-csrf = json.loads(auth)['auth']['unified_xray_csrf']
-assert json.loads(request('GET', '/api/xray/status', auth=True)[1])['ready']
-assert ipc('version')['version'] == {os.environ["RO_CI_XRAY_VERSION"]!r}
-assert ipc('health')['ready']
-for op, payload in [('shell', {{}}), ('restart', {{'container': 'unowned'}})]:
-    try:
-        ipc(op, **payload)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError('Forbidden IPC request succeeded')
+    with adapter_process(runtime, FaultAdapter, expect_crash=True):
+        with adapter_check("ipc-peers", "wrong-uid"):
+            wrong_peer(runtime, 65534)
+        with adapter_check("ipc-peers", "same-uid-outside-hub"):
+            wrong_peer(runtime, m.HUB_UID)
+        with adapter_check("deployment-lock", "restart-denied"), m.deployment_lock():
+            hub_check(project, """
+with check('deployment-lock', 'restart-denied'):
+    rejected('restart')
+""")
+        with adapter_check("hub-api", "exec"):
+            hub_check(project, f"""
+with check('web-auth', 'anonymous-status'):
+    request(401, 'GET', '/api/xray/status')
+with check('web-auth', 'restart-no-csrf'):
+    request(403, 'POST', '/api/xray/restart', auth=True)
+with check('web-auth', 'restart-malformed-csrf'):
+    request(403, 'POST', '/api/xray/restart', auth=True, csrf=chr(255))
+with check('web-auth', 'owner-csrf'):
+    auth = json.loads(request(200, 'GET', '/api/auth/meta', auth=True))['auth']
+    csrf = auth['unified_xray_csrf']
+    assert auth['is_owner'] is True and isinstance(csrf, str) and csrf
+with check('ipc-readiness', 'web-status'):
+    assert json.loads(request(200, 'GET', '/api/xray/status', auth=True))['ready'] is True
+with check('ipc-readiness', 'status'):
+    assert ipc('status')['ready'] is True
+with check('ipc-readiness', 'version'):
+    assert ipc('version')['version'] == {os.environ["RO_CI_XRAY_VERSION"]!r}
+with check('ipc-readiness', 'health'):
+    assert ipc('health')['ready'] is True
+with check('ipc-peers', 'operation-allowlist'):
+    rejected('shell')
+with check('ipc-peers', 'target-override'):
+    rejected('restart', container='unowned')
 data = {{'id': 'ci-router', 'entry_port': {port}, 'ssh_entry_port': {ssh_port}}}
-assert request('POST', '/api/router', data, auth=True)[0] == 403
-assert request('POST', '/api/router', data, auth=True, csrf=csrf)[0] == 200
-assert request('POST', '/api/router/ci-router/xray/edit', {{'entry_port': {edit_port}}},
-               auth=True, csrf=csrf)[0] == 200
-assert request('POST', '/api/router/ci-router/xray/edit', {{'entry_port': {ssh_port}}},
-               auth=True, csrf=csrf)[0] == 409
-assert request('POST', '/api/router/ci-router/xray/edit', {{'entry_port': {failing}}},
-               auth=True, csrf=csrf)[0] == 409
-assert ipc('health')['ready']
-with hub['connect']() as db:
-    row = hub['get_router'](db, 'ci-router')
+with check('web-auth', 'register-no-csrf'):
+    request(403, 'POST', '/api/router', data, auth=True)
+with check('registration', 'create-wss'):
+    request(200, 'POST', '/api/router', data, auth=True, csrf=csrf)
+with check('editing', 'change-port'):
+    request(200, 'POST', '/api/router/ci-router/xray/edit', {{'entry_port': {edit_port}}},
+            auth=True, csrf=csrf)
+def sqlite_state():
+    with hub['connect']() as db:
+        row = hub['get_active_router'](db, 'ci-router')
+        return dict(row), db.execute('SELECT token FROM xray_receipt WHERE slot=1').fetchone()[0]
+with check('editing', 'sqlite-before-rejection'):
+    before = sqlite_state()
+edit = '/api/router/ci-router/xray/edit'
+with check('conflicts', 'duplicate-listener'):
+    request(409, 'POST', edit, {{'entry_port': {ssh_port}}}, auth=True, csrf=csrf)
+    assert sqlite_state() == before
+with check('runtime-rollback', 'edit-rejected'):
+    request(409, 'POST', edit, {{'entry_port': {failing}}}, auth=True, csrf=csrf)
+with check('runtime-rollback', 'sqlite-unchanged'):
+    assert sqlite_state() == before
+with check('runtime-rollback', 'xray-ready-no-pending'):
+    status = ipc('status')
+    assert status['ready'] is True and status['pending'] is None
+with check('runtime-rollback', 'sqlite-xray-parity'):
+    row = before[0]
     assert row['entry_port'] == {edit_port} and row['vless_port'] == {runtime.plan["public"]}
     assert hub['make_router_xray_config'](row)['outbounds'][2]['streamSettings']['wsSettings']['path'] == {runtime.plan["wss_path"]!r}
     assert ipc('validate_config', router_id='ci-router', router=hub['unified_router_spec'](row))['changed'] is False
-assert request('POST', '/api/router/ci-router/delete', auth=True, csrf=csrf)[0] == 200
-assert request('POST', '/api/router', data, auth=True, csrf=csrf)[0] == 200
-assert request('POST', '/api/xray/restart', auth=True, csrf=csrf)[0] == 200
-"""
-        docker("exec", project + "-hub", "python", "-c", program)
-        with socket.create_connection(("127.0.0.1", port), timeout=3):
-            pass
+""")
+        with adapter_check("runtime-rollback", "fault-exercised"):
+            assert runtime_fault.is_file()
+        with adapter_check("runtime-rollback", "config-restored"):
+            record = state.load()
+            assert record["pending"] is None
+            assert state.config.read_bytes() == state.render(record, record["routers"])
+        with adapter_check("deletion", "exec"):
+            hub_check(project, """
+with check('web-auth', 'retrieve-csrf'):
+    csrf = json.loads(request(200, 'GET', '/api/auth/meta', auth=True))['auth']['unified_xray_csrf']
+with check('deletion', 'delete-router'):
+    result = json.loads(request(200, 'POST', '/api/router/ci-router/delete', auth=True, csrf=csrf))
+    assert result['deleted'] is True
+    with hub['connect']() as db:
+        assert hub['get_active_router'](db, 'ci-router') is None
+""")
+        with adapter_check("deletion", "config-restored"):
+            record = state.load()
+            assert record["pending"] is None and not record["routers"]
+            assert state.config.read_bytes() == record["base"].encode()
+        with adapter_check("registration", "exec"):
+            hub_check(project, f"""
+with check('web-auth', 'retrieve-csrf'):
+    csrf = json.loads(request(200, 'GET', '/api/auth/meta', auth=True))['auth']['unified_xray_csrf']
+with check('registration', 'recreate-wss'):
+    request(200, 'POST', '/api/router', {{'id': 'ci-router', 'entry_port': {port},
+            'ssh_entry_port': {ssh_port}}}, auth=True, csrf=csrf)
+with check('registration', 'authorized-restart'):
+    request(200, 'POST', '/api/xray/restart', auth=True, csrf=csrf)
+""")
+        with adapter_check("registration", "listener"):
+            with socket.create_connection(("127.0.0.1", port), timeout=3):
+                pass
         holds = runtime.state / ".xray-maintenance-hold"
-        holds.touch()
-        try:
-            docker("exec", project + "-hub", "python", "-c", prefix + """
-assert ipc('status')['maintenance_hold']
-try:
-    ipc('restart')
-except RuntimeError:
-    pass
-else:
-    raise AssertionError('HOLD bypassed')
+        with adapter_check("hold", "restart-denied"):
+            holds.touch()
+            try:
+                hub_check(project, """
+with check('hold', 'status'):
+    assert ipc('status')['maintenance_hold'] is True
+with check('hold', 'restart-denied'):
+    rejected('restart')
 """)
-        finally:
-            holds.unlink()
-        before = state.config.read_bytes()
-        docker("exec", project + "-hub", "python", "-c", prefix + f"""
-router = {{'id': 'abandoned', 'ports': [{abandoned}, {abandoned_ssh}],
-          'clients': [str(uuid.uuid4()), str(uuid.uuid4())],
-          'targets': [['127.0.0.1', 80], ['127.0.0.1', 22]]}}
-try:
-    ipc('apply_config', router_id='abandoned', router=router, transaction={crash_token!r})
-except RuntimeError:
-    pass
-else:
-    raise AssertionError('CI adapter did not crash before responding')
+            finally:
+                holds.unlink()
+        with adapter_check("sigkill-recovery", "prepare-without-receipt"):
+            before = state.config.read_bytes()
+            hub_check(project, f"""
+with check('sigkill-recovery', 'prepare-without-receipt'):
+    router = {{'id': 'abandoned', 'ports': [{abandoned}, {abandoned_ssh}],
+              'clients': [str(uuid.uuid4()), str(uuid.uuid4())],
+              'targets': [['127.0.0.1', 80], ['127.0.0.1', 22]]}}
+    try:
+        ipc('apply_config', router_id='abandoned', router=router, transaction={crash_token!r})
+    except RuntimeError as error:
+        assert str(error) in {{'Invalid Xray response', 'Xray adapter unavailable'}}
+    else:
+        fail('error=unexpected_success')
 """)
-    assert state.load()["pending"]["token"] == crash_token
-    assert state.config.read_bytes() != before
-    cli(env, "start", expected=2)
-    with adapter_process(runtime):
-        docker("exec", project + "-hub", "python", "-c", prefix + """
-with hub['_XRAY_RELOAD_LOCK'], hub['connect']() as db:
-    hub['reconcile_unified_xray'](db)
-    assert hub['get_router'](db, 'abandoned') is None
-    assert hub['get_active_router'](db, 'ci-router') is not None
-assert ipc('health')['ready']
+    with adapter_check("sigkill-recovery", "durable-prepare"):
+        assert state.load()["pending"]["token"] == crash_token
+        assert state.config.read_bytes() != before
+    with adapter_check("docker-manager", "pending-start-blocked"):
+        cli(env, "start", expected=2, expected_error="BLOCKED: Pending Xray transaction: reconcile from HUB")
+    with adapter_process(runtime, DiagnosticAdapter):
+        with adapter_check("sigkill-recovery", "reconcile"):
+            hub_check(project, f"""
+with check('sigkill-recovery', 'reconcile'):
+    with hub['_XRAY_RELOAD_LOCK'], hub['connect']() as db:
+        hub['reconcile_unified_xray'](db)
+        assert hub['get_router'](db, 'abandoned') is None
+        row = hub['get_active_router'](db, 'ci-router')
+        assert row['entry_port'] == {port} and row['ssh_entry_port'] == {ssh_port}
+    assert ipc('health')['ready'] is True
 """)
-    assert state.config.read_bytes() == before
-    assert state.load()["pending"] is None
-    cli(env, "validate")
+        with adapter_check("sigkill-recovery", "config-restored"):
+            assert state.config.read_bytes() == before
+            assert state.load()["pending"] is None
+        with adapter_check("docker-manager", "validate-recovered"):
+            cli(env, "validate")
 
 
 def main():
@@ -501,9 +714,11 @@ def main():
                 marker(project)
                 verify_ingress(root, plan)
                 if backend == "unified_adapter":
-                    test_adapter(env, config, project)
+                    with adapter_check("adapter-start", "fixture"):
+                        test_adapter(env, config, project)
                 if mode == "standalone":
-                    test_release(root, env, config, project)
+                    with adapter_check("docker-manager", "release-recovery-and-rollback"):
+                        test_release(root, env, config, project)
         finally:
             try:
                 cleanup(project)
@@ -516,6 +731,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except AdapterCheckFailed as error:
+        raise SystemExit(f"CI unified adapter failed: {error}") from None
     except subprocess.CalledProcessError as error:
         # Never print runtime logs, environment or config contents.
         raise SystemExit(f"Integration command failed with exit status {error.returncode}") from None
