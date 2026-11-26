@@ -61,6 +61,25 @@ class StackRuntimeTests(unittest.TestCase):
                     ):
                         stack.Stack(parent / "stack.env", fixture(parent, "standalone"))
 
+    def test_backup_blocks_running_stack_and_catalog_symlink(self):
+        runtime = self.setup_stack()
+        runtime.path.touch()
+        runtime.journal.touch()
+        runtime.plan["nginx_conf"].parent.mkdir(exist_ok=True)
+        runtime.plan["nginx_conf"].write_text("test configuration")
+        with patch.object(runtime, "verify_release"), \
+             patch.object(runtime, "inspect") as inspect, \
+             patch.object(manager, "backup_state") as archive:
+            inspect.return_value = {"hub": {"State": {"Status": "running"}}}
+            with self.assertRaisesRegex(manager.Blocked, "Stop the stack"):
+                runtime.backup({})
+            archive.assert_not_called()
+            inspect.return_value = {"hub": {"State": {"Status": "exited"}}}
+            runtime.transport_store.symlink_to(self.root / "missing")
+            with self.assertRaisesRegex(manager.Blocked, "Unsafe path alias"):
+                runtime.backup({})
+            archive.assert_not_called()
+
     def test_ci_gate_diagnostics_hide_raw_errors(self):
         output = io.StringIO()
         runtime = self.setup_stack()

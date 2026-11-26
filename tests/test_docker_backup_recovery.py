@@ -1,6 +1,5 @@
 """Offline Docker transaction regressions with disposable SQLite fixtures."""
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -8,14 +7,14 @@ import signal
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("docker_manager", Path(__file__).resolve().parents[1] / "docker/manager.py")
-manager = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(manager)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docker"))
+import manager
 
 
 class BackupRecoveryTests(unittest.TestCase):
@@ -349,6 +348,64 @@ class BackupArchiveTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(dest / "hub.db")) as restored:
             self.assertEqual(restored.execute("SELECT name FROM fleet").fetchall(), [("synthetic-router",)])
         self.assertEqual((dest / "nested" / "hub.db").read_bytes(), b"auxiliary file")
+
+    def test_stack_bundle_restores_private_sqlite_wal_and_runtime_files(self):
+        source = self.root / "profiles.db"
+        with contextlib.closing(sqlite3.connect(source)) as profiles:
+            profiles.execute("PRAGMA journal_mode=WAL")
+            profiles.execute("CREATE TABLE revisions (id INTEGER, receipt TEXT)")
+            profiles.execute("INSERT INTO revisions VALUES (1, 'synthetic-receipt')")
+            profiles.commit()
+            self.assertTrue(source.with_name("profiles.db-wal").exists())
+            journal = self.root / "xray.json"
+            journal.write_bytes(b'{"synthetic": "journal"}')
+            active = self.root / "xray-active.json"
+            active.write_bytes(b'{"synthetic": "active"}')
+            archive = manager.backup_state(self.state, self.archives, stack_private={
+                "profiles.db": source, "xray.json": journal, "xray-active.json": active,
+            })
+
+        dest = self.root / "restored-stack"
+        with self.assertRaisesRegex(manager.Blocked, "backup format"):
+            manager.restore(SimpleNamespace(destination=dest, archive=archive))
+        self.assertFalse(dest.exists())
+        manager.restore(SimpleNamespace(destination=dest, archive=archive, stack_bundle=True))
+        private = dest / "private"
+        self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+        self.assertEqual({item.name for item in private.iterdir()},
+                         {"profiles.db", "xray.json", "xray-active.json"})
+        for path in private.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.stat().st_uid, os.geteuid())
+        with manager.sqlite_read(private / "profiles.db", immutable=True) as restored:
+            self.assertEqual(restored.execute("SELECT * FROM revisions").fetchall(),
+                             [(1, "synthetic-receipt")])
+        self.assertEqual((private / journal.name).read_bytes(), journal.read_bytes())
+        self.assertEqual((private / active.name).read_bytes(), active.read_bytes())
+        with manager.sqlite_read(dest / "state" / "hub.db", immutable=True) as restored:
+            self.assertEqual(restored.execute("SELECT * FROM fleet").fetchall(),
+                             [("synthetic-router",)])
+
+    def test_stack_bundle_rejects_corrupt_profile_database_before_publication(self):
+        source = self.root / "profiles.db"
+        source.write_bytes(b"invalid SQLite")
+        with self.assertRaises(sqlite3.DatabaseError):
+            manager.backup_state(self.state, self.archives, stack_private={"profiles.db": source})
+        self.assertEqual(list(self.archives.iterdir()), [])
+
+    def test_stack_bundle_rejects_split_runtime_and_catalog_commit(self):
+        source = self.root / "profiles.db"
+        journal = self.root / "xray.json"
+        journal.write_text(json.dumps({"profile_committed": "a" * 32, "profiles": [], "routers": {}}))
+        with contextlib.closing(sqlite3.connect(source)) as db:
+            db.execute("CREATE TABLE unified_transport_commit(token TEXT PRIMARY KEY)")
+            db.execute("INSERT INTO unified_transport_commit VALUES (?)", ("b" * 32,))
+            db.commit()
+        with self.assertRaisesRegex(manager.Blocked, "Catalog and runtime transaction differ"):
+            manager.backup_state(self.state, self.archives, stack_private={
+                "profiles.db": source, "xray.json": journal,
+            })
+        self.assertEqual(list(self.archives.iterdir()), [])
 
     def test_file_sync_precedes_publication_and_directory_sync_follows(self):
         events = []

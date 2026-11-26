@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGES = (
     ROOT / "vps/static/transport-configurator.html",
     ROOT / "vps/static/secure-profiles.html",
+    ROOT / "vps/static/transport-manager.html",
     ROOT / "vps/static/xray-core-manager.html",
 )
 

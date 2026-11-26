@@ -137,6 +137,51 @@ class Stack:
         self.journal = path.parent / (".stack-" + self.name + ".json")
         self.owner = digest(str(path))
 
+    @property
+    def transport_store(self):
+        return self.path.parent / (".transport-" + self.name)
+
+    def backup(self, release):
+        self.verify_release(release)
+        m.require(all(item["State"]["Status"] in {"created", "exited"}
+                      for item in self.inspect(release).values()),
+                  "Stop the stack before consistency backup")
+        state = XrayState(self)
+        private = {"xray-active.json": state.config, "stack.env": protected(self.path),
+                   "stack.json": protected(self.journal), "compose.yml": m.ROOT / "docker-compose.yml",
+                   "compose-stack.yml": m.ROOT / "deploy/docker-compose.yml"}
+        if self.plan["nginx_conf"] is not None:
+            private["nginx-active.conf"] = protected(self.plan["nginx_conf"])
+        if state.exists():
+            private["xray.json"] = protected(state.path)
+        for prefix, setting in (("tls", "RO_TLS_DIR"), ("xray-assets", "RO_XRAY_ASSET_DIR")):
+            root = Path(self.config[setting])
+            for item in sorted(root.rglob("*")):
+                if protected(item).is_file():
+                    private[prefix + "/" + item.relative_to(root).as_posix()] = item
+        catalog = self.transport_store
+        if catalog.exists() or catalog.is_symlink():
+            protected(catalog)
+            m.require(catalog.is_dir() and not catalog.stat().st_mode & 0o077,
+                      "Unsafe private transport directory")
+            db = catalog / "profiles.db"
+            if db.exists() or db.is_symlink():
+                protected(db)
+                info = db.stat()
+                m.require(db.is_file() and info.st_nlink == 1 and not info.st_mode & 0o077,
+                          "Unsafe private transport database")
+                for suffix in m.SQLITE_SUFFIXES:
+                    sidecar = db.with_name(db.name + suffix)
+                    if sidecar.exists() or sidecar.is_symlink():
+                        protected(sidecar)
+                        info = sidecar.stat()
+                        m.require(sidecar.is_file() and info.st_nlink == 1 and not info.st_mode & 0o077,
+                                  "Unsafe private transport database sidecar")
+                private["profiles.db"] = db
+            else:
+                m.require(not any(catalog.iterdir()), "Transport database missing")
+        return m.backup_state(self.state, self.path.parent / "backups", stack_private=private)
+
     def compose(self, *args, release=None):
         config = dict(self.config, RO_STACK_OWNER=self.owner)
         config["RO_PORT"] = str(self.plan["hub"])
@@ -238,11 +283,36 @@ class Stack:
         nginx = self.plan["nginx_conf"]
         if nginx is not None:
             m.require(not nginx.is_relative_to(self.state), "nginx config overlaps HUB state")
+            original = render_internal(self.plan)
+            allowed = [original]
+            if baseline is not None:
+                record = state.load()
+                allowed = [self.render_profile_nginx(record.get("profiles", []))]
+                if recover_xray and record.get("profile_pending"):
+                    allowed.append(self.render_profile_nginx(record["profile_pending"]["profiles"]))
             m.require(protected(nginx).is_file() and nginx.stat().st_size <= 1024**2 and
-                      nginx.read_text() == render_internal(self.plan),
+                      nginx.read_text() in allowed,
                       "nginx config differs from the renderer for this env")
-            files[str(nginx)] = [m.file_hash(nginx), stat.S_IMODE(nginx.stat().st_mode)]
+            files[str(nginx)] = [hashlib.sha256(original.encode()).hexdigest(),
+                                 stat.S_IMODE(nginx.stat().st_mode)]
         return digest(files)
+
+    def render_profile_nginx(self, profiles):
+        from secure_ingress import plan_ingress
+
+        plan = self.plan
+        if plan["mode"] != "standalone":
+            return render_internal(plan)
+        routes = dict(plan["routes"])
+        reserved = {plan["host"], *routes}
+        for item in profiles:
+            ingress = plan_ingress(item["profile"], public_port=plan["public"])
+            for route in ingress["routes"]:
+                name = route["sni"]
+                m.require(name not in reserved, "Profile SNI conflicts with a stack route")
+                reserved.add(name)
+                routes[name] = ingress["backend_port"]
+        return render_internal(dict(plan, routes=routes))
 
     def release(self, *, recover_xray=False):
         images = {}
@@ -514,7 +584,7 @@ def update(stack, record, candidate, *, rollback=False, acknowledge=False):
     try:
         stack.stop(source)
         m.require(m.schema_fingerprint(stack.config) == schema, "SQLite schema changed before switch")
-        tx["snapshot"] = str(m.backup_state(stack.state, stack.path.parent / "backups"))
+        tx["snapshot"] = str(stack.backup(source))
         stack.save(dict(record, pending=tx))
         candidate.up(target, source)
         tx["target_schema"] = m.schema_fingerprint(candidate.config)
@@ -601,7 +671,9 @@ def run(args):
             initialize(stack, record)
         else:
             m.require(current is not None, "Stack is uninitialized")
-            if action == "stop":
+            if action == "backup":
+                stack.backup(current)
+            elif action == "stop":
                 stack.stop(current)
             elif action in {"start", "recover"}:
                 stack.preflight(current)

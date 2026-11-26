@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 import uuid
@@ -23,7 +24,8 @@ import manager as m
 from docker_stack_integration_ci import AdapterCheckFailed, adapter_check, hub_check
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
-from unified_xray_state import XrayState, encode
+from unified_transport_runtime import Runtime as TransportRuntime
+from unified_xray_state import XrayState, assignment_id, encode
 
 HUB_SPEC = importlib.util.spec_from_file_location("unified_xray_test_hub", ROOT / "vps/owrt-remote-hub.py")
 hub = importlib.util.module_from_spec(HUB_SPEC)
@@ -67,13 +69,72 @@ class CIDiagnosticsTests(unittest.TestCase):
 
 
 class WebAuthorizationTests(unittest.TestCase):
+    def test_stage_and_approval_require_owner_then_csrf(self):
+        for operation in ("stage", "approve"):
+            handler = Mock()
+            handler.parsed.return_value.path = "/api/secure-profiles/" + operation
+            handler.require_owner.return_value = False
+            with patch.object(hub, "unified_xray_enabled", return_value=True):
+                hub.Handler.do_POST(handler)
+            handler.require_owner.assert_called_once_with(json_mode=True)
+            handler.post_unified_transport_catalog.assert_not_called()
+            handler.unified_xray_csrf.return_value = False
+            with patch.object(hub, "unified_xray_request") as request:
+                hub.Handler.post_unified_transport_catalog(handler, operation)
+            request.assert_not_called()
+            handler.read_payload.assert_not_called()
+
     def test_malformed_csrf_header_receives_403(self):
         handler = Mock(headers={"X-Unified-Xray-CSRF": "\xff"})
         self.assertFalse(hub.Handler.unified_xray_csrf(handler))
         handler.send_json.assert_called_once_with(403, {"ok": False, "error": "invalid CSRF or origin"})
 
+    def test_unified_transport_page_is_owner_only_and_uses_unified_csrf(self):
+        for path in ("/secure-profiles/", "/transport-configurator/"):
+            with self.subTest(path=path), patch.object(hub, "unified_xray_enabled", return_value=True):
+                handler = Mock()
+                handler.parsed.return_value.path = path
+                handler.require_owner.return_value = False
+                hub.Handler.do_GET(handler)
+                handler.send_bytes.assert_not_called()
+                handler.require_owner.return_value = True
+                hub.Handler.do_GET(handler)
+                page = handler.send_bytes.call_args.args[1].decode()
+                self.assertIn('data-csrf="' + hub.UNIFIED_XRAY_CSRF + '"', page)
+                self.assertIn("X-Unified-Xray-CSRF", page)
+                self.assertNotIn("/api/transports/router/pilot", page)
+
+    def test_unified_delete_rejects_boolean_confirmation(self):
+        handler = Mock()
+        handler.read_payload.return_value = {"profile_id": "demo", "revision": 1, "confirmed": True}
+        with patch.object(hub, "unified_xray_request") as request:
+            hub.Handler.post_unified_transport_catalog(handler, "delete")
+        request.assert_not_called()
+        self.assertEqual(handler.send_json.call_args.args[0], 400)
+
 
 class ContractTests(unittest.TestCase):
+    def test_stage_and_approval_roles_have_distinct_typed_payloads(self):
+        ref = {"profile_id": "demo", "revision": 1}
+        self.assertEqual(parameters({"op": "transport.stage", **ref}), ("transport.stage", ref))
+        approval = dict(ref, stage_sha256="a" * 64, confirmed=True)
+        self.assertEqual(parameters({"op": "transport.approve", **approval}),
+                         ("transport.approve", approval))
+        for changes in ({"confirmed": 1}, {"confirmed": False}, {"revision": True},
+                        {"profile_id": "../other"}, {"stage_sha256": "invalid"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                parameters(dict({"op": "transport.approve", **approval}, **changes))
+        self.assertEqual(parameters({"op": "transport.publish", **approval}),
+                         ("transport.publish", approval))
+        for operation in ("activate", "disable", "rollback"):
+            name = "transport." + operation
+            self.assertEqual(parameters({"op": name, **ref, "confirmed": True}),
+                             (name, dict(ref, confirmed=True)))
+            with self.assertRaises(ValueError):
+                parameters({"op": name, **ref, "confirmed": False})
+        with self.assertRaises(m.Blocked):
+            parameters({"op": "transport.publish", **ref, "confirmed": True})
+
     def test_allowlist(self):
         for op in ("status", "health", "version", "restart"):
             self.assertEqual(parameters({"op": op}), (op, {}))
@@ -84,6 +145,14 @@ class ContractTests(unittest.TestCase):
                         {"op": "validate_config", "router_id": "demo", "router": dict(router(), targets=[["/tmp", 80], ["localhost", 22]])}):
             with self.subTest(op=request["op"]), self.assertRaises(m.Blocked):
                 parameters(request)
+
+    def test_assignment_requires_typed_distinct_revisions(self):
+        one = {"profile_id": "demo", "revision": 1}
+        request = {"op": "transport.assign", "router_id": "router-a", "profiles": [one], "confirmed": True}
+        self.assertEqual(parameters(request)[0], "transport.assign")
+        for invalid in ([], [one, one], [dict(one, revision=True)], [dict(one, port=8080)]):
+            with self.assertRaises(ValueError):
+                parameters(dict(request, profiles=invalid))
 
     def test_ipc_framing_size_and_single_request(self):
         for parts in ([b"x" * MAX_REQUEST], [b'{}\n{}\n'], [b'{"op":"status"}', b""]):
@@ -260,6 +329,35 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(self.state.config.read_bytes(), self.baseline)
         self.assertIsNone(self.state.load()["pending"])
 
+    def test_profile_rollback_keeps_unrelated_live_revision(self):
+        from secure_profile_store import connection
+        from unified_transport_runtime import Runtime
+
+        def item(name, port):
+            return {"revision": 1, "public_port": 9443, "remote_host": "fixture.invalid",
+                    "profile": {"name": name, "transport": "wss", "server_name": name + ".fixture.invalid",
+                                "port": port, "path": "/reverse/", "certificate_file":
+                                "/etc/router-orchestrator/tls/fullchain.pem", "key_file":
+                                "/etc/router-orchestrator/tls/privkey.pem"}}
+
+        old = item("disabled", 30200)
+        unrelated = item("live", 30201)
+        self.state.save(dict(self.state.load(), profiles=[unrelated],
+                             profile_rollbacks={"disabled:1": old, "live:1": None}))
+        self.stack.transport_store.mkdir(mode=0o700)
+        runtime = Runtime(self.adapter, self.stack, self.release, self.state, self.record["Id"], Mock())
+        with (
+            connection(self.stack.transport_store) as db,
+            patch.object(runtime, "transact") as transact,
+            patch("unified_transport_runtime.live_tcp_ports", return_value=set()),
+        ):
+            result = runtime.change(db, "transport.rollback", ("disabled", 1), {}, "", True)
+        self.assertTrue(result["active"])
+        _, _, candidate, _, rollbacks, additions, _ = transact.call_args.args
+        self.assertEqual(candidate, [unrelated, old])
+        self.assertEqual(additions, [old])
+        self.assertEqual(rollbacks, {"live:1": None})
+
     def test_failed_rollback_restart_leaves_recoverable_prepare(self):
         self.adapter.restart.side_effect = [m.Blocked("candidate failed"), m.Blocked("restore failed"), None]
         with self.assertRaisesRegex(m.Blocked, "restore failed"):
@@ -318,6 +416,28 @@ class TransactionTests(unittest.TestCase):
             self.call("rollback", transaction=self.token)
         self.assertEqual(self.state.load()["pending"]["token"], self.token)
 
+    def test_stage_and_approval_are_blocked_under_hold_and_pending_enrollment(self):
+        ref = {"profile_id": "demo", "revision": 1}
+        operations = (
+            ("transport.stage", ref),
+            ("transport.approve", dict(ref, stage_sha256="a" * 64, confirmed=True)),
+            ("transport.publish", dict(ref, stage_sha256="a" * 64, confirmed=True)),
+            ("transport.activate", dict(ref, confirmed=True)),
+            ("transport.disable", dict(ref, confirmed=True)),
+            ("transport.rollback", dict(ref, confirmed=True)),
+        )
+        self.prepare()
+        with patch("unified_xray_adapter.transport_catalog.handle") as catalog:
+            for operation, args in operations:
+                with self.assertRaisesRegex(m.Blocked, "Pending Xray"):
+                    self.call(operation, **args)
+            hold = self.stack.state / ".xray-maintenance-hold"
+            hold.touch()
+            for operation, args in operations:
+                with self.assertRaisesRegex(m.Blocked, "HOLD"):
+                    self.call(operation, **args)
+            catalog.assert_not_called()
+
     def test_symlink_and_out_of_band_config_refused(self):
         self.prepare()
         self.call("apply_config", commit=self.token)
@@ -332,7 +452,10 @@ class TransactionTests(unittest.TestCase):
 
 class SQLiteTests(unittest.TestCase):
     def setUp(self):
-        self.hub_db = sqlite3.connect(":memory:")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.db_path = Path(directory.name) / "hub.db"
+        self.hub_db = sqlite3.connect(self.db_path)
         self.addCleanup(self.hub_db.close)
         self.hub_db.row_factory = sqlite3.Row
         with patch.object(hub, "unified_xray_enabled", return_value=True):
@@ -342,6 +465,183 @@ class SQLiteTests(unittest.TestCase):
         hook.start()
         self.addCleanup(hook.stop)
         self.status = {"public_port": 9443, "pending": None}
+
+    def test_identity_rotation_is_router_bound_and_promotion_is_atomic(self):
+        self.host.side_effect = [self.status, {"changed": True}, {}] * 2
+        for name, port in (("demo", 30100), ("other", 30200)):
+            hub.unified_router_edit(self.hub_db, name,
+                                    {"entry_port": port, "ssh_entry_port": port + 1}, create=True)
+        first = "Bearer " + hub.issue_transport_identity(self.hub_db, "demo")
+        self.assertEqual(hub.transport_identity(self.hub_db, "other", first, promote=True), (False, False))
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", first), (False, False))
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", first, promote=True), (True, True))
+        self.hub_db.commit()
+        second = "Bearer " + hub.issue_transport_identity(self.hub_db, "demo")
+        self.hub_db.commit()
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", first), (True, True))
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", second, promote=True), (True, True))
+        self.hub_db.rollback()
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", first), (True, True))
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", second, promote=True), (True, True))
+        self.hub_db.commit()
+        self.assertEqual(hub.transport_identity(self.hub_db, "demo", first), (False, True))
+
+    def test_lost_rotation_responses_keep_the_last_committed_credential(self):
+        self.host.side_effect = [self.status, {"changed": True}, {}]
+        hub.unified_router_edit(self.hub_db, "demo",
+                                {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        first = "Bearer " + hub.issue_transport_identity(self.hub_db, "demo")
+        self.assertTrue(hub.transport_identity(self.hub_db, "demo", first, promote=True)[0])
+        self.hub_db.commit()
+        hub.issue_transport_identity(self.hub_db, "demo")  # owner lost the issuance response
+        self.hub_db.commit()
+        second = "Bearer " + hub.issue_transport_identity(self.hub_db, "demo")
+        self.hub_db.commit()
+        self.assertTrue(hub.transport_identity(self.hub_db, "demo", first)[0])
+        self.assertTrue(hub.transport_identity(self.hub_db, "demo", second, promote=True)[0])
+        self.hub_db.commit()  # agent lost the promotion response
+        with sqlite3.connect(self.db_path) as restarted:
+            restarted.row_factory = sqlite3.Row
+            self.assertFalse(hub.transport_identity(restarted, "demo", first, promote=True)[0])
+            self.assertTrue(hub.transport_identity(restarted, "demo", second, promote=True)[0])
+
+    def test_task_is_redelivered_after_hub_restart_and_ttl_cannot_replace_it(self):
+        hub.queue_transport_task(self.hub_db, "demo", "stage", "enrollment", None)
+        self.hub_db.commit()
+        self.assertIsNone(hub.claim_transport_task(self.hub_db, "other"))
+        claimed = hub.claim_transport_task(self.hub_db, "demo")
+        self.hub_db.rollback()  # failure before the claim commit
+        self.assertEqual(hub.claim_transport_task(self.hub_db, "demo"), claimed)
+        self.hub_db.execute("update transport_router_task set updated_at=0")
+        self.hub_db.commit()  # response is lost after commit
+        with sqlite3.connect(self.db_path) as restarted:
+            restarted.row_factory = sqlite3.Row
+            self.assertEqual(hub.claim_transport_task(restarted, "demo"), claimed)
+            with self.assertRaisesRegex(ValueError, "already pending"):
+                hub.queue_transport_task(restarted, "demo", "stage", "enrollment", None)
+
+    def test_task_receipt_rolls_back_and_is_idempotent_after_the_next_task(self):
+        hub.queue_transport_task(self.hub_db, "demo", "stage", "enrollment", None)
+        self.hub_db.commit()
+        task_id = self.hub_db.execute("select task_id from transport_router_task").fetchone()[0]
+        with self.assertRaises(ValueError):
+            hub.acknowledge_transport_task(self.hub_db, "demo", task_id, None, True)
+        hub.claim_transport_task(self.hub_db, "demo")
+        self.hub_db.commit()
+        for router, supplied_id, target in [
+                ("other", task_id, None), ("demo", "0" * 32, None),
+                ("demo", task_id, {"profile_id": "live", "revision": 2, "assignment_id": "a" * 64})]:
+            with self.subTest(router=router, target=target), self.assertRaises(ValueError):
+                hub.acknowledge_transport_task(self.hub_db, router, supplied_id, target, True)
+        self.hub_db.execute("""create trigger fail_receipt before insert on transport_router_receipt
+            begin select raise(abort, 'injected error after updating task'); end""")
+        with self.assertRaises(sqlite3.IntegrityError), self.hub_db:
+            hub.acknowledge_transport_task(self.hub_db, "demo", task_id, None, True)
+        self.assertEqual(hub.claim_transport_task(self.hub_db, "demo")["task_id"], task_id)
+        self.hub_db.execute("drop trigger fail_receipt")
+        with self.hub_db:
+            hub.acknowledge_transport_task(self.hub_db, "demo", task_id, None, True)
+        self.assertIsNone(hub.claim_transport_task(self.hub_db, "demo"))
+        self.hub_db.commit()
+        with sqlite3.connect(self.db_path) as restarted:
+            restarted.row_factory = sqlite3.Row
+            # The first ACK response was lost. A new command may already be queued.
+            hub.queue_transport_task(restarted, "demo", "stage", "enrollment", None)
+            next_task = hub.claim_transport_task(restarted, "demo")
+            hub.acknowledge_transport_task(restarted, "demo", next_task["task_id"], None, False)
+            hub.acknowledge_transport_task(restarted, "demo", task_id, None, True)
+            with self.assertRaises(ValueError):
+                hub.acknowledge_transport_task(restarted, "demo", task_id, None, False)
+            self.assertIsNone(hub.claim_transport_task(restarted, "demo"))
+
+    def test_adapter_portal_rejects_same_revision_reassigned_to_new_credentials(self):
+        state = Mock()
+        runtime = TransportRuntime.__new__(TransportRuntime)
+        runtime.state = state
+        pair = router()
+        profile = {"profile": {"name": "live"}, "revision": 2, "assignments": {"demo": pair}}
+        state.load.return_value = {"pending": None, "routers": {"demo": pair}, "profiles": [profile]}
+        target = {"profile_id": "live", "revision": 2, "assignment_id": assignment_id(pair)}
+        self.assertEqual(runtime.router_portals("demo", target)["ports"], pair["ports"])
+        profile["assignments"]["demo"] = router()
+        with self.assertRaises(m.Blocked):
+            runtime.router_portals("demo", target)
+
+    def test_task_requires_exact_assignment_and_confirmed_activation(self):
+        self.host.side_effect = [self.status, {"changed": True}, {}]
+        hub.unified_router_edit(self.hub_db, "demo",
+                                {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        target = {"profile_id": "live", "revision": 2, "assignment_id": "a" * 64}
+        self.host.side_effect = None
+        self.host.return_value = {"profiles": [{**target, "outbounds": []}]}
+        for stale in (dict(target, profile_id="other"), dict(target, revision=1),
+                      dict(target, assignment_id="b" * 64)):
+            with self.assertRaisesRegex(ValueError, "assignment changed"):
+                hub.queue_transport_task(self.hub_db, "demo", "activate", "0", stale)
+        hub.queue_transport_task(self.hub_db, "demo", "activate", "0", target)
+        task_id = hub.claim_transport_task(self.hub_db, "demo")["task_id"]
+        with self.assertRaisesRegex(ValueError, "activation is not confirmed"):
+            hub.acknowledge_transport_task(self.hub_db, "demo", task_id, target, True)
+        self.hub_db.execute("update routers set transport_active_ref=? where id='demo'",
+                            (hub.transport_target(target),))
+        hub.acknowledge_transport_task(self.hub_db, "demo", task_id, target, True)
+
+    def test_agent_task_api_requires_v2_and_rejects_unmatched_receipt(self):
+        self.host.side_effect = [self.status, {"changed": True}, {}]
+        hub.unified_router_edit(self.hub_db, "demo",
+                                {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        token = "Bearer " + hub.issue_transport_identity(self.hub_db, "demo")
+        hub.transport_identity(self.hub_db, "demo", token, promote=True)
+        hub.queue_transport_task(self.hub_db, "demo", "stage", "enrollment", None)
+        self.hub_db.commit()
+        self.host.side_effect = None
+        self.host.return_value = {"maintenance_hold": False, "ready": True}
+        handler = hub.Handler.__new__(hub.Handler)
+        handler.parsed = lambda: SimpleNamespace(path="/api/agent/transport-task")
+        handler.headers = {"Authorization": token}
+        handler.request_scheme = lambda: "https"
+        handler.server = SimpleNamespace(app=SimpleNamespace(conn=lambda: self.hub_db))
+        handler.send_json = Mock()
+
+        def request(payload):
+            handler.read_payload = lambda **kwargs: {"id": "demo", **payload}
+            with patch.object(hub, "unified_xray_enabled", return_value=True):
+                handler.do_POST()
+            return handler.send_json.call_args.args
+
+        self.assertEqual(request({})[0], 409)
+        self.host.return_value["maintenance_hold"] = True
+        self.assertEqual(request({"protocol": 2})[0], 409)
+        self.host.return_value["maintenance_hold"] = False
+        status, response = request({"protocol": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(request({"protocol": 2}), (200, response))
+        receipt = {"task_id": response["task"]["task_id"], "target": None, "succeeded": True}
+        self.assertEqual(request(dict(receipt, task_id="0" * 32))[0], 409)
+        self.assertEqual(request(receipt), (200, {"ok": True}))
+        self.assertEqual(request(receipt), (200, {"ok": True}))
+        self.assertEqual(request({"protocol": 2}), (200, {"ok": True, "task": None}))
+
+    def test_channel_promotion_changes_routes_only_after_verified_probe(self):
+        self.host.side_effect = [self.status, {"changed": True}, {}]
+        hub.unified_router_edit(self.hub_db, "demo",
+                                {"entry_port": 30100, "ssh_entry_port": 30101}, create=True)
+        self.hub_db.execute("update routers set last_seen=? where id='demo'", (hub.now_ts(),))
+        self.hub_db.commit()
+        profile = {"profile_id": "live", "revision": 2}
+        healthy = dict(self.status, maintenance_hold=False, ready=True)
+        self.host.side_effect = [healthy, {"ports": [30200, 30201]},
+                                 healthy, {"ports": [30200, 30201]}, healthy]
+        with patch.object(hub, "probe_transport_channels", side_effect=[None, 7]), \
+             patch.object(hub, "unified_xray_enabled", return_value=True):
+            self.assertFalse(hub.Handler.agent_transport_probe(None, self.hub_db, "demo", profile,
+                                                                 activate=True)["ok"])
+            self.assertEqual(hub.router_channel_port(hub.get_active_router(self.hub_db, "demo")), 30100)
+            self.assertTrue(hub.Handler.agent_transport_probe(None, self.hub_db, "demo", profile,
+                                                                activate=True)["ok"])
+            row = hub.get_active_router(self.hub_db, "demo")
+            self.assertEqual(hub.router_channel_port(row), 30200)
+            self.assertEqual(hub.router_channel_port(row, ssh=True), 30201)
 
     def test_failed_prepare_rolls_back_sqlite_enrollment(self):
         self.host.side_effect = [self.status, RuntimeError("no ready"), self.status]

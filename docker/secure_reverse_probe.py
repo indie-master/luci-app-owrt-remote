@@ -22,7 +22,7 @@ def needs_final_rules(version):
 
 
 def build_probe(profile, *, ingress_port, admin_port, ssh_port,
-                admin_target, ssh_target, core_version, proxy_protocol):
+                admin_target, ssh_target, core_version, proxy_protocol, probe_name="trial"):
     require_secure_profile(profile)
     ports = [_port(p) for p in (profile["port"], ingress_port, admin_port,
                                 ssh_port, admin_target, ssh_target)]
@@ -30,7 +30,7 @@ def build_probe(profile, *, ingress_port, admin_port, ssh_port,
         raise ProfileError("isolated probe ports must be distinct and unprivileged")
     if type(proxy_protocol) is not bool:
         raise ProfileError("invalid PROXY protocol flag")
-    profile = dict(profile, name="trial")
+    profile = dict(profile, name=probe_name)
     router = {"id":"probe","admin_host":"127.0.0.1","ssh_host":"127.0.0.1",
               "admin_port":admin_target,"ssh_port":ssh_target,
               "vless_uuid":str(uuid.uuid4()),"ssh_vless_uuid":str(uuid.uuid4())}

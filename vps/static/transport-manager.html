@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Router Orchestrator · Транспортные профили</title>
+<style>
+:root{color-scheme:light dark;font:16px system-ui,sans-serif}
+body{max-width:64rem;margin:auto;padding:1rem}
+header,.actions{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}
+header{justify-content:space-between}
+section,form{padding:1rem;border:1px solid GrayText;border-radius:.75rem;margin-block:1rem}
+h2{font-size:1.2rem;margin-top:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,15rem),1fr));gap:.75rem}
+label{display:grid;gap:.3rem;min-width:0}
+input,select,button{font:inherit;padding:.5rem;min-width:0}
+button{cursor:pointer}button:disabled{cursor:default}
+article{border-top:1px solid GrayText;padding-block:.8rem;overflow-wrap:anywhere}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
+[hidden]{display:none}
+</style>
+</head>
+<body data-csrf="__UNIFIED_XRAY_CSRF__">
+<header><h1>Транспортные профили</h1><nav><a href="/">HUB</a> · <a href="#editor">Новый черновик</a></nav></header>
+<section>
+<h2>Каталог</h2>
+<p id="catalog-status" role="status">Загрузка…</p>
+<button id="refresh" type="button">Обновить</button>
+<div id="catalog"></div>
+</section>
+<form id="editor">
+<h2 id="editor-title">Новый черновик</h2>
+<fieldset id="editor-fields" disabled>
+<div class="grid">
+<label>Идентификатор<input name="name" required maxlength="64" pattern="[A-Za-z0-9_\-]{1,64}"></label>
+<label>Название<input name="label" required maxlength="100"></label>
+<label>Транспорт<select name="transport">
+<option value="wss">WSS/TLS</option><option value="reality-tcp">REALITY TCP</option>
+<option value="xhttp">XHTTP/TLS</option><option value="grpc">gRPC/TLS</option>
+</select></label>
+<label>Публичный порт<input name="public_port" type="number" readonly></label>
+<label>Адрес подключения<input name="remote_host" required maxlength="253"></label>
+<label>SNI / домен<input name="server_name" required maxlength="253"></label>
+<label>Порт Xray (0 — автоматически)<input name="port" type="number" min="0" max="65535" value="0" required></label>
+<label data-field="path">URL path<input name="path" value="/owrt-remote"></label>
+<label data-field="service_name" hidden>gRPC service name<input name="service_name" value="owrt_remote"></label>
+<label data-field="target_host" hidden>REALITY target host<input name="target_host" maxlength="253"></label>
+<label data-field="target_port" hidden>REALITY target port<input name="target_port" type="number" min="1" max="65535" value="443"></label>
+<label data-field="server_names" hidden>Дополнительные SNI через запятую<input name="server_names"></label>
+</div>
+<p>TLS использует сертификаты, подключённые к стеку. Ключи REALITY генерируются на сервере.</p>
+<div class="actions"><button type="submit">Сохранить ревизию</button><button type="button" id="clear">Очистить форму</button></div>
+</fieldset>
+<p id="editor-status" role="status"></p>
+</form>
+<section id="router-profiles">
+<h2>Назначения роутерам</h2>
+<div class="grid">
+<label>Роутер<select id="profile-router"></select></label>
+<label>Основной профиль<select id="primary-profile"></select></label>
+<label>Первый резерв<select id="first-fallback"></select></label>
+<label>Второй резерв<select id="second-fallback"></select></label>
+</div>
+<p id="router-active-profile"></p>
+<div class="actions">
+<button type="button" id="issue-router-identity" disabled>Выпустить токен роутера</button>
+<button type="button" id="save-assignment" disabled>Сохранить назначение</button>
+<button type="button" id="remove-assignment" disabled>Снять назначение</button>
+</div>
+<p id="assignment-status" role="status"></p>
+<pre id="router-identity" hidden></pre>
+<div class="actions">
+<label>Цель проверки и переключения<select id="agent-profile-slot">
+<option value="0">Основной профиль</option><option value="1">Первый резерв</option>
+<option value="2">Второй резерв</option><option value="enrollment">Исходный канал WSS</option>
+</select></label>
+<button type="button" data-agent-action="stage" disabled>Подготовить</button>
+<button type="button" data-agent-action="probe" disabled>Проверить LuCI и SSH</button>
+<button type="button" data-agent-action="activate" disabled>Переключить</button>
+<button type="button" data-agent-action="rollback" disabled>Вернуть предыдущий канал</button>
+</div>
+<p id="agent-task-status" role="status"></p>
+</section>
+<section><h2>TCP Legacy</h2><p>Совместимость с существующими роутерами.</p><ul id="legacy"></ul></section>
+<script>
+'use strict';
+const get = id => document.getElementById(id);
+const form = get('editor'), input = form.elements, fields = get('editor-fields');
+const kinds = {
+ wss: ['path'], 'reality-tcp': ['target_host', 'target_port', 'server_names'],
+ xhttp: ['path'], grpc: ['service_name'],
+};
+let publicPort, busy = false, catalogData, assignmentBusy = false, identityTimer;
+
+async function api(operation = '', payload) {
+ const options = {credentials: 'same-origin', cache: 'no-store'};
+ if (payload !== undefined) {
+  options.method = 'POST';
+  options.headers = {'Content-Type': 'application/json', 'X-Unified-Xray-CSRF': document.body.dataset.csrf};
+  options.body = JSON.stringify(payload);
+ }
+ const response = await fetch('/api/secure-profiles' + (operation ? '/' + operation : ''), options);
+ const data = await response.json();
+ if (!response.ok || !data.ok) throw Error(data.error || 'Запрос не выполнен');
+ return data;
+}
+
+function updateFields() {
+ for (const label of form.querySelectorAll('[data-field]')) {
+  const key = label.dataset.field;
+  label.hidden = !kinds[input.transport.value].includes(key);
+  input[key].disabled = label.hidden;
+  input[key].required = !label.hidden && key !== 'server_names';
+ }
+}
+input.transport.addEventListener('change', updateFields);
+get('clear').addEventListener('click', () => {
+ form.reset();
+ input.public_port.value = publicPort;
+ get('editor-title').textContent = 'Новый черновик';
+ get('editor-status').textContent = '';
+ updateFields();
+});
+updateFields();
+
+function action(label, handler) {
+ const button = document.createElement('button');
+ button.type = 'button';
+ button.textContent = label;
+ button.addEventListener('click', handler);
+ return button;
+}
+
+function revisionRow(revision) {
+ const {profile_id, revision: number, label} = revision;
+ const ref = {profile_id, revision: number};
+ const row = document.createElement('article'), title = document.createElement('strong');
+ const summary = document.createElement('p'), actions = document.createElement('div');
+ const result = document.createElement('pre');
+ title.textContent = label + ' · ' + profile_id + ' · ревизия ' + number;
+ summary.textContent = revision.transport + ' · ' + revision.hostname + ':' + revision.public_port +
+  ' · Xray ' + revision.backend_port + ' · SNI ' + revision.server_names.join(', ') +
+  ' · ' + (revision.published ? (revision.active ? 'Активен' : 'Отключён') : !revision.stage ? 'Черновик'
+   : revision.stage.approved_at ? 'План согласован · ожидает публикации' : 'План подготовлен');
+ actions.className = 'actions';
+ result.setAttribute('role', 'status');
+ result.hidden = true;
+ function add(label, run) {
+  actions.append(action(label, async () => {
+   const buttons = Array.from(actions.querySelectorAll('button'));
+   buttons.forEach(button => {button.disabled = true;});
+   result.hidden = false;
+   result.textContent = 'Выполняется…';
+   try { result.textContent = await run(); }
+   catch (error) { result.textContent = error.message; }
+   finally { buttons.forEach(button => {button.disabled = false;}); }
+  }));
+ }
+ if (!revision.published) {
+  add('В новую ревизию', async () => {
+   const detail = await api('detail', ref);
+   if (busy) return 'Дождитесь окончания сохранения формы.';
+   const {profile} = detail;
+   input.name.value = profile.name;
+   input.label.value = label;
+   input.remote_host.value = detail.remote_host;
+   input.transport.value = profile.transport;
+   input.server_name.value = profile.server_name;
+   input.port.value = 0;
+   for (const key of kinds[profile.transport]) {
+    input[key].value = key === 'server_names'
+     ? profile[key].filter(name => name !== profile.server_name).join(', ') : profile[key];
+   }
+   updateFields();
+   get('editor-title').textContent = 'Новая ревизия ' + profile_id;
+   get('editor-status').textContent = '';
+   input.label.focus();
+   return 'Параметры загружены в форму.';
+  });
+  const syntax = data => data.xray_validated && data.client_syntax_validated
+   ? 'Синтаксис серверной и клиентской конфигураций проверен Xray.'
+   : 'Проверка конфигураций не подтверждена.';
+  add('Проверить Xray', async () => syntax(await api('validate', ref)));
+  add('План маршрутизации', async () => {
+   const plan = await api('plan', ref);
+   return [syntax(plan), 'Режим стека: ' + plan.stack_mode,
+    ...plan.routes.map(route => route.sni + ' → ' + route.upstream),
+    plan.nginx_stream_map, 'Проверка работающего входа не выполнялась.'].filter(Boolean).join('\n');
+  });
+  add('Подготовить к согласованию', async () => {
+   await api('stage', ref);
+   await refresh('План подготовлен. Xray и ingress продолжают работать с текущей конфигурацией. ');
+  });
+  if (revision.stage && !revision.stage.approved_at) {
+   add('Согласовать план', async () => {
+    const digest = revision.stage.stage_sha256;
+    if (!window.confirm('Согласовать план «' + label + '», ревизия ' + number + '?\nSHA-256 ' + digest)) {
+     return 'Согласование отменено.';
+    }
+    await api('approve', {...ref, stage_sha256: digest, confirmed: true});
+    await refresh('План согласован. Публикация ожидает проверки рабочего входа. ');
+   });
+  }
+  if (revision.stage?.approved_at) {
+   lifecycleAction('Опубликовать', 'publish', {stage_sha256: revision.stage.stage_sha256});
+  }
+ } else {
+  lifecycleAction(revision.active ? 'Отключить' : 'Активировать', revision.active ? 'disable' : 'activate');
+ }
+ if (revision.rollback_available) lifecycleAction('Откатить', 'rollback');
+ if (revision.delete_allowed) {
+  add(revision.published ? 'Удалить ревизию' : 'Удалить черновик', async () => {
+   if (!window.confirm('Удалить «' + label + '», ревизия ' + number + '?')) return 'Удаление отменено.';
+   const grant = await api('confirm_delete', ref);
+   const deletion = await api('delete', {...ref, confirmation: grant.confirmation});
+   if (!deletion.deleted) throw Error('Удаление не подтверждено');
+   await refresh('Ревизия удалена. ');
+   return 'Ревизия удалена.';
+  });
+ }
+ function lifecycleAction(labelText, operation, extra = {}) {
+  add(labelText, async () => {
+   if (!window.confirm(labelText + ' «' + label + '», ревизия ' + number + '?')) return 'Операция отменена.';
+   const changed = await api(operation, {...ref, ...extra, confirmed: true});
+   if (!changed.applied) throw Error('Применение не подтверждено.');
+   await refresh(changed.active ? 'Профиль активен. ' : 'Профиль отключён. ');
+  });
+ }
+ row.append(title, summary, actions, result);
+ return row;
+}
+
+const routerSelect = get('profile-router');
+const profileSelects = ['primary-profile', 'first-fallback', 'second-fallback'].map(get);
+const identityView = get('router-identity');
+function clearIdentity() {
+ clearTimeout(identityTimer);
+ identityView.textContent = '';
+ identityView.hidden = true;
+}
+function assignmentEditor(reset = true) {
+ const router = catalogData?.managed_routers.find(item => item.id === routerSelect.value);
+ const assigned = catalogData?.assignments?.[routerSelect.value] || [];
+ const active = catalogData?.revisions.filter(item => item.active) || [];
+ const value = rev => rev.profile_id + ':' + rev.revision;
+ if (reset) profileSelects.forEach((select, index) => {
+  select.replaceChildren(new Option(index ? 'Без резерва' : 'Выберите профиль', ''),
+   ...active.map(item => new Option(item.label + ' · ' + item.revision, value(item))));
+  select.value = assigned[index] ? value(assigned[index]) : '';
+ });
+ get('router-active-profile').textContent = router?.active_profile
+  ? 'На роутере активна ревизия ' + value(router.active_profile)
+  : router ? 'На роутере используется исходный канал WSS.' : '';
+ get('issue-router-identity').disabled = !router || assignmentBusy;
+ const task = router?.task;
+ const ongoing = task && ['queued', 'running'].includes(task.state);
+ get('save-assignment').disabled = !router?.identity_bound || !profileSelects[0].value || assignmentBusy || ongoing;
+ get('remove-assignment').disabled = !router?.identity_bound || !!router.active_profile || !assigned.length || assignmentBusy || ongoing;
+ const taskStates = {queued: 'Ожидает heartbeat', running: 'Выполняется', completed: 'Выполнено', failed: 'Ошибка'};
+ get('agent-task-status').textContent = task ? taskStates[task.state] : '';
+ for (const button of document.querySelectorAll('[data-agent-action]')) {
+  const slot = get('agent-profile-slot').value;
+  button.disabled = !router?.identity_bound || assignmentBusy || ongoing ||
+   (button.dataset.agentAction === 'rollback'
+    ? router?.transport_rollback_target === undefined
+    : slot !== 'enrollment' && !assigned[Number(slot)]?.assignment_id);
+ }
+}
+routerSelect.addEventListener('change', () => { clearIdentity(); assignmentEditor(); });
+profileSelects.forEach(select => select.addEventListener('change', () => assignmentEditor(false)));
+async function assignmentAction(operation) {
+ if (assignmentBusy || !routerSelect.value) return;
+ const payload = {router_id: routerSelect.value, confirmed: true};
+ if (operation === 'assign') {
+  const values = profileSelects.map(select => select.value);
+  if (values[2] && !values[1]) return;
+  payload.profiles = values.filter(Boolean).map(value => {
+   const [profile_id, revision] = value.split(':');
+   return {profile_id, revision: Number(revision)};
+  });
+ }
+ if (!window.confirm('Применить операцию к ' + payload.router_id + '?')) return;
+ const status = get('assignment-status');
+ assignmentBusy = true;
+ routerSelect.disabled = true;
+ profileSelects.forEach(select => {select.disabled = true;});
+ clearIdentity();
+ assignmentEditor(false);
+ status.textContent = 'Выполняется…';
+ try {
+  const data = await api(operation, payload);
+  if (operation === 'identity') {
+   identityView.textContent = data.router_token;
+   identityView.hidden = false;
+   identityTimer = setTimeout(clearIdentity, 60000);
+   status.textContent = 'На роутере запустите owrt-remote transport-bind-identity и передайте токен через stdin.';
+  } else {
+   status.textContent = operation === 'assign' ? 'Назначение сохранено.' : 'Назначение снято.';
+   await refresh();
+  }
+ } catch (error) {
+  status.textContent = error.message;
+ } finally {
+  assignmentBusy = false;
+  routerSelect.disabled = false;
+  profileSelects.forEach(select => {select.disabled = false;});
+  assignmentEditor(false);
+ }
+}
+get('issue-router-identity').addEventListener('click', () => assignmentAction('identity'));
+get('save-assignment').addEventListener('click', () => assignmentAction('assign'));
+get('remove-assignment').addEventListener('click', () => assignmentAction('unassign'));
+get('agent-profile-slot').addEventListener('change', () => assignmentEditor(false));
+for (const button of document.querySelectorAll('[data-agent-action]')) {
+ button.addEventListener('click', async () => {
+  if (!window.confirm(button.textContent + ' для ' + routerSelect.value + '?')) return;
+  assignmentBusy = true;
+  assignmentEditor(false);
+  try {
+   const routerId = routerSelect.value;
+   const action = button.dataset.agentAction;
+   const slot = get('agent-profile-slot').value;
+   const router = catalogData.managed_routers.find(item => item.id === routerId);
+   const target = action === 'rollback' ? router.transport_rollback_target
+    : slot === 'enrollment' ? null : catalogData.assignments[routerId][Number(slot)];
+   await api('agent_action', {router_id: routerId, action, slot, target, confirmed: true});
+   await refresh();
+  } catch (error) {
+   get('assignment-status').textContent = error.message;
+  } finally {
+   assignmentBusy = false;
+   assignmentEditor(false);
+  }
+ });
+}
+
+async function refresh(message = '') {
+ const status = get('catalog-status'), button = get('refresh');
+ if (button.disabled) return;
+ button.disabled = true;
+ status.textContent = 'Загрузка…';
+ try {
+  const data = await api();
+  catalogData = data;
+  const selected = routerSelect.value;
+  routerSelect.replaceChildren(new Option('Выберите роутер', ''), ...data.managed_routers.map(
+   router => new Option(router.name + ' · ' + router.id, router.id)));
+  routerSelect.value = selected;
+  assignmentEditor();
+  publicPort = data.public_port;
+  input.public_port.value = publicPort;
+  const catalog = get('catalog');
+  catalog.replaceChildren(...data.revisions.map(revisionRow));
+  get('legacy').replaceChildren(...data.legacy_routers.map(router => {
+   const entry = document.createElement('li');
+   entry.textContent = router.name + ' · ' + router.id;
+   return entry;
+  }));
+  if (!data.legacy_routers.length) {
+   const entry = document.createElement('li');
+   entry.textContent = 'Зарегистрированных устройств TCP Legacy нет.';
+   get('legacy').append(entry);
+  }
+  status.textContent = message + (data.revisions.length ? '' : 'Каталог пуст. ') +
+   'Обновлено в ' + new Date().toLocaleTimeString();
+ } catch (error) {
+  status.textContent = message + 'Каталог не обновлён. ' + error.message;
+ } finally {
+  fields.disabled = busy || publicPort === undefined;
+  button.disabled = false;
+ }
+}
+get('refresh').addEventListener('click', () => refresh());
+
+form.addEventListener('submit', async event => {
+ event.preventDefault();
+ if (busy || fields.disabled || !form.reportValidity()) return;
+ const status = get('editor-status');
+ const values = Object.fromEntries(new FormData(form));
+ const profile = {name: values.name, port: Number(values.port), transport: values.transport,
+  server_name: values.server_name};
+ for (const key of kinds[profile.transport]) profile[key] = values[key];
+ if (profile.transport === 'reality-tcp') {
+  profile.target_port = Number(profile.target_port);
+  profile.server_names = [...new Set([profile.server_name, ...profile.server_names.split(',')]
+   .map(name => name.trim()).filter(Boolean))];
+ }
+ busy = true;
+ fields.disabled = true;
+ status.textContent = 'Сохранение…';
+ try {
+  const {draft} = await api('draft', {profile, label: values.label,
+   remote_host: values.remote_host, public_port: publicPort});
+  status.textContent = 'Сохранена ревизия ' + draft.revision + ' · порт Xray ' + draft.backend_port;
+  await refresh();
+ } catch (error) {
+  status.textContent = error.message;
+ } finally {
+  busy = false;
+  fields.disabled = false;
+ }
+});
+refresh();
+</script>
+</body>
+</html>

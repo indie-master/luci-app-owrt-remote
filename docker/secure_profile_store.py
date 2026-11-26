@@ -123,6 +123,9 @@ def connection(root=STORE):
             db.execute("""CREATE TABLE IF NOT EXISTS secure_profile_artifacts(
                 profile_id TEXT NOT NULL, revision INTEGER NOT NULL,
                 artifact BLOB NOT NULL, PRIMARY KEY(profile_id, revision))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS secure_profile_discarded(
+                profile_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                PRIMARY KEY(profile_id, revision))""")
             yield db
     finally:
         db.close()
@@ -200,7 +203,10 @@ def save_allocated_draft(db, *, profile, label, remote_host, public_port, occupi
 
 def list_revisions(db):
     rows = db.execute("""SELECT profile_id,revision,label,transport,hostname,public_port,published
-                          FROM secure_profile_revisions ORDER BY label,revision DESC""")
+                          FROM secure_profile_revisions r WHERE NOT EXISTS (
+                            SELECT 1 FROM secure_profile_discarded d
+                            WHERE d.profile_id=r.profile_id AND d.revision=r.revision)
+                          ORDER BY label,revision DESC""")
     fields = ("profile_id","revision","label","transport","hostname","public_port","published")
     result = []
     for row in rows:
@@ -229,3 +235,18 @@ def load_artifact(db, profile_id, revision):
     if not isinstance(artifact, bytes) or not secrets.compare_digest(hashlib.sha256(artifact).hexdigest(), digest):
         raise ProfileError("profile artifact digest mismatch")
     return json.loads(artifact), digest, bool(published)
+
+
+def discard_draft(db, profile_id, revision):
+    """Release an unused draft's port without reusing its revision number."""
+    _, _, published = load_artifact(db, profile_id, revision)
+    if published:
+        raise ProfileError("published revision requires verified runtime removal")
+    deleted = db.execute("""DELETE FROM secure_profile_artifacts
+        WHERE profile_id=? AND revision=? AND EXISTS (
+            SELECT 1 FROM secure_profile_revisions r WHERE
+            r.profile_id=? AND r.revision=? AND r.published=0)""",
+        (profile_id, revision, profile_id, revision))
+    if deleted.rowcount != 1:
+        raise ProfileError("draft changed")
+    db.execute("INSERT INTO secure_profile_discarded VALUES (?,?)", (profile_id, revision))

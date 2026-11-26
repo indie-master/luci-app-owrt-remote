@@ -7,14 +7,17 @@ from pathlib import Path
 import re
 import socket
 import socketserver
+import sqlite3
 import struct
 import subprocess
 import tempfile
 import time
 
 import manager as m
+import unified_transport_catalog as transport_catalog
 from stack_runtime import OWNER, REVISION, Stack, open_settings, protected
-from unified_xray_state import BACKEND, MAX_CONFIG, ROUTER_ID, TOKEN, XrayState, read_private, router_spec
+from unified_xray_state import BACKEND, MAX_CONFIG, ROUTER_ID, TOKEN, XrayState, profile_ports, read_private, router_spec
+from unified_transport_runtime import Runtime
 
 MAX_REQUEST = 8192
 XRAY_TMPFS = {
@@ -30,6 +33,8 @@ OPERATIONS = {
     "apply_config": {frozenset({"router_id", "router", "transaction"}), frozenset({"commit"})},
     "restart": {frozenset()},
     "rollback": {frozenset({"transaction"})},
+    "transport.recover": {frozenset()},
+    **{op: {frozenset(fields)} for op, fields in transport_catalog.OPERATIONS.items()},
 }
 
 
@@ -88,8 +93,10 @@ def parameters(request):
     if "router_id" in args:
         name = args["router_id"]
         m.require(isinstance(name, str) and ROUTER_ID.fullmatch(name), "Invalid router ID")
-        if args["router"] is not None:
+        if "router" in args and args["router"] is not None:
             m.require(router_spec(args["router"])["id"] == name, "Router IDs differ")
+    if op in transport_catalog.OPERATIONS:
+        transport_catalog.validate_request(op, args)
     return op, args
 
 
@@ -144,22 +151,27 @@ class Adapter:
                   "Xray ownership verification failed: bind-mounts")
         return record["Id"]
 
-    def probe(self, stack, release, routers):
+    def probe(self, stack, release, routers, *, extra_ports=None):
         try:
             item, = json.loads(docker("container", "inspect", stack.name + "-xray", timeout=4))
             self.owned_xray(stack, release, item)
             ports = [port for spec in routers.values() for port in spec["ports"]]
+            if extra_ports is None:
+                record = XrayState(stack).load()
+                extra_ports = profile_ports(record.get("profiles", []))
+            ports.extend(extra_ports)
             return item["State"]["Status"] == "running" and stack.xray_ready(item, ports)
         except (OSError, http.client.HTTPException):
             return False
 
-    def restart(self, stack, release, container, routers):
+    def restart(self, stack, release, container, routers, *, extra_ports=None):
         stack.guard()
         m.require(self.owned_xray(stack, release, stack.inspect(release)["xray"]) == container,
                   "Xray container changed")
         docker("restart", "--time", "3", container)
         deadline = time.monotonic() + 12
-        while not self.probe(stack, release, routers):
+        while not (self.probe(stack, release, routers) if extra_ports is None else
+                   self.probe(stack, release, routers, extra_ports=extra_ports)):
             m.require(time.monotonic() < deadline, "Xray readiness failed")
             time.sleep(0.2)
 
@@ -189,28 +201,42 @@ class Adapter:
         state = XrayState(stack)
         record = state.load()
         pending = record["pending"]
-        stack.verify_release(release, recover_xray=pending is not None)
+        profile_pending = record.get("profile_pending")
+        stack.verify_release(release, recover_xray=bool(pending or profile_pending))
         hold = stack.xray_hold()
+        runtime = Runtime(self, stack, release, state, container, docker)
         if op == "status":
             operations = {"status", "version", "health"}
             if not hold:
-                operations.update({"apply_config", "rollback"} if pending else
-                                  {"validate_config", "apply_config", "restart"})
+                if profile_pending:
+                    operations.add("transport.recover")
+                elif pending:
+                    operations.update({"apply_config", "rollback"})
+                else:
+                    operations.update({"validate_config", "apply_config", "restart"})
             return {"backend": BACKEND, "maintenance_hold": hold,
                     "pending": pending["token"] if pending else None,
-                    "ready": not pending and self.probe(stack, release, record["routers"]),
+                    "profile_recovery_pending": bool(profile_pending),
+                    "ready": not (pending or profile_pending) and self.probe(stack, release, record["routers"]),
                     "operations": sorted(operations),
                     "public_port": stack.plan["public"], "wss_path": stack.plan["wss_path"]}
         if op == "health":
-            return {"ready": not pending and self.probe(stack, release, record["routers"])}
+            return {"ready": not (pending or profile_pending) and self.probe(stack, release, record["routers"])}
         if op == "version":
             output = docker("exec", container, "xray", "version")
             version = re.match(r"Xray ([0-9]+\.[0-9]+\.[0-9]+)\b", output)
             m.require(version, "Xray version unavailable")
             return {"version": version[1], "image": release["images"]["xray"]}
 
+        if op in {"transport.list", "transport.detail", "transport.router_profiles", "transport.router_portals"}:
+            return transport_catalog.handle(self, stack, release, state, op, args, runtime=runtime)
         stack.guard()
         m.require(not m.pending_transaction(), "Pending HUB-only deployment")
+        if profile_pending:
+            runtime.recover(record)
+            record = state.load()
+        if op == "transport.recover":
+            return {"recovered": bool(profile_pending)}
         if op == "rollback" or "commit" in args:
             token = args.get("commit", args.get("transaction"))
             if "commit" in args and record.get("committed") == token:
@@ -228,6 +254,9 @@ class Adapter:
                                 committed=token, pending=None))
             return {}
         m.require(not pending, "Pending Xray transaction")
+        if op in transport_catalog.OPERATIONS:
+            return transport_catalog.handle(self, stack, release, state, op, args, container=container,
+                                            runtime=runtime)
         if op == "restart":
             self.restart(stack, release, container, record["routers"])
             return {"ready": True}
@@ -236,6 +265,8 @@ class Adapter:
         name, router = args["router_id"], args["router"]
         if router is None:
             m.require(name in routers, "Router is outside adapter ownership")
+            m.require(not any(name in item.get("assignments", {}) for item in record.get("profiles", [])),
+                      "Router has assigned transport profiles")
             del routers[name]
         else:
             routers[name] = router
@@ -290,7 +321,7 @@ class Adapter:
                 result = self.handle(stack, release, records, request)
             response = {"ok": True, **result}
         except (m.Blocked, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError,
-                subprocess.SubprocessError):
+                subprocess.SubprocessError, sqlite3.Error):
             if not authenticated:
                 return
             response = {"ok": False, "error": "Xray adapter request failed"}
@@ -307,6 +338,16 @@ class Adapter:
         m.require(stack.config["RO_XRAY_BACKEND"] == BACKEND, "Xray adapter is disabled")
         protected(m.LOCK.parent)
         adapter = self
+
+        # Recovery also runs before the next authorized write if startup finds
+        # the stack unavailable or HOLD active.
+        if XrayState(stack).exists() and XrayState(stack).load().get("profile_pending"):
+            try:
+                with m.deployment_lock():
+                    stack, release, records = self.open_project()
+                    self.handle(stack, release, records, {"op": "transport.recover"})
+            except (m.Blocked, OSError, ValueError, KeyError, subprocess.SubprocessError, sqlite3.Error):
+                print("Profile recovery pending", flush=True)
 
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):

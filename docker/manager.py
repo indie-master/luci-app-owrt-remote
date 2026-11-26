@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import http.client
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -48,7 +49,17 @@ HUB_GID = 23088
 SOURCE_LABEL = "org.router-orchestrator.hub-source-sha256"
 PROJECT = "router-orchestrator"
 LOCK_FD = ContextVar("deployment_lock_fd", default=None)
-TRANSIENT = {"hub.db-wal", "hub.db-shm", "hub.db-journal"}
+SQLITE_SUFFIXES = ("-wal", "-shm", "-journal")
+TRANSIENT = {"hub.db" + suffix for suffix in SQLITE_SUFFIXES}
+STACK_PRIVATE_FILES = {"profiles.db", "xray.json", "xray-active.json", "nginx-active.conf",
+                       "stack.env", "stack.json", "compose.yml", "compose-stack.yml"}
+STACK_PRIVATE_DIRECTORIES = {"tls", "xray-assets"}
+
+
+def stack_private_member(name):
+    return name in STACK_PRIVATE_FILES or (
+        name.split("/", 1)[0] in STACK_PRIVATE_DIRECTORIES and
+        all(part not in {"", ".", ".."} for part in name.split("/")) and "/" in name)
 
 class Blocked(Exception):
     pass
@@ -344,9 +355,9 @@ class BoundedTarReader:
 
 
 def sqlite_read(path, *, immutable=False):
-    require(path.is_file() and not path.is_symlink(), "hub.db missing/unsafe")
-    for name in TRANSIENT:
-        sidecar = path.parent / name
+    require(path.is_file() and not path.is_symlink(), "SQLite database missing/unsafe")
+    for suffix in SQLITE_SUFFIXES:
+        sidecar = path.with_name(path.name + suffix)
         require(not sidecar.is_symlink() and (not sidecar.exists() or sidecar.is_file()),
                 "Unsafe SQLite sidecar")
     query = "?mode=ro&immutable=1" if immutable else "?mode=ro"
@@ -379,13 +390,13 @@ def backup_members(state, snapshot):
             yield item, relative
 
 
-def archive_file(tar, path, relative, remaining):
+def archive_file(tar, path, name, remaining):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         before = os.fstat(stream.fileno())
         require(stat.S_ISREG(before.st_mode), "Non-regular state member")
         require(before.st_size <= remaining, "Backup data too large")
-        info = tarfile.TarInfo("state/" + relative)
+        info = tarfile.TarInfo(name)
         info.mode = 0o600
         info.size = before.st_size
         reader = HashReader(stream)
@@ -405,7 +416,19 @@ def backup():
     return backup_state(state_path(), BACKUPS)
 
 
-def backup_state(state, directory):
+def snapshot_sqlite(source, target):
+    with sqlite_read(source) as src, contextlib.closing(sqlite3.connect(target)) as dst:
+        src.execute("BEGIN")
+        pages = src.execute("PRAGMA page_count").fetchone()[0]
+        page_size = src.execute("PRAGMA page_size").fetchone()[0]
+        require(pages * page_size <= MAX_DATA, "SQLite snapshot too large")
+        src.backup(dst, pages=128)
+        check_integrity(dst)
+
+
+def backup_state(state, directory, *, stack_private=None):
+    require(stack_private is None or all(stack_private_member(name) for name in stack_private),
+            "Unexpected private stack backup member")
     require(directory == directory.resolve() and not directory.is_relative_to(state.resolve())
             and not state.resolve().is_relative_to(directory),
             "Backup directory overlaps state or has path aliases")
@@ -415,30 +438,36 @@ def backup_state(state, directory):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = directory / f"router-orchestrator-{stamp}-{uuid.uuid4().hex}.tar.gz"
     files = {}
-    manifest = {"format": 1, "files": files, "hub_source_sha256": file_hash(APP)}
+    manifest = {"format": 1 if stack_private is None else 2,
+                "files": files, "hub_source_sha256": file_hash(APP)}
     manifest_size = len(json.dumps(manifest, separators=(",", ":")))
     total = 0
     with tempfile.TemporaryDirectory(prefix=".router-backup-", dir=directory) as td:
         dbpath = Path(td) / "hub.db"
-        with sqlite_read(state / "hub.db") as src, contextlib.closing(sqlite3.connect(dbpath)) as dst:
-            src.execute("BEGIN")
-            pages = src.execute("PRAGMA page_count").fetchone()[0]
-            page_size = src.execute("PRAGMA page_size").fetchone()[0]
-            require(pages * page_size <= MAX_DATA, "SQLite snapshot too large")
-            src.backup(dst, pages=128)
-            check_integrity(dst)
+        snapshot_sqlite(state / "hub.db", dbpath)
+        members = (("state/" + relative, item) for item, relative in backup_members(state, dbpath))
+        private = dict(stack_private or {})
+        if "profiles.db" in private:
+            profile_snapshot = Path(td) / "profiles.db"
+            snapshot_sqlite(private["profiles.db"], profile_snapshot)
+            private["profiles.db"] = profile_snapshot
+        if "xray.json" in private:
+            from unified_xray_state import verify_profile_snapshot
+
+            verify_profile_snapshot(private["xray.json"], Path(td) / "profiles.db", dbpath)
         pending = Path(td) / dest.name
         with pending.open("xb") as out:
             os.fchmod(out.fileno(), 0o600)
             limited = ArchiveWriter(out)
             with tarfile.open(fileobj=limited, mode="w|gz") as tar:
-                for item, relative in backup_members(state, dbpath):
+                for name, item in itertools.chain(members, (
+                        ("private/" + name, item) for name, item in private.items())):
+                    relative = name if stack_private is not None else name.removeprefix("state/")
                     require(len(files) < MAX_FILES, "Too many backup files")
-                    # JSON key, colon, quoted SHA-256 and optional comma.
                     manifest_size += len(json.dumps(relative)) + 67 + bool(files)
                     require(manifest_size <= MAX_MANIFEST, "Backup manifest/data too large")
                     size, files[relative] = archive_file(
-                        tar, item, relative, MAX_DATA - total - manifest_size)
+                        tar, item, name, MAX_DATA - total - manifest_size)
                     total += size
                 blob = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
                 require(len(blob) <= MAX_MANIFEST and total + len(blob) <= MAX_DATA,
@@ -480,12 +509,12 @@ def restore(args):
         require(metadata.st_size <= MAX_ARCHIVE, "Backup unexpectedly large")
         reader = BoundedTarReader(compressed)
         with tarfile.open(fileobj=reader, mode="r:") as tar:
-            restore_members(tar, reader, dest)
+            restore_members(tar, reader, dest, stack_bundle=getattr(args, "stack_bundle", False))
     print("PASS: isolated restore:", dest)
     print("Never mount it over the live state without a separate cutover plan")
 
 
-def restore_members(tar, reader, dest):
+def restore_members(tar, reader, dest, *, stack_bundle=False):
     members = {}
     total_size = 0
     for member in tar:
@@ -499,27 +528,35 @@ def restore_members(tar, reader, dest):
     require("manifest.json" in members and members["manifest.json"].size <= MAX_MANIFEST,
             "Missing or oversized manifest")
     manifest = json.load(tar.extractfile(members["manifest.json"]))
-    require(isinstance(manifest, dict) and manifest.get("format") == 1,
-            "Unsupported backup format")
+    version = 2 if stack_bundle else 1
+    require(isinstance(manifest, dict) and manifest.get("format") == version,
+            "Unsupported backup format for requested restore mode")
     expected = manifest.get("files")
-    require(isinstance(expected, dict) and "hub.db" in expected
-            and members.keys() == {"manifest.json"} | {"state/" + n for n in expected},
+    require(isinstance(expected, dict), "Invalid backup manifest")
+    if not stack_bundle:
+        expected = {"state/" + name: digest for name, digest in expected.items()}
+    require("state/hub.db" in expected and members.keys() == {"manifest.json"} | expected.keys(),
             "Manifest/archive mismatch")
     require(all(all(p not in ("", ".", "..") for p in n.split("/"))
-                and "\\" not in n and "\x00" not in n for n in expected)
-            and not (TRANSIENT & expected.keys()),
+                and "\\" not in n and "\x00" not in n for n in expected),
             "Unsafe filename")
+    for name in expected:
+        scope, _, relative = name.partition("/")
+        require((scope == "state" and relative and relative not in TRANSIENT) or
+                (stack_bundle and scope == "private" and stack_private_member(relative)),
+                "Unsafe backup scope")
     require(all(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
                 for digest in expected.values()), "Invalid file digest")
     create_private_parents(dest)
     with tempfile.TemporaryDirectory(prefix=".router-restore-", dir=dest.parent) as temporary:
-        state = Path(temporary) / "state"
-        state.mkdir(mode=0o700)
+        bundle = Path(temporary) / "bundle"
+        state = bundle / "state"
+        state.mkdir(mode=0o700, parents=True)
+        bundle.chmod(0o700)
         for member in members.values():
             if member.name == "manifest.json":
                 continue
-            n = member.name.removeprefix("state/")
-            target = state / n
+            target = bundle / member.name
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             digest = hashlib.sha256()
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -527,8 +564,9 @@ def restore_members(tar, reader, dest):
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
                     digest.update(chunk)
                     out.write(chunk)
-                require(digest.hexdigest() == expected[n], "Backup digest mismatch")
-                os.chown(target, HUB_UID, HUB_GID)
+                require(digest.hexdigest() == expected[member.name], "Backup digest mismatch")
+                if target.is_relative_to(state):
+                    os.chown(target, HUB_UID, HUB_GID)
                 out.flush()
                 os.fsync(out.fileno())
         # SQLite Backup API produced a self-contained snapshot. Immutable mode
@@ -540,7 +578,20 @@ def restore_members(tar, reader, dest):
             sync_directory(directory)
         os.chown(state, HUB_UID, HUB_GID)
         sync_directory(state)
-        publish_restore(state, dest)
+        private = bundle / "private"
+        if private.exists():
+            profiles = private / "profiles.db"
+            if profiles.exists():
+                with sqlite_read(profiles, immutable=True) as db:
+                    check_integrity(db)
+            from unified_xray_state import verify_profile_snapshot
+
+            verify_profile_snapshot(private / "xray.json", profiles, state / "hub.db")
+            for directory in sorted((p for p in private.rglob("*") if p.is_dir()), reverse=True):
+                sync_directory(directory)
+            sync_directory(private)
+        sync_directory(bundle)
+        publish_restore(bundle if stack_bundle else state, dest)
 
 RELEASE_STATE = HUB_DEPLOY_ROOT / ".releases.json"
 
@@ -947,10 +998,12 @@ def main():
     restore_parser = subs.add_parser("restore")
     restore_parser.add_argument("archive")
     restore_parser.add_argument("--destination", required=True)
+    restore_parser.add_argument("--stack-bundle", action="store_true",
+                                help="restore HUB state and root-only files into an isolated bundle")
     stack_parser = subs.add_parser("stack")
     stack_parser.add_argument("--env-file", type=Path, required=True)
     stack_actions = stack_parser.add_subparsers(dest="operation", required=True)
-    for operation in ("validate", "start", "stop", "status", "recover", "rollback"):
+    for operation in ("validate", "start", "stop", "status", "recover", "rollback", "backup"):
         stack_actions.add_parser(operation)
     update = stack_actions.add_parser("update")
     update.add_argument("--candidate-env", type=Path, required=True)

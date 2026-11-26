@@ -1,6 +1,7 @@
 """Durable Xray enrollment state, independent of the stack release journal."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -8,6 +9,7 @@ import stat
 import uuid
 
 import manager as m
+from secure_ingress import plan_ingress
 
 MAX_CONFIG = 2 * 1024**2
 MAX_ROUTERS = 512
@@ -97,6 +99,14 @@ def render(baseline, routers, plan):
     return data
 
 
+def assignment_id(pair):
+    return hashlib.sha256(("ro-assignment:" + pair["clients"][0]).encode("ascii")).hexdigest()
+
+
+def assignment_tag(pair, index):
+    return "ro-reverse-" + pair["clients"][index].replace("-", "")
+
+
 class XrayState:
     def __init__(self, stack):
         self.stack = stack
@@ -117,8 +127,62 @@ class XrayState:
                   "Xray journal belongs to a different configuration")
         return record
 
-    def render(self, record, routers):
-        return render(record["base"].encode(), routers, self.stack.plan)
+    def render(self, record, routers, *, profiles=None):
+        base = render(record["base"].encode(), routers, self.stack.plan)
+        profiles = record.get("profiles", []) if profiles is None else profiles
+        if not profiles:
+            return base
+        config = json.loads(base)
+        inbounds = config["inbounds"]
+        tags = {item.get("tag") for item in inbounds + config.get("outbounds", [])}
+        identities = [client for item in inbounds for client in item.get("settings", {}).get("clients", [])]
+        tags.update(item.get("reverse", {}).get("tag") for item in identities)
+        ids = {item.get("id") for item in identities}
+        routing = config.setdefault("routing", {}).setdefault("rules", [])
+        for rule in routing:
+            tags.update(rule.get("inboundTag") or ())
+            tags.add(rule.get("outboundTag"))
+        deny = "ro-profile-deny"
+        m.require(deny not in tags, "Profile deny route conflicts with the baseline")
+        config.setdefault("outbounds", []).append({"tag": deny, "protocol": "blackhole"})
+        for item in profiles:
+            profile = item["profile"]
+            tag = profile_tag(item)
+            occupied = {entry["port"] for entry in inbounds}
+            occupied.update(port for port in self.stack.plan["routes"].values())
+            occupied.update(self.stack.plan.get(name) for name in ("hub", "wss", "tls", "health", "http", "public"))
+            plan = plan_ingress(profile, public_port=item["public_port"], occupied_ports=occupied)
+            m.require(tag not in tags, "Profile listener tag conflicts")
+            tags.add(tag)
+            inbound = {
+                "tag": tag, "listen": plan["listen"], "port": plan["backend_port"],
+                "protocol": "vless", "settings": {"clients": [], "decryption": "none"},
+                "streamSettings": plan["streamSettings"],
+            }
+            inbounds.append(inbound)
+            occupied.add(profile["port"])
+            for router_id, pair in sorted(item.get("assignments", {}).items()):
+                targets = routers[router_id]["targets"]
+                spec = router_spec(dict(pair, id=router_id, targets=targets))
+                for index, (uid, port, target) in enumerate(zip(spec["clients"], spec["ports"], targets)):
+                    reverse = assignment_tag(spec, index)
+                    portal = reverse + "-portal"
+                    m.require(uid not in ids and port not in occupied and
+                              reverse not in tags and portal not in tags, "Profile router identity conflicts")
+                    ids.add(uid)
+                    tags.update((reverse, portal))
+                    occupied.add(port)
+                    inbound["settings"]["clients"].append({
+                        "id": uid, "email": reverse + "@owrt-remote", "reverse": {"tag": reverse},
+                    })
+                    inbounds.append({"tag": portal, "port": port, "listen": "127.0.0.1", "protocol": "tunnel",
+                                     "settings": {"allowedNetwork": "tcp", "rewriteAddress": target[0],
+                                                  "rewritePort": target[1]}})
+                    routing.insert(0, {"type": "field", "inboundTag": [portal], "outboundTag": reverse})
+            routing.insert(0, {"type": "field", "inboundTag": [tag], "outboundTag": deny})
+        data = encode(config)
+        m.require(len(data) <= MAX_CONFIG, "Xray configuration exceeds limit")
+        return data
 
     def baseline(self, *, recover=False):
         if not self.exists():
@@ -126,19 +190,26 @@ class XrayState:
         m.require(self.stack.config["RO_XRAY_BACKEND"] == BACKEND, "Xray journal requires its backend")
         record = self.load()
         pending = record["pending"]
-        m.require(recover or pending is None, "Pending Xray transaction: reconcile from HUB")
+        profile_pending = record.get("profile_pending")
+        m.require(recover or not pending, "Pending Xray transaction: reconcile from HUB")
+        m.require(recover or not profile_pending, "Pending profile transaction: recover through the adapter")
         valid = [self.render(record, record["routers"])]
         if pending:
             valid.append(self.render(record, pending["routers"]))
         live = read_private(self.config, MAX_CONFIG)
-        m.require(live in valid,
+        if profile_pending:
+            valid.append(self.render(record, record["routers"], profiles=profile_pending["profiles"]))
+        m.require(live in valid or (profile_pending and
+                  hashlib.sha256(live).hexdigest() == profile_pending.get("trial_sha256")),
                   "Active Xray config differs from journal")
         return record["base"].encode()
 
     def managed_ports(self):
         if not self.exists():
             return ()
-        return tuple(port for router in self.load()["routers"].values() for port in router["ports"])
+        record = self.load()
+        return tuple(port for router in record["routers"].values() for port in router["ports"]) + profile_ports(
+            record.get("profiles", []))
 
     def save(self, record):
         data = encode(record)
@@ -174,3 +245,54 @@ class XrayState:
         m.sync_directory(directory)
         directory.rmdir()
         m.sync_directory(self.config.parent)
+
+
+def profile_tag(item):
+    return f"ro-profile-{item['profile']['name']}-{item['revision']}"
+
+
+def profile_ports(profiles):
+    return tuple(port for item in profiles for port in (
+        item["profile"]["port"], *(port for pair in item.get("assignments", {}).values()
+                                   for port in pair["ports"])))
+
+
+def verify_profile_snapshot(journal, catalog, hub):
+    """Cross-check the two databases and the finalized runtime in a bundle."""
+    if not journal.exists():
+        return
+    with journal.open("rb") as stream:
+        raw = stream.read(6 * MAX_CONFIG + 1)
+    m.require(len(raw) <= 6 * MAX_CONFIG, "Oversized transport journal")
+    record = json.loads(raw)
+    token = record.get("profile_committed")
+    m.require(not record.get("profile_pending") and not record.get("pending"),
+              "Cannot archive an incomplete transport transaction")
+    if token is None:
+        return
+    from secure_profile_store import load_artifact
+
+    assigned = {}
+    with m.sqlite_read(catalog, immutable=True) as db:
+        marker = db.execute("SELECT token FROM unified_transport_commit").fetchall()
+        m.require(marker == [(token,)], "Catalog and runtime transaction differ")
+        for item in record.get("profiles", []):
+            ref = (item["profile"]["name"], item["revision"])
+            artifact, _, published = load_artifact(db, *ref)
+            expected = {name: value for name, value in item.items() if name != "assignments"}
+            m.require(published and dict(artifact, revision=ref[1]) == expected,
+                      "Active profile differs from catalog artifact")
+            for router, pair in item.get("assignments", {}).items():
+                m.require(router in record["routers"], "Assignment references an unknown router")
+                assigned.setdefault(router, {})[ref] = pair
+        desired = {router: {(entry["profile_id"], entry["revision"]) for entry in json.loads(data)}
+                   for router, data in db.execute("SELECT router_id, desired_profiles FROM secure_router_preferences")}
+        m.require(desired == {router: set(items) for router, items in assigned.items()},
+                  "Router preferences differ from Xray assignments")
+    with m.sqlite_read(hub, immutable=True) as db:
+        for router, reference, luci, ssh in db.execute("""SELECT id, transport_active_ref,
+                transport_luci_port, transport_ssh_port FROM routers WHERE transport_active_ref != ''"""):
+            ref = json.loads(reference)
+            pair = assigned.get(router, {}).get((ref["profile_id"], ref["revision"]))
+            m.require(pair and pair["ports"] == [luci, ssh]
+                      and ref.get("assignment_id", assignment_id(pair)) == assignment_id(pair), "Active router ports differ from assigned Xray listeners")

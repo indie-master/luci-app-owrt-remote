@@ -1,4 +1,5 @@
 """Real unified-stack checks restricted to disposable GitHub-hosted runners."""
+import argparse
 import contextlib
 from functools import wraps
 import io
@@ -20,12 +21,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
 from stack_runtime import Ingress, Stack, docker, websocket
+from secure_profile_store import connection, load_artifact, reality_keys, save_draft
+from secure_reverse_probe import build_probe
+from rehearse_secure_reverse import Proof, proof_matches, reserve
 from orchestrator_stack_config import STREAM_MODULE, render_external, render_internal, stack_plan
 from unified_xray_adapter import Adapter, XRAY_TMPFS, socket_address
-from unified_xray_state import XrayState
+from unified_xray_state import XrayState, encode
+from unified_transport_catalog import initialize_stage, record_stage, stage_status
 
 HUB = "hub.example.invalid"
 PASSTHROUGH = "pass.example.invalid"
+LIFECYCLE_HOST = "lifecycle.example.invalid"
+PROFILE_TRANSPORTS = ("wss", "reality-tcp", "xhttp", "grpc")
 WS_PATH = "/owrt-ws/"
 CI_LABEL = "org.router-orchestrator.integration"
 
@@ -77,11 +84,13 @@ def choose_ports(count):
 
 def cert(directory, host):
     directory.mkdir()
+    directory.chmod(0o755)
     m.call("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
            "-subj", "/CN=" + host, "-addext", "subjectAltName=DNS:" + host,
            "-keyout", str(directory / "privkey.pem"), "-out", str(directory / "fullchain.pem"))
     os.chown(directory / "privkey.pem", 0, m.HUB_GID)
     (directory / "privkey.pem").chmod(0o640)
+    (directory / "fullchain.pem").chmod(0o644)
 
 
 def write_env(path, config):
@@ -93,6 +102,12 @@ def fixture(root, mode, project, hub_image, nginx, xray, backend="external_reado
     hub, ws, stream, tls, health, public, http = choose_ports(7)
     cert(root / "tls", HUB)
     cert(root / "tls" / "passthrough", PASSTHROUGH)
+    if backend == "unified_adapter":
+        cert(root / "tls" / LIFECYCLE_HOST, LIFECYCLE_HOST)
+        if mode == "standalone":
+            for transport in PROFILE_TRANSPORTS[1:]:
+                host = f"{transport}.{LIFECYCLE_HOST}"
+                cert(root / "tls" / host, host)
     (root / "xray").mkdir()
     (root / "assets").mkdir()
 
@@ -140,11 +155,13 @@ def fixture(root, mode, project, hub_image, nginx, xray, backend="external_reado
     return config, plan, module
 
 
-def external_fixture(root, config, plan, module, project):
+def external_fixture(root, config, plan, module, project, profile_port=None):
     paths = render_external(plan)
     prefix = f"load_module {module};\n" if module else ""
     prefix += "events {}\npid /var/run/nginx.pid;\n"
     rules = paths["external-stream.snippet"]
+    if profile_port is not None:
+        rules += f"    {LIFECYCLE_HOST} 127.0.0.1:{profile_port};\n"
     http = ""
     if plan["mode"] == "external-only":
         rules += f"    {HUB} 127.0.0.1:{plan['tls'] or config['RO_TLS_PORT']};\n"
@@ -175,6 +192,217 @@ def external_fixture(root, config, plan, module, project):
     docker("run", "--rm", *common, image, "nginx", "-t")
     docker("run", "--detach", "--label", f"{CI_LABEL}={project}", "--name",
            project + "-fixture-ingress", *common, image)
+
+
+def verify_stack_backup(root, env, config):
+    stack = Stack(env, config)
+    catalog = stack.transport_store
+    catalog.mkdir(mode=0o700, exist_ok=True)
+    with connection(catalog) as db:
+        draft = save_draft(db, profile={"name": "backup-ci", "transport": "reality-tcp",
+                                       "server_name": "backup.example.invalid",
+                                       "server_names": ["backup.example.invalid"],
+                                       "target_host": "backup.example.invalid",
+                                       "target_port": 443, "port": choose_ports(1)[0]},
+                           label="Synthetic backup", remote_host="backup.example.invalid",
+                           public_port=stack.plan["public"])
+        ref = {key: draft[key] for key in ("profile_id", "revision")}
+        initialize_stage(db)
+        receipt = record_stage(db, "transport.stage", ref, "a" * 64)
+        artifact = load_artifact(db, **ref)
+    cli(env, "backup", expected=2, expected_error="BLOCKED: Stop the stack before consistency backup")
+    cli(env, "stop")
+    output = cli(env, "backup")
+    archive = next(line.removeprefix("BACKUP: ") for line in output.splitlines()
+                   if line.startswith("BACKUP: "))
+    destination = root / "restored-bundle"
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.restore(argparse.Namespace(archive=archive, destination=destination, stack_bundle=True))
+    private = destination / "private"
+    assert private.stat().st_uid == 0 and private.stat().st_mode & 0o777 == 0o700
+    with m.sqlite_read(private / "profiles.db", immutable=True) as db:
+        restored = load_artifact(db, **ref)
+        assert restored == artifact, "private revision differs after restore"
+        assert stage_status(db, **ref) == receipt, "receipt differs after restore"
+    with m.sqlite_read(destination / "state/hub.db", immutable=True) as db:
+        assert db.execute("SELECT value FROM ro_stack_ci").fetchall() == [("synthetic",)]
+    state = XrayState(stack)
+    assert (private / "xray-active.json").read_bytes() == state.config.read_bytes()
+    if state.exists():
+        assert (private / "xray.json").read_bytes() == state.path.read_bytes()
+    if stack.plan["nginx_conf"] is not None:
+        assert (private / "nginx-active.conf").read_bytes() == stack.plan["nginx_conf"].read_bytes()
+    cli(env, "start")
+    marker(stack.name)
+
+
+def render_fixture_agent(root, profile, probe, version, proofs):
+    """Run the agent's renderer against synthetic UCI on the runner."""
+    outbound, ssh = [item for item in probe["outbounds"] if item["protocol"] == "vless"]
+    values = dict(os.environ, TMPDIR=str(root), RO_AGENT_SCRIPT=str(m.ROOT / "files/usr/sbin/owrt-remote"),
+                  RO_AGENT_VERSION=version, RO_AGENT_LUCI=str(proofs[0].port),
+                  RO_AGENT_SSH=str(proofs[1].port),
+                  OWRT_REMOTE_CANDIDATE_TRANSPORT={"wss": "ws"}.get(profile["transport"], profile["transport"]),
+                  OWRT_REMOTE_CANDIDATE_HOST=outbound["settings"]["address"],
+                  OWRT_REMOTE_CANDIDATE_PORT=str(outbound["settings"]["port"]),
+                  OWRT_REMOTE_CANDIDATE_UUID=outbound["settings"]["id"],
+                  OWRT_REMOTE_CANDIDATE_SSH_UUID=ssh["settings"]["id"],
+                  OWRT_REMOTE_CANDIDATE_REVERSE_TAG=outbound["settings"]["reverse"]["tag"],
+                  OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG=ssh["settings"]["reverse"]["tag"],
+                  OWRT_REMOTE_CANDIDATE_SNI=profile["server_name"],
+                  OWRT_REMOTE_CANDIDATE_WS_PATH=profile.get("path", ""),
+                  OWRT_REMOTE_CANDIDATE_XHTTP_PATH=profile.get("path", ""),
+                  OWRT_REMOTE_CANDIDATE_GRPC_SERVICE=profile.get("service_name", ""),
+                  OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY=profile.get("public_key", ""),
+                  OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID=(profile.get("short_ids") or [""])[0])
+    runner = """source <(sed '/^cmd=/,$d' "$RO_AGENT_SCRIPT")
+uci_get() {
+    case "$1" in
+        admin_port) printf '%s' "$RO_AGENT_LUCI" ;;
+        ssh_port) printf '%s' "$RO_AGENT_SSH" ;;
+        *) printf '%s' "$2" ;;
+    esac
+}
+xray_reverse_finalrules_required() {
+    [[ "$RO_AGENT_VERSION" == "Xray 26.10.21" ]]
+}
+render_client_config --stdout
+"""
+    proc = subprocess.run(["bash", "-c", runner], env=values, capture_output=True, check=True, timeout=15)
+    return json.loads(proc.stdout)
+
+
+def verify_secure_reverse(root, config, module, project):
+    """Exercise real transport I/O with synthetic clients on loopback."""
+    version = "Xray " + os.environ["RO_CI_XRAY_VERSION"]
+    for transport in PROFILE_TRANSPORTS:
+        with adapter_check("secure-reverse", transport), contextlib.ExitStack() as resources:
+            directory = root / ("reverse-" + transport)
+            directory.mkdir(mode=0o700)
+            host = "reverse.example.invalid"
+            cert(directory / "tls", host)
+            (directory / "tls").chmod(0o755)
+            (directory / "tls/fullchain.pem").chmod(0o644)
+            sockets = [resources.enter_context(reserve()) for _ in range(7)]
+            backend, ingress, admin, ssh, _, _, decoy = (sock.getsockname()[1] for sock in sockets)
+            proofs = [Proof(sock) for sock in sockets[4:6]]
+            for proof in proofs:
+                resources.callback(proof.close)
+            profile = {"name": "ci-probe", "transport": transport, "port": backend,
+                       "server_name": host, "path": "/ci-reverse/", "service_name": "ci_reverse"}
+            if transport == "reality-tcp":
+                profile.update(server_names=[host], target_host="127.0.0.1", target_port=decoy)
+                reality_keys(profile)
+                sockets[6].close()
+                target = subprocess.Popen(
+                    ["openssl", "s_server", "-accept", f"127.0.0.1:{decoy}", "-tls1_3",
+                     "-alpn", "h2", "-cert", str(directory / "tls/fullchain.pem"),
+                     "-key", str(directory / "tls/privkey.pem"), "-quiet"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                def stop_target():
+                    target.terminate()
+                    target.wait(timeout=5)
+                resources.callback(stop_target)
+                deadline = time.monotonic() + 5
+                while True:
+                    assert target.poll() is None, "REALITY TLS target exited"
+                    try:
+                        with socket.create_connection(("127.0.0.1", decoy), timeout=0.2):
+                            break
+                    except OSError:
+                        assert time.monotonic() < deadline, "REALITY TLS target unavailable"
+                        time.sleep(0.1)
+            else:
+                profile.update(certificate_file="/etc/router-orchestrator/tls/fullchain.pem",
+                               key_file="/etc/router-orchestrator/tls/privkey.pem")
+
+            server, client = build_probe(profile, ingress_port=ingress, admin_port=admin,
+                                         ssh_port=ssh, admin_target=proofs[0].port,
+                                         ssh_target=proofs[1].port, core_version=version,
+                                         proxy_protocol=False)
+            invalid = json.loads(json.dumps(client))
+            for outbound in invalid["outbounds"]:
+                if outbound["protocol"] == "vless":
+                    outbound["settings"]["id"] = str(uuid.uuid4())
+            fixtures = (("server", server),
+                        ("client", render_fixture_agent(directory, profile, client, version, proofs)),
+                        ("invalid", render_fixture_agent(directory, profile, invalid, version, proofs)))
+            for name, document in fixtures:
+                path = directory / (name + ".json")
+                path.write_text(json.dumps(document))
+                os.chown(path, 0, m.HUB_GID)
+                path.chmod(0o640)
+
+            nginx_config = directory / "nginx.conf"
+            prefix = f"load_module {module};\n" if module else ""
+            nginx_config.write_text(prefix + "events {}\npid /var/run/nginx.pid;\n"
+                "stream { map $ssl_preread_server_name $backend { default \"\"; "
+                f"{host} 127.0.0.1:{backend}; }} "
+                f"server {{ listen 127.0.0.1:{ingress}; ssl_preread on; proxy_pass $backend; }} }}")
+            nginx_config.chmod(0o644)
+
+            def start(role, image, options, *command):
+                name = f"{project}-{transport}-{role}"
+                docker("run", "--detach", "--pull=never", "--name", name,
+                       "--label", f"{CI_LABEL}={project}", "--network=host", "--read-only",
+                       "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
+                       "--pids-limit=64", "--memory=192m", *options, image, *command)
+                resources.callback(docker, "rm", "-f", name)
+                return name
+
+            def start_core(role):
+                mounts = ("--mount", f"type=bind,src={directory / (role + '.json')},dst=/probe.json,readonly",
+                          "--mount", f"type=bind,src={directory / 'tls'},dst=/etc/router-orchestrator/tls,readonly")
+                return start(role, config["RO_XRAY_IMAGE"],
+                             ("--user", f"{m.HUB_UID}:{m.HUB_GID}",
+                              "--env", "SSL_CERT_FILE=/etc/router-orchestrator/tls/fullchain.pem",
+                              *(arg for path, options in XRAY_TMPFS.items()
+                                for arg in ("--tmpfs", path + ":" + options)), *mounts),
+                             "run", "-config", "/probe.json")
+
+            for sock in sockets[:4]:
+                sock.close()
+            nginx = start("ingress", config["RO_NGINX_IMAGE"],
+                          ("--user", f"{m.HUB_UID}:{m.HUB_GID}",
+                           "--entrypoint", "nginx", "--tmpfs", "/var/cache/nginx:mode=1777",
+                           "--tmpfs", "/var/run:mode=1777",
+                           "--mount", f"type=bind,src={nginx_config},dst=/etc/nginx/nginx.conf,readonly"),
+                          "-g", "daemon off;")
+            server_name = start_core("server")
+            invalid_name = start_core("invalid")
+
+            def running(*names):
+                assert docker("inspect", "--format", "{{.State.Status}}", *names).split() == [
+                    "running"] * len(names), "secure reverse fixture exited"
+
+            deadline = time.monotonic() + 10
+            while True:
+                running(nginx, server_name, invalid_name)
+                try:
+                    for port in (backend, ingress, admin, ssh):
+                        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                            pass
+                    break
+                except OSError:
+                    assert time.monotonic() < deadline, "reverse listeners did not open"
+                    time.sleep(0.2)
+
+            for _ in range(5):
+                running(nginx, server_name, invalid_name)
+                assert not any(proof_matches(port, proof)
+                               for port, proof in zip((admin, ssh), proofs)), "wrong UUID accepted"
+                time.sleep(1)
+
+            client_name = start_core("client")
+            deadline = time.monotonic() + 40
+            while True:
+                running(nginx, server_name, client_name)
+                if all(proof_matches(port, proof) for port, proof in zip((admin, ssh), proofs)):
+                    break
+                assert time.monotonic() < deadline, "missing authenticated admin or SSH reverse stream"
+                time.sleep(0.5)
+            print("Authenticated dual reverse through isolated ingress:", transport, flush=True)
 
 
 def verify_ingress(root, plan):
@@ -321,6 +549,7 @@ def adapter_detail(stage, check):
 # Executed inside the real HUB container. Never emit response bodies, exceptions,
 # or Python tracebacks. The host validates this record before forwarding it.
 HUB_CHECKS = """
+import argparse
 import contextlib
 import http.client
 import json
@@ -338,12 +567,16 @@ def fail(outcome):
     print("RO_ADAPTER_CHECK stage=%s check=%s %s" % (*current, outcome), flush=True)
     raise SystemExit(1)
 
-def request(expected, method, path, body=None, auth=False, csrf=None):
+def request(expected, method, path, body=None, auth=False, csrf=None, bearer=None, https=False):
     headers = {'Content-Type': 'application/json'}
     if auth:
         headers['Cookie'] = hub['SESSION_COOKIE'] + '=' + hub['session_token']()
     if csrf is not None:
         headers['X-Unified-Xray-CSRF'] = csrf
+    if bearer is not None:
+        headers['Authorization'] = 'Bearer ' + bearer
+    if https:
+        headers['X-Forwarded-Proto'] = 'https'
     conn = http.client.HTTPConnection('127.0.0.1', int(os.environ['OWRT_REMOTE_PORT']), timeout=90)
     try:
         conn.request(method, path, json.dumps(body) if body is not None else None, headers)
@@ -387,7 +620,7 @@ except Exception:
     fail("error=unexpected_error")
 """
     try:
-        docker("exec", project + "-hub", "python", "-c", program)
+        docker("exec", project + "-hub", "python", "-c", program, timeout=300)
     except subprocess.CalledProcessError as error:
         # Do not forward stderr, command arguments, or arbitrary stdout. Only
         # identifiers declared by the local test body may be reported.
@@ -406,7 +639,7 @@ except Exception:
 
 
 @contextlib.contextmanager
-def adapter_process(runtime, adapter_type=Adapter, *, expect_crash=False):
+def adapter_process(runtime, adapter_type=Adapter, *, expect_crash=False, listen_timeout=5):
     with adapter_check("adapter-start", "fork"):
         pid = os.fork()
     if pid == 0:
@@ -420,7 +653,7 @@ def adapter_process(runtime, adapter_type=Adapter, *, expect_crash=False):
     status = None
     try:
         with adapter_check("adapter-start", "listen"):
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + listen_timeout
             while True:
                 waited, result = os.waitpid(pid, os.WNOHANG)
                 if waited:
@@ -678,6 +911,207 @@ with check('sigkill-recovery', 'reconcile'):
             cli(env, "validate")
 
 
+def test_profile_lifecycle(env, config, project, backend_port, transport="wss", target_port=None):
+    stack = Stack(env, config)
+    state = XrayState(stack)
+    baseline = json.loads(state.config.read_bytes())
+    original_nginx = stack.plan["nginx_conf"]
+    original_nginx = original_nginx.read_bytes() if original_nginx is not None else None
+    external_nginx = env.parent / "fixture-nginx.conf"
+    external_bytes = external_nginx.read_bytes() if external_nginx.exists() else None
+    name = "lifecycle-" + transport
+    host = LIFECYCLE_HOST if transport == "wss" else f"{transport}.{LIFECYCLE_HOST}"
+    profile = {"name": name, "transport": transport, "server_name": host, "port": backend_port}
+    if transport == "reality-tcp":
+        profile.update(target_host="127.0.0.1", target_port=target_port, server_names=[host])
+    elif transport == "grpc":
+        profile["service_name"] = "lifecycle_ci"
+    else:
+        profile["path"] = "/lifecycle/"
+    class FixtureTrustAdapter(Adapter):
+        def handle(self, stack, release, records, request):
+            def docker_with_fixture_ca(*args, **kwargs):
+                if args[:2] == ("run", "-d") and transport != "reality-tcp":
+                    certificate = f"/etc/router-orchestrator/tls/{host}/fullchain.pem"
+                    tls = stack.config["RO_TLS_DIR"]
+                    options = ("--mount", f"type=bind,src={tls},dst=/etc/router-orchestrator/tls,readonly",
+                               "--env", "SSL_CERT_FILE=" + certificate)
+                    return docker(args[0], *options, *args[1:], **kwargs)
+                return docker(*args, **kwargs)
+
+            with patch("unified_xray_adapter.docker", docker_with_fixture_ca):
+                return super().handle(stack, release, records, request)
+
+    with adapter_process(stack, FixtureTrustAdapter):
+        hub_check(project, f"""
+base = '/api/secure-profiles/'
+ref = {{'profile_id':{name!r}, 'revision':1}}
+with check('profile-lifecycle', 'owner-and-csrf'):
+    request(401, 'POST', base + 'disable', {{**ref, 'confirmed': True}})
+    request(403, 'POST', base + 'disable', {{**ref, 'confirmed': True}}, auth=True)
+with check('profile-lifecycle', 'stage-and-publish'):
+    draft = ipc('transport.draft', profile={profile!r},
+                remote_host='127.0.0.1', label='Lifecycle CI', public_port={stack.plan['public']})
+    stage = ipc('transport.stage', **ref)['stage']
+    approval = dict(ref, stage_sha256=stage['stage_sha256'], confirmed=True)
+    rejected('transport.publish', **approval)
+    assert ipc('transport.approve', **approval)['stage']['approved_at']
+    result = ipc('transport.publish', **approval)
+    assert result['active'] and result['published']
+with check('profile-lifecycle', 'disable-and-rollback'):
+    assert not ipc('transport.disable', **ref, confirmed=True)['active']
+    assert ipc('transport.rollback', **ref, confirmed=True)['active']
+with check('profile-lifecycle', 'reactivate'):
+    assert not ipc('transport.disable', **ref, confirmed=True)['active']
+    assert ipc('transport.activate', **ref, confirmed=True)['active']
+""")
+    installed = json.loads(state.config.read_bytes())
+    assert installed["inbounds"][:len(baseline["inbounds"])] == baseline["inbounds"]
+    assert not installed["inbounds"][-1]["settings"]["clients"], "Probe credentials survived"
+    if transport != "wss":
+        with adapter_process(stack):
+            hub_check(project, f"""
+with check('profile-lifecycle', 'disable'):
+    assert not ipc('transport.disable', profile_id={name!r}, revision=1, confirmed=True)['active']
+""")
+        assert json.loads(state.config.read_bytes()) == baseline
+        return
+    with adapter_process(stack):
+        hub_check(project, """
+with check('profile-assignment', 'bind-router-identity'):
+    auth = json.loads(request(200, 'GET', '/api/auth/meta', auth=True))['auth']
+    csrf = auth['unified_xray_csrf']
+    router = {'id': 'ci-router'}
+    issue = {'router_id': router['id'], 'confirmed': True}
+    token = json.loads(request(200, 'POST', '/api/secure-profiles/identity', issue,
+                               auth=True, csrf=csrf, https=True))['router_token']
+    request(401, 'POST', '/api/agent/transport-profiles', router, bearer=token, https=True)
+    confirmation = '/api/agent/transport-identity'
+    assert json.loads(request(200, 'POST', confirmation, router, bearer=token, https=True))['identity_accepted']
+    request(200, 'POST', '/api/heartbeat', router, bearer=token, https=True)
+    rotated = json.loads(request(200, 'POST', '/api/secure-profiles/identity', issue,
+                                 auth=True, csrf=csrf, https=True))['router_token']
+    request(200, 'POST', '/api/heartbeat', router, bearer=token, https=True)
+    request(200, 'POST', confirmation, router, bearer=rotated, https=True)  # discard first confirmation
+    assert json.loads(request(200, 'POST', confirmation, router, bearer=rotated, https=True))['identity_accepted']
+    request(401, 'POST', '/api/heartbeat', router, bearer=token, https=True)
+    token = rotated
+    request(401, 'POST', '/api/heartbeat', router, bearer=hub['agent_token'](), https=True)
+with check('profile-assignment', 'individual-credentials'):
+    ref = {'profile_id': 'lifecycle-wss', 'revision': 1}
+    assign = {**issue, 'profiles': [ref]}
+    request(200, 'POST', '/api/secure-profiles/assign', assign, auth=True, csrf=csrf)
+    request(401, 'POST', '/api/agent/transport-profiles', router, bearer=hub['agent_token'](), https=True)
+    request(401, 'POST', '/api/agent/transport-profiles', {'id':'other-router'}, bearer=token, https=True)
+    profile, = json.loads(request(200, 'POST', '/api/agent/transport-profiles',
+                                  router, bearer=token, https=True))['profiles']
+    assert {key: profile[key] for key in ref} == ref
+    outbounds = profile['outbounds']
+    assert len(outbounds) == 2 and outbounds[0]['settings']['id'] != outbounds[1]['settings']['id']
+    rejected('transport.disable', **ref, confirmed=True)
+with check('profile-assignment', 'transport-task-replay'):
+    target = {**ref, 'assignment_id': profile['assignment_id']}
+    action = {**issue, 'action': 'stage', 'slot': '0', 'target': target}
+    owner_task = '/api/secure-profiles/agent_action'
+    agent_task = '/api/agent/transport-task'
+    request(400, 'POST', owner_task, {**action, 'target': {**target, 'revision': 2}}, auth=True, csrf=csrf)
+    request(202, 'POST', owner_task, action, auth=True, csrf=csrf)
+    claim = {**router, 'protocol': 2}
+    first = json.loads(request(200, 'POST', agent_task, claim, bearer=token, https=True))['task']
+    assert first == json.loads(request(200, 'POST', agent_task, claim, bearer=token, https=True))['task']
+    assert first['target'] == target
+    ack = {**router, 'task_id': first['task_id'], 'target': target, 'succeeded': True}
+    request(409, 'POST', agent_task, {**ack, 'target': None}, bearer=token, https=True)
+    request(200, 'POST', agent_task, ack, bearer=token, https=True)
+    request(200, 'POST', agent_task, ack, bearer=token, https=True)
+    assert json.loads(request(200, 'POST', agent_task, claim, bearer=token, https=True))['task'] is None
+    # The isolated fixture's enrollment listeners have no OpenWrt behind them.
+    # Exercise the host runtime removal independently of the HUB's live LuCI/SSH gate.
+    assert ipc('transport.unassign', **issue)['applied']
+""")
+    installed = json.loads(state.config.read_bytes())
+
+    class CrashAdapter(Adapter):
+        def restart(self, stack, release, container, routers, *, extra_ports=None):
+            super().restart(stack, release, container, routers, extra_ports=extra_ports)
+            if extra_ports == ():
+                os.kill(os.getpid(), signal.SIGKILL)
+
+    with adapter_process(stack, CrashAdapter, expect_crash=True):
+        hub_check(project, """
+with check('profile-recovery', 'crash-after-xray-restart'):
+    try:
+        ipc('transport.disable', profile_id='lifecycle-wss', revision=1, confirmed=True)
+    except RuntimeError as error:
+        assert str(error) in {'Invalid Xray response', 'Xray adapter unavailable'}
+    else:
+        fail('error=unexpected_success')
+""")
+    assert state.load()["profile_pending"] and state.config.read_bytes() != encode(installed)
+    with adapter_process(stack, listen_timeout=45):
+        hub_check(project, """
+with check('profile-recovery', 'catalog-and-runtime-recovered'):
+    assert ipc('status')['ready']
+    revisions = ipc('transport.list')['revisions']
+    assert next(item for item in revisions if item['profile_id'] == 'lifecycle-wss')['active']
+""")
+
+    class CommitCrashAdapter(Adapter):
+        def handle(self, stack, release, records, request):
+            if request.get("op") != "transport.disable":
+                return super().handle(stack, release, records, request)
+            save = XrayState.save
+
+            def crash_before_final_state(instance, record):
+                if record.get("profile_committed") and not record.get("profile_pending"):
+                    os.kill(os.getpid(), signal.SIGKILL)
+                save(instance, record)
+
+            with patch.object(XrayState, "save", crash_before_final_state):
+                return super().handle(stack, release, records, request)
+
+    with adapter_process(stack, CommitCrashAdapter, expect_crash=True):
+        hub_check(project, """
+with check('profile-recovery', 'crash-after-catalog-commit'):
+    try:
+        ipc('transport.disable', profile_id='lifecycle-wss', revision=1, confirmed=True)
+    except RuntimeError as error:
+        assert str(error) in {'Invalid Xray response', 'Xray adapter unavailable'}
+    else:
+        fail('error=unexpected_success')
+""")
+    assert state.load()["profile_pending"]
+    with adapter_process(stack, listen_timeout=45):
+        hub_check(project, """
+with check('profile-recovery', 'committed-disable-recovered'):
+    assert ipc('status')['ready']
+    revisions = ipc('transport.list')['revisions']
+    disabled = next(item for item in revisions if item['profile_id'] == 'lifecycle-wss')
+    assert disabled['published'] and not disabled['active']
+""")
+    assert json.loads(state.config.read_bytes()) == baseline
+    if original_nginx is not None:
+        assert stack.plan["nginx_conf"].read_bytes() == original_nginx
+    if external_bytes is not None:
+        assert external_nginx.read_bytes() == external_bytes
+
+
+def test_additional_profiles(env, config, project):
+    backend, target = choose_ports(2)
+    tls = env.parent / "tls" / f"reality-tcp.{LIFECYCLE_HOST}"
+    with subprocess.Popen(
+            ["openssl", "s_server", "-accept", f"127.0.0.1:{target}", "-tls1_3", "-alpn", "h2",
+             "-cert", str(tls / "fullchain.pem"), "-key", str(tls / "privkey.pem"), "-quiet"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as server:
+        try:
+            test_profile_lifecycle(env, config, project, backend, "reality-tcp", target)
+        finally:
+            server.terminate()
+            server.wait(timeout=5)
+    for transport in ("xhttp", "grpc"):
+        test_profile_lifecycle(env, config, project, choose_ports(1)[0], transport)
+
+
 def main():
     assert os.geteuid() == 0 and os.getenv("GITHUB_ACTIONS") == "true"
     assert os.getenv("RUNNER_ENVIRONMENT") == "github-hosted"
@@ -711,8 +1145,9 @@ def main():
                 if mode != "external-only":
                     expected["nginx"] = True
                 assert json.loads(cli(env, "status")) == expected
+                profile_port = choose_ports(1)[0] if backend == "unified_adapter" else None
                 if mode != "standalone":
-                    external_fixture(root, config, plan, module, project)
+                    external_fixture(root, config, plan, module, project, profile_port)
                 verify_ingress(root, plan)
                 marker(project, create=True)
                 cli(env, "stop")
@@ -727,6 +1162,13 @@ def main():
                 if backend == "unified_adapter":
                     with adapter_check("adapter-start", "fixture"):
                         test_adapter(env, config, project)
+                    with adapter_check("profile-lifecycle", "fixture"):
+                        test_profile_lifecycle(env, config, project, profile_port)
+                        if mode == "standalone":
+                            test_additional_profiles(env, config, project)
+                    with adapter_check("stack-backup", "private-catalog-and-journal"):
+                        verify_stack_backup(root, env, config)
+                    verify_secure_reverse(root, config, module, project)
                 if mode == "standalone":
                     with adapter_check("docker-manager", "release-recovery-and-rollback"):
                         test_release(root, env, config, project)

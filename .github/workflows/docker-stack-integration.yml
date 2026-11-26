@@ -6,12 +6,17 @@ on:
       - '.dockerignore'
       - 'docker/**'
       - 'docker-compose.yml'
+      - 'files/usr/sbin/owrt-remote'
       - 'tools/orchestrator_stack_config.py'
       - 'tools/orchestrator_edge_plan.py'
       - 'tools/orchestrator_setup_profiles.py'
+      - 'tools/rehearse_secure_reverse.py'
       - 'tests/docker_stack_integration_ci.py'
       - 'tests/test_docker_stack_runtime.py'
+      - 'tests/test_docker_backup_recovery.py'
       - 'tests/test_unified_xray_adapter.py'
+      - 'tests/test_openwrt_transport_pilot.py'
+      - 'tests/openwrt_transport_lifecycle_fixture.sh'
       - 'vps/**'
   workflow_dispatch:
 permissions:
@@ -41,6 +46,9 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p test_docker_stack_runtime.py
           python3 -m unittest discover -s tests -p test_orchestrator_stack_config.py
+          python3 -m unittest discover -s tests -p test_docker_backup_recovery.py
+          python3 -m unittest discover -s tests -p test_openwrt_transport_pilot.py
+          sh -n tests/openwrt_transport_lifecycle_fixture.sh
           sudo env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_unified_xray_adapter.py
       - name: Verify pinned Docker Compose plugin
         run: |

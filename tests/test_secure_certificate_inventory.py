@@ -4,10 +4,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docker"))
 from secure_certificate_inventory import inspect_pair, find_certificate, mounted_certificate
 from transport_profiles import ProfileError
+from unified_transport_catalog import tls_binding
 
 
 @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required")
@@ -39,6 +41,19 @@ class CertificateInventoryTests(unittest.TestCase):
         self.assertEqual(selected["key_file"], "/etc/router-orchestrator/tls/key.pem")
         with self.assertRaises(ProfileError):
             mounted_certificate("uncovered.example.org", root=self.root)
+
+    def test_stage_tls_binding_checks_the_exact_mounted_pair(self):
+        name = "node.lab.example.org"
+        stack = SimpleNamespace(config={"RO_TLS_DIR": str(self.root)})
+        profile = dict(mounted_certificate(name, root=self.root), transport="grpc", server_name=name)
+        original = tls_binding(stack, profile)
+        with self.cert.open("ab") as stream:
+            stream.write(b"\n")
+        renewed = tls_binding(stack, profile)
+        self.assertNotEqual(original["certificate_file"], renewed["certificate_file"])
+        self.assertEqual(original["key_file"], renewed["key_file"])
+        with self.assertRaises(ProfileError):
+            tls_binding(stack, dict(profile, server_name="uncovered.example.org"))
 
     def test_expiry_root_and_mismatched_key(self):
         with self.assertRaises(ProfileError):

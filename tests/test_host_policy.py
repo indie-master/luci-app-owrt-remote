@@ -492,13 +492,17 @@ wan_prepare
         result = self.run_shell('''
 curl() {
     printf '<%s>\n' "$@" >"$TEST_ROOT/curl"
+    for arg in "$@"; do
+        case "$arg" in @*/auth) cat "${arg#@}" >"$TEST_ROOT/header" ;; esac
+    done
     printf '{"ok":true}'
 }
 post_json http://hub.example/api/heartbeat test-token "$TEST_ROOT/payload"
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         args = (self.directory / "curl").read_text()
-        self.assertIn("<Authorization: Bearer test-token>", args)
+        self.assertNotIn("test-token", args)
+        self.assertEqual((self.directory / "header").read_text(), "Authorization: Bearer test-token\n")
         self.assertIn("<--data-binary>", args)
         self.assertNotIn("<--location>", args)
 

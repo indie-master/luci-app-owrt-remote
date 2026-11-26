@@ -76,9 +76,7 @@ def available_profiles(db):
     return [dict(zip(fields, row)) for row in rows]
 
 
-def set_desired_profiles(db, router_id, profiles):
-    """Save explicit desired order for exactly one router; does NOT activate it."""
-    _identifier(router_id)
+def profile_selection(profiles):
     if not isinstance(profiles, list) or not 1 <= len(profiles) <= 3:
         raise ProfileError("select a primary and at most two fallback profiles")
     seen = set()
@@ -86,9 +84,17 @@ def set_desired_profiles(db, router_id, profiles):
         if not isinstance(item, dict) or set(item) != {"profile_id","revision"}:
             raise ProfileError("invalid profile selection")
         key = (_identifier(item["profile_id"]), item["revision"])
-        if type(key[1]) is not int or key[1] < 1 or key in seen:
+        if type(key[1]) is not int or not 1 <= key[1] <= 2**63 - 1 or key in seen:
             raise ProfileError("invalid or duplicate revision")
         seen.add(key)
+    return seen
+
+
+def set_desired_profiles(db, router_id, profiles):
+    """Save explicit desired order for exactly one router; does NOT activate it."""
+    if not isinstance(router_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", router_id):
+        raise ProfileError("invalid router identifier")
+    for key in profile_selection(profiles):
         if not db.execute("""SELECT 1 FROM secure_profile_revisions
                 WHERE profile_id=? AND revision=? AND published=1""", key).fetchone():
             raise ProfileError("profile is not published")
@@ -98,7 +104,8 @@ def set_desired_profiles(db, router_id, profiles):
 
 
 def desired_profiles(db, router_id):
-    _identifier(router_id)
+    if not isinstance(router_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", router_id):
+        raise ProfileError("invalid router identifier")
     row = db.execute("SELECT desired_profiles FROM secure_router_preferences WHERE router_id=?",
                      (router_id,)).fetchone()
     return json.loads(row[0]) if row else []
