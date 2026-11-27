@@ -24,7 +24,8 @@ import manager as m
 from docker_stack_integration_ci import AdapterCheckFailed, adapter_check, hub_check
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
-from unified_transport_runtime import Runtime as TransportRuntime
+from unified_transport_runtime import Runtime as TransportRuntime, receipt
+from secure_profile_store import connection, load_artifact
 from unified_xray_state import XrayState, assignment_id, encode
 
 HUB_SPEC = importlib.util.spec_from_file_location("unified_xray_test_hub", ROOT / "vps/owrt-remote-hub.py")
@@ -40,6 +41,33 @@ def router(port=30100):
 
 
 class CIDiagnosticsTests(unittest.TestCase):
+    def test_runtime_error_reports_only_a_known_ipc_outcome(self):
+        body = "with check('profile-lifecycle', 'publish'):\n    ipc('transport.publish')"
+        for message, outcome in (
+            ("Xray adapter rejected the operation", "ipc_rejected"),
+            ("Xray adapter unavailable", "ipc_unavailable"),
+            ("Invalid Xray response", "ipc_invalid_response"),
+            ("Xray adapter peer verification failed", "ipc_peer_rejected"),
+            ("private runtime detail", "runtime_error"),
+        ):
+            def execute_child(*args, **kwargs):
+                program = args[-1]
+                result = subprocess.run(
+                    [sys.executable, "-c", "import runpy\n"
+                     f"def ipc(*args, **kwargs): raise RuntimeError({message!r})\n"
+                     "runpy.run_path = lambda _: {'unified_xray_request': ipc}\n" + program],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.stderr, "")
+                result.check_returncode()
+
+            with self.subTest(outcome=outcome), patch(
+                "docker_stack_integration_ci.docker", side_effect=execute_child,
+            ), self.assertRaises(AdapterCheckFailed) as caught:
+                hub_check("fixture", body)
+            self.assertEqual(str(caught.exception),
+                             f"stage=profile-lifecycle check=publish error={outcome}")
+
     def test_http_status_survives_failed_docker_exec(self):
         body = "with check('registration', 'create-wss'):\n    pass"
         error = subprocess.CalledProcessError(
@@ -255,6 +283,43 @@ class TransactionTests(unittest.TestCase):
     def prepare(self):
         self.token = uuid.uuid4().hex
         return self.call("apply_config", router_id="demo", router=self.spec, transaction=self.token)
+
+    def test_profile_publish_requires_approval_and_commits_matching_receipt(self):
+        host = "lifecycle.example.invalid"
+        tls = self.root / "tls"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+             "-subj", "/CN=" + host, "-addext", "subjectAltName=DNS:" + host,
+             "-keyout", str(tls / "privkey.pem"), "-out", str(tls / "fullchain.pem")],
+            check=True, capture_output=True, timeout=10,
+        )
+        ref = {"profile_id": "lifecycle-wss", "revision": 1}
+        profile = {"name": ref["profile_id"], "transport": "wss", "server_name": host,
+                   "port": 30123, "path": "/lifecycle/"}
+        with (
+            patch("unified_transport_catalog.live_tcp_ports", return_value=set()),
+            patch("unified_transport_runtime.live_tcp_ports", return_value=set()),
+            patch.object(self.stack, "inspect", return_value={"xray": self.record}),
+            patch.object(TransportRuntime, "prove") as prove,
+        ):
+            self.call("transport.draft", profile=profile, label="Lifecycle test",
+                      remote_host="127.0.0.1", public_port=self.stack.plan["public"])
+            stage = self.call("transport.stage", **ref)["stage"]
+            approval = dict(ref, stage_sha256=stage["stage_sha256"], confirmed=True)
+            with self.assertRaisesRegex(ValueError, "current stage must be approved"):
+                self.call("transport.publish", **approval)
+            prove.assert_not_called()
+            self.assertEqual(self.state.config.read_bytes(), self.baseline)
+            self.call("transport.approve", **approval)
+            self.assertEqual(self.call("transport.publish", **approval),
+                             {"published": True, "active": True, "applied": True})
+            prove.assert_called_once()
+        record = self.state.load()
+        self.assertIsNone(record["profile_pending"])
+        self.assertTrue(record["profile_committed"])
+        with connection(self.stack.transport_store) as db:
+            self.assertEqual(receipt(db), record["profile_committed"])
+            self.assertTrue(load_artifact(db, **ref)[2])
 
     def test_validate_apply_commit_delete_and_restore(self):
         initial_material = self.stack.material()

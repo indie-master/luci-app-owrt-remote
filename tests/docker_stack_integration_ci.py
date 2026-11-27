@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from stack_runtime import Ingress, Stack, docker, websocket
 from secure_profile_store import connection, load_artifact, reality_keys, save_draft
 from secure_reverse_probe import build_probe
 from rehearse_secure_reverse import Proof, proof_matches, reserve
+from transport_profiles import ProfileError
 from orchestrator_stack_config import STREAM_MODULE, render_external, render_internal, stack_plan
 from unified_xray_adapter import Adapter, XRAY_TMPFS, socket_address
 from unified_xray_state import XrayState, encode
@@ -519,6 +521,10 @@ def error_category(error):
         return "connection_failed"
     if isinstance(error, OSError):
         return "os_error"
+    if isinstance(error, sqlite3.Error):
+        return "sqlite_error"
+    if isinstance(error, ProfileError):
+        return "profile_validation"
     if isinstance(error, m.Blocked):
         return "blocked"
     if isinstance(error, AssertionError):
@@ -612,8 +618,13 @@ except TimeoutError:
     fail("error=timeout")
 except (OSError, http.client.HTTPException):
     fail("error=connection_failed")
-except RuntimeError:
-    fail("error=runtime_error")
+except RuntimeError as error:
+    fail({
+        "Xray adapter rejected the operation": "error=ipc_rejected",
+        "Xray adapter unavailable": "error=ipc_unavailable",
+        "Invalid Xray response": "error=ipc_invalid_response",
+        "Xray adapter peer verification failed": "error=ipc_peer_rejected",
+    }.get(str(error), "error=runtime_error"))
 except (ValueError, KeyError, TypeError):
     fail("error=invalid_response")
 except Exception:
@@ -630,7 +641,8 @@ except Exception:
             r"RO_ADAPTER_CHECK stage=([a-z-]+) check=([a-z0-9-]+) "
             r"(expected_http=[1-5][0-9]{2} actual_http=[0-9]{3}|"
             r"error=(?:assertion_failed|timeout|connection_failed|runtime_error|invalid_response|"
-            r"unexpected_error|ipc_unavailable|unexpected_success))\n?",
+            r"unexpected_error|ipc_rejected|ipc_unavailable|ipc_invalid_response|"
+            r"ipc_peer_rejected|unexpected_success))\n?",
             error.stdout or "",
         )
         if match and (match[1], match[2]) in declared:
@@ -929,6 +941,14 @@ def test_profile_lifecycle(env, config, project, backend_port, transport="wss", 
     else:
         profile["path"] = "/lifecycle/"
     class FixtureTrustAdapter(Adapter):
+        def test_config(self, stack, release, data):
+            with adapter_detail("profile-lifecycle", "xray-config"):
+                return super().test_config(stack, release, data)
+
+        def restart(self, stack, release, container, routers, *, extra_ports=None):
+            with adapter_detail("profile-lifecycle", "xray-restart"):
+                return super().restart(stack, release, container, routers, extra_ports=extra_ports)
+
         def handle(self, stack, release, records, request):
             def docker_with_fixture_ca(*args, **kwargs):
                 if args[:2] == ("run", "-d") and transport != "reality-tcp":
@@ -940,7 +960,24 @@ def test_profile_lifecycle(env, config, project, backend_port, transport="wss", 
                 return docker(*args, **kwargs)
 
             with patch("unified_xray_adapter.docker", docker_with_fixture_ca):
-                return super().handle(stack, release, records, request)
+                try:
+                    return super().handle(stack, release, records, request)
+                except Exception as error:
+                    operation = request.get("op")
+                    if isinstance(operation, str) and operation in {
+                        "transport.draft", "transport.stage", "transport.approve", "transport.publish",
+                        "transport.disable", "transport.rollback", "transport.activate",
+                    }:
+                        if isinstance(error, ProfileError) and str(error) == (
+                            "current stage must be approved before publication"
+                        ):
+                            raise
+                        outcome = error_category(error)
+                        if isinstance(error, m.Blocked) and str(error) == "Ingress reverse probe failed":
+                            outcome = "reverse_proof_failed"
+                        print(f"stage=profile-lifecycle check={operation.removeprefix('transport.')} "
+                              f"error={outcome}", file=sys.stderr, flush=True)
+                    raise
 
     with adapter_process(stack, FixtureTrustAdapter):
         hub_check(project, f"""
@@ -949,13 +986,17 @@ ref = {{'profile_id':{name!r}, 'revision':1}}
 with check('profile-lifecycle', 'owner-and-csrf'):
     request(401, 'POST', base + 'disable', {{**ref, 'confirmed': True}})
     request(403, 'POST', base + 'disable', {{**ref, 'confirmed': True}}, auth=True)
-with check('profile-lifecycle', 'stage-and-publish'):
-    draft = ipc('transport.draft', profile={profile!r},
-                remote_host='127.0.0.1', label='Lifecycle CI', public_port={stack.plan['public']})
+with check('profile-lifecycle', 'draft'):
+    ipc('transport.draft', profile={profile!r},
+        remote_host='127.0.0.1', label='Lifecycle CI', public_port={stack.plan['public']})
+with check('profile-lifecycle', 'stage'):
     stage = ipc('transport.stage', **ref)['stage']
-    approval = dict(ref, stage_sha256=stage['stage_sha256'], confirmed=True)
+approval = dict(ref, stage_sha256=stage['stage_sha256'], confirmed=True)
+with check('profile-lifecycle', 'reject-unapproved-publish'):
     rejected('transport.publish', **approval)
+with check('profile-lifecycle', 'approve'):
     assert ipc('transport.approve', **approval)['stage']['approved_at']
+with check('profile-lifecycle', 'publish'):
     result = ipc('transport.publish', **approval)
     assert result['active'] and result['published']
 with check('profile-lifecycle', 'disable-and-rollback'):
