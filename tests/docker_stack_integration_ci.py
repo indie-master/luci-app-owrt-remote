@@ -238,6 +238,18 @@ def verify_stack_backup(root, env, config):
     marker(stack.name)
 
 
+def fixture_tls_client(document):
+    """Use the runner's mounted test CA with Xray's system trust opt-in."""
+    result = json.loads(json.dumps(document))
+    for outbound in result["outbounds"]:
+        stream = outbound.get("streamSettings", {})
+        if stream.get("security") == "tls":
+            tls = stream["tlsSettings"]
+            assert tls.get("allowInsecure", False) is False
+            tls["useSystemCA"] = True
+    return result
+
+
 def render_fixture_agent(root, profile, probe, version, proofs):
     """Run the agent's renderer against synthetic UCI on the runner."""
     outbound, ssh = [item for item in probe["outbounds"] if item["protocol"] == "vless"]
@@ -271,7 +283,7 @@ xray_reverse_finalrules_required() {
 render_client_config --stdout
 """
     proc = subprocess.run(["bash", "-c", runner], env=values, capture_output=True, check=True, timeout=15)
-    return json.loads(proc.stdout)
+    return fixture_tls_client(json.loads(proc.stdout))
 
 
 def verify_secure_reverse(root, config, module, project):
@@ -1060,7 +1072,14 @@ def test_profile_lifecycle(env, config, project, backend_port, transport="wss", 
                     probe_id = result.strip()
                 return result
 
-            with patch("unified_xray_adapter.docker", docker_with_fixture_ca):
+            def build_fixture_probe(*args, **kwargs):
+                server, client = build_probe(*args, **kwargs)
+                return server, fixture_tls_client(client)
+
+            with (
+                patch("unified_xray_adapter.docker", docker_with_fixture_ca),
+                patch("unified_transport_runtime.build_probe", build_fixture_probe),
+            ):
                 try:
                     return super().handle(stack, release, records, request)
                 except Exception as error:

@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
 from docker_stack_integration_ci import (AdapterCheckFailed, adapter_check, adapter_failure_sites,
-                                         fixture_probe_summary, hub_check, probe_log_categories)
+                                         fixture_probe_summary, fixture_tls_client, hub_check,
+                                         probe_log_categories)
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
 from unified_transport_runtime import Runtime as TransportRuntime, receipt
@@ -42,6 +43,24 @@ def router(port=30100):
 
 
 class CIDiagnosticsTests(unittest.TestCase):
+    def test_fixture_ca_opt_in_is_limited_to_tls_client_copy(self):
+        tls = {"protocol": "vless", "streamSettings": {
+            "security": "tls", "tlsSettings": {
+                "serverName": "fixture.invalid", "allowInsecure": False}}}
+        other = {"protocol": "vless", "streamSettings": {
+            "security": "reality", "realitySettings": {"serverName": "fixture.invalid"}}}
+        local = {"protocol": "freedom"}
+        original = {"outbounds": [tls, other, local]}
+        result = fixture_tls_client(original)
+        self.assertEqual(result["outbounds"][0]["streamSettings"]["tlsSettings"],
+                         {"serverName": "fixture.invalid", "allowInsecure": False,
+                          "useSystemCA": True})
+        self.assertEqual(result["outbounds"][1:], original["outbounds"][1:])
+        self.assertNotIn("useSystemCA", tls["streamSettings"]["tlsSettings"])
+        tls["streamSettings"]["tlsSettings"]["allowInsecure"] = True
+        with self.assertRaises(AssertionError):
+            fixture_tls_client(original)
+
     def test_probe_diagnostics_never_forward_raw_log_text(self):
         sample = "x509: certificate signed by unknown authority PRIVATE-TEST-VALUE"
         self.assertEqual(probe_log_categories(sample), "tls-trust")
