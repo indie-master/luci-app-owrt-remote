@@ -118,6 +118,55 @@ class CIDiagnosticsTests(unittest.TestCase):
                 self.assertTrue(caught.exception.__suppress_context__)
 
 
+class ProfileProbeMergeTests(unittest.TestCase):
+    def test_existing_untagged_inbounds_and_unique_target(self):
+        item = {"profile": {"name": "fixture"}, "revision": 1,
+                "public_port": 9443, "remote_host": "127.0.0.1"}
+        baseline = {"port": 18090, "settings": {"clients": []}}
+        target = {"tag": "ro-profile-fixture-1", "port": 30123,
+                  "settings": {"clients": []}}
+        probe = {"inbounds": [{"settings": {"clients": [{"id": "test-client"}]}},
+                              {"tag": "probe-fixture", "port": 31001}],
+                 "routing": {"rules": []}}
+        for entries, unique in (
+            ([baseline, target], True),
+            ([baseline], False),
+            ([baseline, target, target], False),
+        ):
+            with self.subTest(count=len(entries), unique=unique):
+                adapter, state = Mock(), Mock()
+                adapter.test_config.side_effect = m.Blocked("test validation boundary")
+                runtime = TransportRuntime(adapter, Mock(), {}, state, "fixture", Mock())
+                data = encode({"inbounds": entries, "routing": {"rules": []}})
+                sockets = [Mock() for _ in range(4)]
+                for sock, port in zip(sockets, (31001, 31002, 31003, 31004)):
+                    sock.getsockname.return_value = ("127.0.0.1", port)
+                with (
+                    patch("unified_transport_runtime.reserve", side_effect=sockets),
+                    patch("unified_transport_runtime.Proof"),
+                    patch("unified_transport_runtime.build_probe",
+                          return_value=(probe, {"outbounds": []})),
+                ):
+                    with self.assertRaisesRegex(
+                        m.Blocked, "test validation boundary" if unique else
+                        "Expected exactly one profile probe listener",
+                    ):
+                        runtime.prove({"routers": {}}, [item], data, item,
+                                      {"token": "b" * 32})
+                state.save.assert_not_called()
+                adapter.restart.assert_not_called()
+                self.assertEqual(json.loads(data)["inbounds"], entries)
+                if unique:
+                    adapter.test_config.assert_called_once()
+                    trial = json.loads(adapter.test_config.call_args.args[2])
+                    self.assertEqual(trial["inbounds"][0], baseline)
+                    self.assertEqual(trial["inbounds"][1]["settings"]["clients"],
+                                     [{"id": "test-client"}])
+                    self.assertEqual(trial["inbounds"][2], probe["inbounds"][1])
+                else:
+                    adapter.test_config.assert_not_called()
+
+
 class WebAuthorizationTests(unittest.TestCase):
     def test_stage_and_approval_require_owner_then_csrf(self):
         for operation in ("stage", "approve"):
