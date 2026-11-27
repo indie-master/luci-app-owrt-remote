@@ -1138,8 +1138,10 @@ def test_core_restart(stack, project, profile_id):
 
         def run_core_job(action, version="", *, expected="success"):
             hub_check(project, f"""
-with check('core-lifecycle', '{action}-{expected}-and-fleet-recovery'):
+with check('core-lifecycle', '{action}-{expected}-submit'):
     job = ipc('core.start', action={action!r}, version={version!r}, confirmed=True)
+    assert job['job_id']
+with check('core-lifecycle', '{action}-{expected}-and-fleet-recovery'):
     deadline = time.monotonic() + 175
     while time.monotonic() < deadline:
         # The heartbeat is synthetic. Reverse LuCI and SSH travel through Xray.
@@ -1149,7 +1151,10 @@ with check('core-lifecycle', '{action}-{expected}-and-fleet-recovery'):
         try:
             result = ipc('core.job', job_id=job['job_id'])['job']
         except RuntimeError as error:
-            if str(error) not in {{'Xray adapter rejected the operation', 'Invalid Xray response'}}:
+            # The journal/env/container snapshots can race during a core
+            # switch. Retry only the read-only status call, never core.start.
+            if str(error) not in {{'Xray adapter rejected the operation', 'Invalid Xray response',
+                                   'Xray adapter unavailable'}}:
                 raise
             time.sleep(1)
             continue
