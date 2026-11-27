@@ -1,5 +1,6 @@
 """Offline transaction and IPC contract regressions using private synthetic state."""
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -26,7 +27,7 @@ from docker_stack_integration_ci import (AdapterCheckFailed, adapter_check, adap
                                          probe_log_categories)
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
-from unified_transport_runtime import Runtime as TransportRuntime, receipt
+from unified_transport_runtime import Runtime as TransportRuntime, receipt, reserve_probe_sockets
 from secure_profile_store import connection, load_artifact
 from unified_xray_state import XrayState, assignment_id, encode
 
@@ -150,8 +151,37 @@ class CIDiagnosticsTests(unittest.TestCase):
 
 
 class ProfileProbeMergeTests(unittest.TestCase):
+    def test_probe_port_reservation_excludes_candidate_ports_and_cleans_up(self):
+        sockets = [Mock() for _ in range(8)]
+        ports = (30123, 9443, 30124, 31001, 31001, 31002, 31003, 31004)
+        for sock, port in zip(sockets, ports):
+            sock.getsockname.return_value = ("127.0.0.1", port)
+        with patch("unified_transport_runtime.reserve", side_effect=sockets) as reserve:
+            with contextlib.ExitStack() as resources:
+                accepted = reserve_probe_sockets(resources, {30123, 9443, 30124})
+                self.assertEqual(accepted, [sockets[i] for i in (3, 5, 6, 7)])
+                self.assertEqual(reserve.call_count, 8)
+                for i in (0, 1, 2, 4):
+                    sockets[i].close.assert_called_once()
+                for sock in accepted:
+                    sock.close.assert_not_called()
+            for sock in sockets:
+                sock.close.assert_called_once()
+
+    def test_probe_port_reservation_exhaustion_closes_partial_allocation(self):
+        sockets = [Mock() for _ in range(32)]
+        for i, sock in enumerate(sockets):
+            sock.getsockname.return_value = ("127.0.0.1", 31001 if i == 0 else 30123)
+        with patch("unified_transport_runtime.reserve", side_effect=sockets) as reserve:
+            with self.assertRaisesRegex(m.Blocked, "Unable to reserve four distinct"):
+                with contextlib.ExitStack() as resources:
+                    reserve_probe_sockets(resources, {30123})
+            self.assertEqual(reserve.call_count, 32)
+        for sock in sockets:
+            sock.close.assert_called_once()
+
     def test_existing_untagged_inbounds_and_unique_target(self):
-        item = {"profile": {"name": "fixture"}, "revision": 1,
+        item = {"profile": {"name": "fixture", "port": 30123}, "revision": 1,
                 "public_port": 9443, "remote_host": "127.0.0.1"}
         baseline = {"port": 18090, "settings": {"clients": []}}
         target = {"tag": "ro-profile-fixture-1", "port": 30123,

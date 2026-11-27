@@ -45,6 +45,28 @@ def receipt(db):
     return row[0] if row else None
 
 
+def reserve_probe_sockets(resources, excluded):
+    """Allocate four distinct temporary ports outside the candidate listeners."""
+    excluded = set(excluded)
+    sockets = []
+    for _ in range(32):
+        sock = reserve()
+        try:
+            port = sock.getsockname()[1]
+            if port < 1024 or port in excluded:
+                sock.close()
+                continue
+        except Exception:
+            sock.close()
+            raise
+        resources.callback(sock.close)
+        excluded.add(port)
+        sockets.append(sock)
+        if len(sockets) == 4:
+            return sockets
+    raise m.Blocked("Unable to reserve four distinct profile probe ports")
+
+
 class Runtime:
     def __init__(self, adapter, stack, release, state, container, docker):
         self.adapter = adapter
@@ -138,10 +160,11 @@ class Runtime:
         profile = item["profile"]
         token = pending["token"]
         version = self.docker("exec", self.container, "xray", "version")
+        trial = json.loads(data)
+        excluded = {entry["port"] for entry in trial["inbounds"]}
+        excluded.update((profile["port"], item["public_port"]))
         with contextlib.ExitStack() as resources:
-            sockets = [reserve() for _ in range(4)]
-            for sock in sockets:
-                resources.callback(sock.close)
+            sockets = reserve_probe_sockets(resources, excluded)
             admin, ssh, admin_target, ssh_target = [sock.getsockname()[1] for sock in sockets]
             proof_admin, proof_ssh = [Proof(sock) for sock in sockets[2:]]
             resources.callback(proof_admin.close)
@@ -150,7 +173,6 @@ class Runtime:
                 profile, ingress_port=item["public_port"], admin_port=admin, ssh_port=ssh,
                 admin_target=admin_target, ssh_target=ssh_target, core_version=version,
                 proxy_protocol=False, probe_name="trial-" + token[:12])
-            trial = json.loads(data)
             matches = [entry for entry in trial["inbounds"] if entry.get("tag") == profile_tag(item)]
             m.require(len(matches) == 1, "Expected exactly one profile probe listener")
             live = matches[0]
