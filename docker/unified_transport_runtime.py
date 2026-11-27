@@ -151,9 +151,11 @@ class Runtime:
                 admin_target=admin_target, ssh_target=ssh_target, core_version=version,
                 proxy_protocol=False, probe_name="trial-" + token[:12])
             trial = json.loads(data)
-            live = next(entry for entry in trial["inbounds"] if entry["tag"] == profile_tag(item))
+            matches = [entry for entry in trial["inbounds"] if entry.get("tag") == profile_tag(item)]
+            m.require(len(matches) == 1, "Expected exactly one profile probe listener")
+            live = matches[0]
             live["settings"]["clients"].extend(server["inbounds"][0]["settings"]["clients"])
-            tags = {entry["tag"] for entry in trial["inbounds"]}
+            tags = {entry.get("tag") for entry in trial["inbounds"]}
             m.require(not tags.intersection(entry["tag"] for entry in server["inbounds"][1:]),
                       "Probe listener tag conflicts")
             trial["inbounds"].extend(server["inbounds"][1:])
