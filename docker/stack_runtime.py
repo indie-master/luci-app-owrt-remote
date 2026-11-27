@@ -190,6 +190,8 @@ class Stack:
         runtime = None
         if release:
             config["RO_STACK_REVISION"] = release["revision"]
+            if "nginx_revision" in release:
+                config["RO_STACK_NGINX_REVISION"] = release["nginx_revision"]
             config["RO_XRAY_IMAGE"] = release["images"]["xray"]
             if "nginx" in self.services:
                 config["RO_NGINX_IMAGE"] = release["images"]["nginx"]
@@ -314,7 +316,7 @@ class Stack:
                 routes[name] = ingress["backend_port"]
         return render_internal(dict(plan, routes=routes))
 
-    def release(self, *, recover_xray=False):
+    def release(self, *, recover_xray=False, nginx_revision=None):
         images = {}
         for service in self.services:
             reference = self.config[IMAGES[service]]
@@ -332,12 +334,17 @@ class Stack:
                     m.SOURCE_LABEL, "")), "HUB image is missing its source revision")
             images[service] = info["Id"]
         release = {"config": self.config, "images": images, "material": self.material(recover_xray=recover_xray)}
+        if nginx_revision is not None:
+            m.require("nginx" in self.services and re.fullmatch(r"[a-f0-9]{64}", nginx_revision),
+                      "Invalid retained nginx revision")
+            release["nginx_revision"] = nginx_revision
         release["revision"] = digest(release)
         release["model"] = self.model(release)
         return release
 
     def verify_release(self, release, *, recover_xray=False):
-        m.require(self.config == release["config"] and self.release(recover_xray=recover_xray) == release,
+        m.require(self.config == release["config"] and self.release(recover_xray=recover_xray,
+                      nginx_revision=release.get("nginx_revision")) == release,
                   "Stack images, configuration or rendered model changed")
 
     def preflight(self, release):
@@ -375,7 +382,8 @@ class Stack:
                       item["Name"] == "/" + self.name + "-" + service,
                       "Unexpected container in the stack project")
             m.require(any(item["Image"] == r["images"].get(service) and
-                          (service == "hub" or labels.get(REVISION) == r["revision"]) for r in releases) and
+                          (service == "hub" or labels.get(REVISION) ==
+                           (r.get("nginx_revision", r["revision"]) if service == "nginx" else r["revision"])) for r in releases) and
                       (self.owns_hub(item) if service == "hub" else labels.get(OWNER) == self.owner),
                       "Unexpected container in the stack project")
             result[service] = item
@@ -542,8 +550,8 @@ def recovered(stack, record):
         if source:
             m.require(observed_schema == tx["target_schema"],
                       "Committed SQLite schema changed after restart")
-        stack.save({"current": target, "previous": source, "previous_schema": tx.get("schema"),
-                    "snapshot": tx.get("snapshot"), "pending": None})
+        stack.save(dict(record, current=target, previous=source, previous_schema=tx.get("schema"),
+                        snapshot=tx.get("snapshot"), pending=None))
         return
 
     m.require(source is not None and stack.config == source["config"],
@@ -567,7 +575,8 @@ def update(stack, record, candidate, *, rollback=False, acknowledge=False):
         m.require(candidate.config["RO_XRAY_CONFIG_DIR"] == stack.config["RO_XRAY_CONFIG_DIR"],
                   "An enrolled stack must retain its managed Xray config directory")
     stack.verify_release(source)
-    target = candidate.release()
+    target = candidate.release(nginx_revision=record["previous"].get("nginx_revision")
+                               if rollback else None)
     m.require(source["material"] != target["material"] or source["images"] != target["images"],
               "Candidate does not change images or staged inputs")
     if source["images"]["hub"] != target["images"]["hub"]:
@@ -592,8 +601,8 @@ def update(stack, record, candidate, *, rollback=False, acknowledge=False):
             m.require(tx["target_schema"] == schema, "Rollback changed the SQLite schema")
         stack.save(dict(record, pending=tx))
         stack.publish(candidate.config)
-        stack.save({"current": target, "previous": source, "previous_schema": schema,
-                    "snapshot": tx["snapshot"], "pending": None})
+        stack.save(dict(record, current=target, previous=source, previous_schema=schema,
+                        snapshot=tx["snapshot"], pending=None))
     except Exception:
         # Read the journal and active env again in case an atomic rename already succeeded.
         persisted = json.loads(stack.journal.read_text())
@@ -654,7 +663,11 @@ def run(args):
             stack.inspect()
             print("Stack is uninitialized")
         return
-    if action == "validate":
+    if action == "install-host-services":
+        from stack_host_install import prepare
+        m.require(not m.pending_transaction(), "Pending HUB-only transaction: run recover")
+        prepare(stack)
+    elif action == "validate":
         stack.state_permissions(initializing=current is None)
         containers = stack.inspect(*([current] if current else []))
         stack.ports_free({service for service, item in containers.items()
@@ -666,7 +679,15 @@ def run(args):
         m.require(not m.pending_transaction(), "Pending HUB-only transaction: run recover")
         stack.guard()
         if action == "recover" and pending:
-            recovered(stack, record)
+            if pending.get("kind") == "core":
+                from core_job_runner import settle_unified_jobs
+                from unified_core_manager import CoreManager, legacy_exclusion
+                from unified_xray_adapter import Adapter
+                with legacy_exclusion():
+                    CoreManager(Adapter(stack.path)).recover(stack, record)
+                    settle_unified_jobs(stack)
+            else:
+                recovered(stack, record)
         elif action == "start" and not current:
             initialize(stack, record)
         else:

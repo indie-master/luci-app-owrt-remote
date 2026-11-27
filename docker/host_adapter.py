@@ -397,7 +397,7 @@ class Adapter:
 
     def can_mutate(self, enabled):
         require(enabled, "Xray mutation not approved in host adapter")
-        require(not HOLD.exists(), "Xray maintenance hold is active")
+        require(not (HOLD.exists() or HOLD.is_symlink()), "Xray maintenance hold is active")
         require(time.monotonic() - self.last_restart >= 120,
                 "Xray restart cooldown is active")
 
@@ -802,13 +802,40 @@ class Adapter:
         return {"ok": True, "status": "rollback_requested",
                 "router_id": stage["router_id"], "phase": stage["phase"]}
 
+    def core_info(self):
+        image = docker_inspect_image()
+        active = active_xray()
+        version = architecture = image_id = None
+        if image:
+            inspected = docker("inspect", "--format", "{{.Image}}", XRAY_CONTAINER, timeout=8)
+            digest = inspected.stdout.strip()
+            if inspected.returncode == 0 and re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                image_id = digest
+                inspected = docker("image", "inspect", "--format", "{{.Architecture}}",
+                                   image_id, timeout=8)
+                platform = inspected.stdout.strip()
+                if inspected.returncode == 0 and re.fullmatch(r"[a-z0-9_]{1,32}", platform):
+                    architecture = platform
+            if active:
+                reported = docker("exec", XRAY_CONTAINER, "xray", "version", timeout=8)
+                match = re.match(r"Xray ([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)", reported.stdout)
+                if reported.returncode == 0 and match:
+                    version = match[1]
+        return {"ok": True, "active": active, "image": image, "image_id": image_id,
+                "version": version, "architecture": architecture, "runtime": "docker",
+                "maintenance_hold": HOLD.exists() or HOLD.is_symlink(),
+                "may_prepare": False, "may_upgrade": False, "may_restart": False}
+
     def core_job_start(self, request):
+        require(set(request) <= {"op", "action", "version", "confirmed"},
+                "unsupported core request field")
         action = request.get("action")
         require(action in ("prepare", "upgrade", "restart", "rollback"),
                 "unsupported core action")
         if action == "prepare":
             require(self.allow_apply, "Xray preparation is not authorized")
         else:
+            require(request.get("confirmed") is True, "explicit confirmation required")
             self.can_mutate(self.allow_apply if action == "upgrade" else self.allow_restart)
         version = request.get("version") or ""
         if action in ("prepare", "upgrade"):
@@ -817,42 +844,7 @@ class Adapter:
                     "invalid stable release version")
         else:
             require(not version, "version is not used for this action")
-        root = Path("/opt/router-orchestrator/data/core-jobs")
-        require(root.is_dir() and not root.is_symlink(), "core-job directory not provisioned")
-        st = root.stat()
-        require(st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700,
-                "core-job directory permissions unsafe")
-        # Do not queue more work while a core operation is in progress.
-        for path in root.glob("*.json"):
-            if path.is_symlink():
-                raise Rejected("unsafe core-job record")
-            try:
-                item = json.loads(path.read_text())
-            except Exception:
-                raise Rejected("unreadable core-job record")
-            if item.get("status") in ("pending", "running"):
-                raise Rejected("a core operation is already pending/running")
-        job_id = str(uuid.uuid4())
-        path = root / (job_id + ".json")
-        record = {"id": job_id, "status": "pending",
-                  "action": action, "version": version,
-                  "created_unix": int(time.time())}
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            json.dump(record, stream)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        unit = "router-orchestrator-core-job@" + job_id + ".service"
-        started = subprocess.run(["systemctl", "start", "--no-block", unit],
-                                 capture_output=True, timeout=15, text=True)
-        if started.returncode:
-            path.unlink(missing_ok=True)
-            raise Rejected("core-job systemd unit did not start")
-        if action != "prepare":
-            self.last_restart = time.monotonic()
-        return {"ok": True, "job_id": job_id, "status": "pending",
-                "action": action}
+        raise Rejected("Core maintenance requires a managed unified Docker stack")
 
     def core_job_status(self, request):
         job_id = request.get("job_id")
@@ -1002,9 +994,7 @@ class Adapter:
         if op == "xray.transport.stage.rollback":
             return self.transport_stage_rollback(request)
         if op == "xray.core.info":
-            return {"ok": True, "active": active_xray(),
-                    "image": docker_inspect_image(),
-                    "runtime": "docker", "maintenance_hold": HOLD.exists() or HOLD.is_symlink()}
+            return self.core_info()
         if op == "xray.core.start":
             return self.core_job_start(request)
         if op == "xray.core.job":
@@ -1088,6 +1078,16 @@ if __name__ == "__main__":
     p.add_argument("--allow-xray-restart", action="store_true")
     p.add_argument("--allow-xray-apply", action="store_true")
     args = p.parse_args()
+    if "RO_MANAGED_STACK_ENV" in os.environ:
+        from unified_core_manager import configured_stack_env
+        from manager import Blocked
+        try:
+            configured = configured_stack_env()
+        except Blocked:
+            p.error("Invalid host stack selector")
+        if args.stack_env not in (None, configured):
+            p.error("Conflicting host stack selectors")
+        args.stack_env = configured
     if args.stack_env is not None:
         if args.socket != str(SOCKET) or args.peer_uid != 23088 or args.allow_xray_restart or args.allow_xray_apply:
             p.error("Unified stack mode cannot be combined with legacy adapter settings")

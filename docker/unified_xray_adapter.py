@@ -27,6 +27,9 @@ XRAY_TMPFS = {
 }
 OPERATIONS = {
     "status": {frozenset()},
+    "core.info": {frozenset()},
+    "core.start": {frozenset({"action", "version", "confirmed"})},
+    "core.job": {frozenset({"job_id"})},
     "version": {frozenset()},
     "health": {frozenset()},
     "validate_config": {frozenset({"router_id", "router"})},
@@ -103,16 +106,20 @@ def parameters(request):
 class Adapter:
     def __init__(self, env):
         self.env = env
+        self.core_worker = None
 
-    def open_project(self):
+    def open_project(self, *, allow_core_pending=False):
         stack = Stack(self.env, open_settings(self.env), command_timeout=6)
         m.require(stack.config["RO_XRAY_BACKEND"] == BACKEND, "Xray adapter is disabled")
-        journal = json.loads(read_private(stack.journal, 256 * 1024))
-        m.require(journal["version"] == 1 and journal["pending"] is None and journal["current"],
-                  "Stack release unavailable or pending")
+        from unified_core_manager import load_record
+        journal = load_record(stack)
         release = journal["current"]
-        m.require(release["config"] == stack.config, "Active stack env changed")
-        records = stack.inspect(release)
+        pending = journal["pending"]
+        m.require(pending is None or (allow_core_pending and pending.get("kind") == "core"),
+                  "Stack release unavailable or pending")
+        allowed = (release, pending["target"]) if pending else (release,)
+        m.require(any(item["config"] == stack.config for item in allowed), "Active stack env changed")
+        records = stack.inspect(*allowed)
         hub = records["hub"]
         m.require(hub["HostConfig"].get("PidMode", "") in {"", "private"},
                   "HUB requires a private PID namespace")
@@ -175,7 +182,7 @@ class Adapter:
             m.require(time.monotonic() < deadline, "Xray readiness failed")
             time.sleep(0.2)
 
-    def test_config(self, stack, release, data):
+    def test_config(self, stack, release, data, *, image=None):
         with tempfile.TemporaryDirectory(prefix=".xray-test-", dir=stack.path.parent) as directory:
             candidate = Path(directory) / "candidate.json"
             candidate.write_bytes(data)
@@ -193,7 +200,7 @@ class Adapter:
                    "--env", "XRAY_LOCATION_ASSET=/usr/local/share/xray",
                    *(arg for path, options in XRAY_TMPFS.items()
                      for arg in ("--tmpfs", path + ":" + options)),
-                   *mounts, release["images"]["xray"], "run", "-test", "-config", "/etc/xray/owrt-remote.json")
+                   *mounts, image or release["images"]["xray"], "run", "-test", "-config", "/etc/xray/owrt-remote.json")
 
     def handle(self, stack, release, records, request):
         op, args = parameters(request)
@@ -309,16 +316,53 @@ class Adapter:
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
             if (uid, gid) != (m.HUB_UID, m.HUB_GID):
                 return
-            stack, _, records = self.open_project()
+            stack, _, records = self.open_project(allow_core_pending=True)
             if not peer_is_hub(pid, uid, gid, records["hub"]):
                 return
             authenticated = True
             request = read_request(channel)
-            with m.deployment_lock():
-                stack, release, records = self.open_project()
-                if not peer_is_hub(pid, uid, gid, records["hub"]):
-                    return
-                result = self.handle(stack, release, records, request)
+            op, args = parameters(request)
+            if op == "core.job":
+                from core_job_runner import settle_unified_job, unified_job_status
+                result = unified_job_status(stack, args["job_id"])
+                if result["job"]["status"] in ("pending", "running"):
+                    try:
+                        with m.deployment_lock():
+                            settle_unified_job(stack, args["job_id"])
+                    except m.Blocked:
+                        pass
+                    result = unified_job_status(stack, args["job_id"])
+            else:
+                with m.deployment_lock():
+                    stack, release, records = self.open_project(allow_core_pending=op in {"core.start", "core.info"})
+                    if not peer_is_hub(pid, uid, gid, records["hub"]):
+                        return
+                    if op == "core.start":
+                        from core_job_runner import queue_unified
+                        result = queue_unified(self, stack, args)
+                    elif op == "core.info":
+                        from unified_core_manager import load_record
+                        pending = load_record(stack)["pending"]
+                        item = records.get("xray")
+                        active = item is not None and item["State"]["Status"] == "running"
+                        version = None
+                        running_release = release
+                        if item is not None:
+                            if pending and item["Config"]["Labels"][REVISION] == pending["target"]["revision"]:
+                                running_release = pending["target"]
+                            container = self.owned_xray(stack, running_release, item)
+                            if active:
+                                output = docker("exec", container, "xray", "version")
+                                version = re.match(r"Xray ([0-9]+\.[0-9]+\.[0-9]+)\b", output)
+                        enabled = not stack.xray_hold()
+                        result = {"active": active, "image": running_release["config"]["RO_XRAY_IMAGE"],
+                                  "image_id": running_release["images"]["xray"] if item is not None else "",
+                                  "version": version[1] if version else "", "architecture": "amd64",
+                                  "runtime": "docker", "maintenance_hold": not enabled,
+                                  "recovery_pending": bool(pending),
+                                  "may_prepare": enabled, "may_upgrade": enabled, "may_restart": enabled}
+                    else:
+                        result = self.handle(stack, release, records, request)
             response = {"ok": True, **result}
         except (m.Blocked, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError,
                 subprocess.SubprocessError, sqlite3.Error):
@@ -339,8 +383,13 @@ class Adapter:
         protected(m.LOCK.parent)
         adapter = self
 
-        # Recovery also runs before the next authorized write if startup finds
-        # the stack unavailable or HOLD active.
+        from core_job_runner import recover_unified
+        try:
+            recover_unified(self)
+        except (m.Blocked, OSError, ValueError, KeyError, TypeError,
+                subprocess.SubprocessError, sqlite3.Error):
+            print("Core recovery unavailable at startup; watchdog will retry", flush=True)
+
         if XrayState(stack).exists() and XrayState(stack).load().get("profile_pending"):
             try:
                 with m.deployment_lock():
@@ -353,6 +402,11 @@ class Adapter:
             def handle(self):
                 adapter.serve(self.request)
 
-        with socketserver.UnixStreamServer(socket_address(stack), Handler) as server:
+        class Server(socketserver.UnixStreamServer):
+            def service_actions(self):
+                if adapter.core_worker is not None and adapter.core_worker.poll() is not None:
+                    adapter.core_worker = None
+
+        with Server(socket_address(stack), Handler) as server:
             server.serve_forever()
 

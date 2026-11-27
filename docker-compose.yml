@@ -86,7 +86,7 @@ services:
     container_name: ${RO_STACK_NAME:-router-orchestrator}-nginx
     labels:
       org.router-orchestrator.stack-owner: "${RO_STACK_OWNER:-}"
-      org.router-orchestrator.stack-revision: "${RO_STACK_REVISION:-}"
+      org.router-orchestrator.stack-revision: "${RO_STACK_NGINX_REVISION:-${RO_STACK_REVISION:-}}"
     network_mode: host
     restart: unless-stopped
     read_only: true

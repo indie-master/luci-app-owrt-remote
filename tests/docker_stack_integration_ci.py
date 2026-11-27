@@ -1,6 +1,7 @@
 """Real unified-stack checks restricted to disposable GitHub-hosted runners."""
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 import io
 import json
@@ -9,11 +10,13 @@ import re
 from pathlib import Path
 import signal
 import socket
+import socketserver
 import sqlite3
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from unittest.mock import patch
@@ -27,6 +30,8 @@ from secure_reverse_probe import build_probe
 from rehearse_secure_reverse import Proof, proof_matches, reserve
 from transport_profiles import ProfileError
 from orchestrator_stack_config import STREAM_MODULE, render_external, render_internal, stack_plan
+from unified_core_manager import PINNED_CORE, baseline as core_baseline, preparation_directory
+from xray_releases import VERSION as CORE_VERSION
 from unified_xray_adapter import Adapter, XRAY_TMPFS, socket_address
 from unified_xray_state import XrayState, encode
 from unified_transport_catalog import initialize_stage, record_stage, stage_status
@@ -624,6 +629,7 @@ import http.client
 import json
 import os
 import runpy
+import time
 import uuid
 
 @contextlib.contextmanager
@@ -802,9 +808,9 @@ def test_adapter(env, config, project):
     runtime_fault = runtime.path.parent / ".ci-runtime-fault"
 
     class DiagnosticAdapter(Adapter):
-        def open_project(self):
+        def open_project(self, **kwargs):
             with adapter_detail("ipc-peers", "active-project"):
-                return super().open_project()
+                return super().open_project(**kwargs)
 
         @staticmethod
         def owned_xray(stack, release, record):
@@ -1025,6 +1031,223 @@ def fixture_probe_summary(container):
         return "state=unavailable categories=unavailable"
 
 
+def core_candidate(environ):
+    reference = environ.get("RO_CI_CORE_CANDIDATE_IMAGE", "")
+    version = environ.get("RO_CI_CORE_CANDIDATE_VERSION", "")
+    if (not PINNED_CORE.fullmatch(reference) or not CORE_VERSION.fullmatch("v" + version) or
+            reference == environ.get("RO_CI_XRAY_IMAGE") or version == environ.get("RO_CI_XRAY_VERSION")):
+        raise SystemExit("Core acceptance blocked: a distinct, reviewed official Linux amd64 Xray image is required")
+    return reference, version
+
+
+def test_core_restart(stack, project, profile_id):
+    """Run a real Xray restart with two reverse channels and a fixture heartbeat."""
+    state = XrayState(stack)
+    transport = state.load()
+    entry, = [item for item in transport["profiles"] if item["profile"]["name"] == profile_id]
+    profile = entry["profile"]
+    assignment = entry["assignments"]["ci-router"]
+    portals = assignment["ports"]
+    config = json.loads(state.config.read_bytes())
+    clients = {client["id"]: client["reverse"]["tag"]
+               for inbound in config["inbounds"] for client in inbound.get("settings", {}).get("clients", [])
+               if client["id"] in assignment["clients"]}
+    version = "Xray " + os.environ["RO_CI_XRAY_VERSION"]
+    release = json.loads(stack.journal.read_text())["current"]
+    before = stack.inspect(release)
+    ingress = project + "-fixture-ingress"
+    external = stack.plan["mode"] != "standalone"
+
+    def identity(item):
+        return item["Id"], item["Image"], item["State"]["StartedAt"]
+
+    def ingress_identity():
+        item, = json.loads(docker("container", "inspect", ingress))
+        return identity(item)
+
+    ingress_before = ingress_identity() if external else None
+    nginx_files = [path for path in (stack.plan["nginx_conf"],
+                                     stack.path.parent / "fixture-nginx.conf")
+                   if path is not None and path.exists()]
+    nginx_before = {path: m.file_hash(path) for path in nginx_files}
+
+    class LuCI(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.settimeout(2)
+            if self.request.recv(4096).startswith(b"GET /cgi-bin/luci/ "):
+                self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nLuCI")
+
+    class SSH(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.sendall(b"SSH-2.0-RouterOrchestratorCI\r\n")
+
+    with contextlib.ExitStack() as resources:
+        targets = []
+        for handler in (LuCI, SSH):
+            server = resources.enter_context(socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            resources.callback(server.shutdown)
+            targets.append(server.server_address[1])
+        _, client = build_probe(profile, ingress_port=stack.plan["public"],
+                                admin_port=portals[0], ssh_port=portals[1],
+                                admin_target=targets[0], ssh_target=targets[1], core_version=version,
+                                proxy_protocol=False)
+        outbounds = [item for item in client["outbounds"] if item["protocol"] == "vless"]
+        for outbound, identity in zip(outbounds, assignment["clients"]):
+            old = outbound["settings"]["reverse"]["tag"]
+            outbound["settings"]["id"] = identity
+            outbound["settings"]["reverse"]["tag"] = clients[identity]
+            for rule in client["routing"]["rules"]:
+                if rule["inboundTag"] == [old]:
+                    rule["inboundTag"] = [clients[identity]]
+        directory = Path(resources.enter_context(tempfile.TemporaryDirectory(dir=stack.path.parent)))
+        document = directory / "client.json"
+        document.write_text(json.dumps(fixture_tls_client(client)))
+        os.chown(document, 0, m.HUB_GID)
+        document.chmod(0o640)
+        name = project + "-core-ci-client"
+        tls = stack.config["RO_TLS_DIR"]
+        ca = profile["certificate_file"]
+        docker("run", "-d", "--pull=never", "--name", name, "--label", f"{CI_LABEL}={project}",
+               "--network=host", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
+               "--user", f"{m.HUB_UID}:{m.HUB_GID}", "--env", "SSL_CERT_FILE=" + ca,
+               "--mount", f"type=bind,src={document},dst=/probe.json,readonly",
+               "--mount", f"type=bind,src={tls},dst=/etc/router-orchestrator/tls,readonly",
+               *(arg for path, options in XRAY_TMPFS.items() for arg in ("--tmpfs", path + ":" + options)),
+               stack.config["RO_XRAY_IMAGE"], "run", "-config", "/probe.json")
+        resources.callback(docker, "rm", "-f", name)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                core_baseline(stack, transport)
+                break
+            except m.Blocked:
+                assert time.monotonic() < deadline, "Core fixture reverse channels unavailable"
+                time.sleep(0.5)
+        heartbeat_marker = stack.state / ".ci-core-restored"
+        resources.callback(heartbeat_marker.unlink, missing_ok=True)
+
+        def run_core_job(action, version="", *, expected="success"):
+            hub_check(project, f"""
+with check('core-lifecycle', '{action}-{expected}-and-fleet-recovery'):
+    job = ipc('core.start', action={action!r}, version={version!r}, confirmed=True)
+    deadline = time.monotonic() + 175
+    while time.monotonic() < deadline:
+        # The heartbeat is synthetic. Reverse LuCI and SSH travel through Xray.
+        if {expected == "success"!r} or os.path.isfile('/var/lib/owrt-remote/.ci-core-restored'):
+            with hub['connect']() as db:
+                db.execute('update routers set last_seen=? where id=?', (int(time.time()), 'ci-router'))
+        try:
+            result = ipc('core.job', job_id=job['job_id'])['job']
+        except RuntimeError as error:
+            if str(error) not in {{'Xray adapter rejected the operation', 'Invalid Xray response'}}:
+                raise
+            time.sleep(1)
+            continue
+        if result['status'] not in {{'pending', 'running'}}:
+            assert result['status'] == {expected!r}
+            break
+        time.sleep(1)
+    else:
+        fail('error=timeout')
+""")
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    with m.deployment_lock():
+                        return
+                except m.Blocked:
+                    assert time.monotonic() < deadline, "Core worker did not release its lock"
+                    time.sleep(0.1)
+
+        run_core_job("restart")
+        after = stack.inspect(release)
+        assert before["xray"]["State"]["StartedAt"] != after["xray"]["State"]["StartedAt"]
+        assert before["xray"]["Id"] == after["xray"]["Id"]
+
+        def assert_unchanged_services(items):
+            for service in stack.services:
+                if service != "xray":
+                    assert identity(before[service]) == identity(items[service])
+            if external:
+                assert ingress_identity() == ingress_before
+            assert all(m.file_hash(path) == value for path, value in nginx_before.items())
+
+        def committed(status):
+            record = json.loads(stack.journal.read_text())
+            assert record["pending"] is None and record["core_receipt"]["status"] == status
+            from core_job_runner import unified_directory
+            job = unified_directory(stack) / (record["core_receipt"]["id"] + ".json")
+            assert json.loads(job.read_text())["status"] == status
+            return record["current"]
+
+        assert_unchanged_services(after)
+        alternative, version = core_candidate(os.environ)
+        metadata, = json.loads(docker("image", "inspect", alternative))
+        assert metadata["Os"] == "linux" and metadata["Architecture"] == "amd64"
+        assert alternative in metadata["RepoDigests"]
+        version_text = docker("run", "--rm", "--pull=never", "--network=none", alternative, "version")
+        assert version_text.splitlines()[0].split()[:2] == ["Xray", version]
+        candidate_id = metadata["Id"]
+        assert candidate_id != release["images"]["xray"]
+        directory = preparation_directory(stack)
+        directory.mkdir(mode=0o700)
+        manifest = {"version": "v" + version, "image": "router-orchestrator-xray:" + version,
+                    "image_id": candidate_id, "official_digest_ref": alternative,
+                    "official_image": "ghcr.io/xtls/xray-core:" + version, "validation": "config-only"}
+        m.durable_write(directory / (version + ".json"), json.dumps(manifest))
+        run_core_job("upgrade", "v" + version)
+        updated = committed("success")
+        items = stack.inspect(updated)
+        assert items["xray"]["Id"] != after["xray"]["Id"]
+        assert items["xray"]["Image"] == candidate_id
+        assert_unchanged_services(items)
+        run_core_job("rollback")
+        restored = committed("success")
+        items = stack.inspect(restored)
+        assert items["xray"]["Image"] == release["images"]["xray"]
+        assert_unchanged_services(items)
+        original_id = items["xray"]["Id"]
+
+        def reject_candidate(done):
+            disrupted = False
+            while not done.is_set():
+                try:
+                    observed = stack.inspect(restored, updated).get("xray")
+                except subprocess.CalledProcessError:
+                    # Compose can replace a container between Docker list and inspect.
+                    done.wait(0.25)
+                    continue
+                if observed and observed["Image"] == candidate_id and not disrupted:
+                    # Cover the empty Xray slot as well as an exited candidate across the matrix.
+                    if stack.plan["mode"] == "external-only":
+                        docker("rm", "-f", observed["Id"])
+                    else:
+                        docker("stop", "--time", "0", observed["Id"])
+                    disrupted = True
+                if (disrupted and observed and observed["Image"] == release["images"]["xray"] and
+                        observed["Id"] != original_id and observed["State"]["Running"]):
+                    # Only the recovered runtime gets a fresh fixture heartbeat.
+                    heartbeat_marker.touch(mode=0o644)
+                    return
+                done.wait(0.25)
+            raise AssertionError("Candidate was not disrupted and recovered")
+
+        done = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fault = pool.submit(reject_candidate, done)
+            try:
+                run_core_job("upgrade", "v" + version, expected="failed")
+            finally:
+                done.set()
+                fault.result()
+        assert committed("failed") == restored
+        items = stack.inspect(restored)
+        assert items["xray"]["Image"] == release["images"]["xray"]
+        assert items["xray"]["Id"] != original_id
+        assert_unchanged_services(items)
+
+
 def test_profile_lifecycle(env, config, project, backend_port, transport="wss", target_port=None):
     stack = Stack(env, config)
     state = XrayState(stack)
@@ -1191,9 +1414,11 @@ with check('profile-assignment', 'transport-task-replay'):
     request(200, 'POST', agent_task, ack, bearer=token, https=True)
     request(200, 'POST', agent_task, ack, bearer=token, https=True)
     assert json.loads(request(200, 'POST', agent_task, claim, bearer=token, https=True))['task'] is None
-    # The isolated fixture's enrollment listeners have no OpenWrt behind them.
-    # Exercise the host runtime removal independently of the HUB's live LuCI/SSH gate.
-    assert ipc('transport.unassign', **issue)['applied']
+""")
+        test_core_restart(stack, project, name)
+        hub_check(project, """
+with check('profile-assignment', 'remove-fixture-assignment'):
+    assert ipc('transport.unassign', router_id='ci-router', confirmed=True)['applied']
 """)
     installed = json.loads(state.config.read_bytes())
 
@@ -1286,6 +1511,8 @@ def main():
     project = "ro-stack-ci-" + uuid.uuid4().hex[:12]
     backend = os.environ.get("RO_CI_BACKEND", "external_readonly")
     assert backend in {"external_readonly", "unified_adapter"}
+    if backend == "unified_adapter":
+        core_candidate(os.environ)
     nginx, xray = os.environ["RO_CI_NGINX_IMAGE"], os.environ["RO_CI_XRAY_IMAGE"]
 
     def interrupted(signum, _frame):

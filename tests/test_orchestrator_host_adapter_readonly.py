@@ -73,6 +73,16 @@ class ReadonlyHostAdapterTests(unittest.TestCase):
             service.assert_not_called()
             files.assert_not_called()
 
+    def test_core_ipc_denies_unknown_action_and_unconfirmed_lifecycle(self):
+        adapter = host.Adapter(uid=os.geteuid(), allow_apply=True, allow_restart=True)
+        with patch.object(host.subprocess, "run") as system:
+            for action, confirmation in (("shell", True), ("upgrade", "true"),
+                                         ("restart", None), ("rollback", False)):
+                result = self.exchange(adapter, {"op": "xray.core.start", "action": action,
+                                                 "confirmed": confirmation})
+                self.assertFalse(result["ok"])
+            system.assert_not_called()
+
     def test_additive_xray_preview_runs_xray_test_without_host_write(self):
         from test_orchestrator_docker_runtime import DockerRuntimeContracts
         old, new = DockerRuntimeContracts.sample_new_wss_config()

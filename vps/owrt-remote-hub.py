@@ -4816,6 +4816,12 @@ def host_adapter_request(operation, payload=None):
     return data
 
 
+def core_adapter_request(operation, payload=None):
+    if unified_xray_enabled():
+        return unified_xray_request(operation.removeprefix("xray."), **(payload or {}))
+    return host_adapter_request(operation, payload)
+
+
 def unified_xray_enabled():
     return DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "unified_adapter"
 
@@ -19604,7 +19610,7 @@ exit 127
             if not self.require_owner(json_mode=True):
                 return
             try:
-                self.send_json(200, host_adapter_request("xray.core.info"))
+                self.send_json(200, core_adapter_request("xray.core.info"))
             except Exception as exc:
                 self.send_json(500, {"ok": False, "error": str(exc)[:150]})
             return
@@ -19624,7 +19630,7 @@ exit 127
                 return
             try:
                 job_id = path.rsplit("/", 1)[-1]
-                self.send_json(200, host_adapter_request("xray.core.job", {"job_id": job_id}))
+                self.send_json(200, core_adapter_request("xray.core.job", {"job_id": job_id}))
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:150]})
             return
@@ -20487,9 +20493,10 @@ exit 127
                 return
             try:
                 payload = self.read_payload()
-                self.send_json(200, host_adapter_request(
+                self.send_json(200, core_adapter_request(
                     "xray.core.start",
-                    {"action": payload.get("action"), "version": payload.get("version") or ""},
+                    {"action": payload.get("action"), "version": payload.get("version") or "",
+                     "confirmed": payload.get("confirmed") is True},
                 ))
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)[:160]})

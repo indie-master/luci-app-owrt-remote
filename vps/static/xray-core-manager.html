@@ -33,11 +33,13 @@ button{cursor:pointer}button.danger{background:#5f3037}button:disabled{opacity:.
 const byId=id=>document.getElementById(id);
 const csrf=document.body.dataset.csrf,version=byId('version'),job=byId('job'),info=byId('running');
 let preparedVersion=null, statusKnown=false, active=false, held=true, busy=false, versionsReady=false, loadingVersions=false;
+let capabilities={};
 function controls(){
  for(const button of document.querySelectorAll('[data-action]')){
   const action=button.dataset.action;
-  button.disabled=busy||!statusKnown||(action==='prepare'?!versionsReady||!version.value:
-   held||!active||(action==='upgrade'&&(!versionsReady||!version.value||preparedVersion!==version.value)));
+  const permission={prepare:'may_prepare',upgrade:'may_upgrade',restart:'may_restart',rollback:'may_restart'}[action];
+  button.disabled=busy||!statusKnown||capabilities[permission]!==true||(action==='prepare'?!versionsReady||!version.value:
+   held||(action!=='rollback'&&!active)||(action==='upgrade'&&(!versionsReady||!version.value||preparedVersion!==version.value)));
  }
  version.disabled=busy||!versionsReady;byId('refresh').disabled=busy;
  byId('retryVersions').disabled=busy||loadingVersions;
@@ -53,8 +55,11 @@ async function refreshStatus(){
  try{
   const s=await api('/api/xray/core/info');
   active=s.active===true;held=s.maintenance_hold!==false;statusKnown=true;
-  info.textContent=(active?'Работает':'Недоступен')+' · '+(s.image||'неизвестный образ');
-  byId('maintenance').textContent=held?'Включена защита конфигурации (maintenance HOLD). Просмотр и подготовка образа разрешены; перезапуск, обновление и откат заблокированы.':'Операции обслуживания доступны.';
+  capabilities=s;
+  info.textContent=[active?'Работает':'Недоступен','Docker',s.version&&'Xray '+s.version,s.architecture,s.image||'неизвестный образ'].filter(Boolean).join(' · ');
+  byId('maintenance').textContent=held?'Включён maintenance HOLD. Операции обслуживания заблокированы.':
+   s.recovery_pending?'Есть прерванная операция. Core Manager сначала восстановит рабочую версию.':
+   s.may_restart?'Операции обслуживания доступны.':'Для обслуживания нужен управляемый unified Docker-стек.';
  }catch(e){info.textContent='Не удалось получить состояние: '+String(e.message||e);byId('maintenance').textContent='Изменения заблокированы до получения статуса.'}
  finally{controls()}
 }
@@ -86,7 +91,7 @@ async function watch(id){
     if(state.status==='success'&&state.action==='prepare')preparedVersion=state.version;
     await refreshStatus();return;
    }
-  }catch(e){job.textContent='Статус задания недоступен: '+String(e.message||e)+' · ID '+id;return}
+  }catch(e){job.textContent='Повторная проверка статуса: '+String(e.message||e)+' · ID '+id}
   await new Promise(resolve=>setTimeout(resolve,2000));
  }
  job.textContent='Задание ещё не подтверждено · ID '+id;
@@ -100,7 +105,7 @@ document.querySelectorAll('[data-action]').forEach(button=>button.onclick=async(
  if(action!=='prepare'&&!confirm('Подтвердить операцию? Активные соединения могут прерваться.'))return;
  busy=true;controls();
  try{
-  const result=await api('/api/xray/core/start',{method:'POST',headers:{'Content-Type':'application/json','X-Core-Action-CSRF':csrf},body:JSON.stringify({action,version:(action==='prepare'||action==='upgrade')?v:''})});
+  const result=await api('/api/xray/core/start',{method:'POST',headers:{'Content-Type':'application/json','X-Core-Action-CSRF':csrf},body:JSON.stringify({action,confirmed:action!=='prepare',version:(action==='prepare'||action==='upgrade')?v:''})});
   job.textContent='Операция запущена: '+result.job_id;await watch(result.job_id);
  }catch(e){job.textContent=String(e.message||e)}
  finally{busy=false;controls()}

@@ -49,6 +49,7 @@ HUB_GID = 23088
 SOURCE_LABEL = "org.router-orchestrator.hub-source-sha256"
 PROJECT = "router-orchestrator"
 LOCK_FD = ContextVar("deployment_lock_fd", default=None)
+LIFECYCLE_FDS = ContextVar("lifecycle_lock_fds", default=())
 SQLITE_SUFFIXES = ("-wal", "-shm", "-journal")
 TRANSIENT = {"hub.db" + suffix for suffix in SQLITE_SUFFIXES}
 STACK_PRIVATE_FILES = {"profiles.db", "xray.json", "xray-active.json", "nginx-active.conf",
@@ -95,7 +96,7 @@ def require(condition, message):
 
 def inherited_lock():
     fd = LOCK_FD.get()
-    return () if fd is None else (fd,)
+    return () if fd is None else (fd, *LIFECYCLE_FDS.get())
 
 
 def call(*args, check=True, env=None, timeout=None):
@@ -1005,6 +1006,7 @@ def main():
     stack_actions = stack_parser.add_subparsers(dest="operation", required=True)
     for operation in ("validate", "start", "stop", "status", "recover", "rollback", "backup"):
         stack_actions.add_parser(operation)
+    stack_actions.add_parser("install-host-services", help="prepare unified adapter and watchdog unit files")
     update = stack_actions.add_parser("update")
     update.add_argument("--candidate-env", type=Path, required=True)
     update.add_argument("--acknowledge-schema-risk", action="store_true")

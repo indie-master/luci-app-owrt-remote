@@ -6,9 +6,7 @@ its tag cannot be supplied from untrusted web content.
 """
 from __future__ import annotations
 import argparse
-import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -18,6 +16,7 @@ import urllib.error
 
 RELEASES = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=10"
 VERSION = re.compile(r"^v([0-9]{1,4}\.[0-9]{1,3}\.[0-9]{1,3})$")
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 REGISTRY = "ghcr.io/xtls/xray-core"
 STAGED = Path("/opt/router-orchestrator/data/xray-candidates")
 MAX_BYTES = 4 * 1024 * 1024
@@ -65,11 +64,18 @@ def stable_release_tags():
 
 
 def command(*args, timeout=180):
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    import manager as m
+
+    return subprocess.run(("/usr/bin/docker", "--host", "unix:///var/run/docker.sock", *args[1:]),
+                          env=m.local_docker_env(), pass_fds=m.inherited_lock(),
+                          capture_output=True, text=True, timeout=timeout)
 
 
 def prepare(version):
-    require(os.geteuid() == 0, "root required")
+    raise RuntimeError("Core preparation requires a managed unified Docker stack")
+
+
+def prepare_candidate(version, lifecycle, *, staged=None):
     tags = stable_release_tags()
     require(version in tags, "requested version is not a published stable GitHub release")
     tag = version[1:]
@@ -78,37 +84,44 @@ def prepare(version):
     pulled = command("docker", "pull", "--platform", "linux/amd64", official,
                      timeout=240)
     require(pulled.returncode == 0, "official OCI image unavailable for stable tag")
-    details = command("docker", "image", "inspect", "--format",
-                      "{{.Architecture}}|{{.Id}}", official)
+    details = command("docker", "image", "inspect", official)
     require(details.returncode == 0, "official image inspection failed")
-    architecture, digest = details.stdout.strip().split("|", 1)
-    require(architecture == "amd64" and digest.startswith("sha256:"),
-            "unexpected image architecture or digest")
-    # Verify executable compatibility; the image is network-isolated.
-    result = command("docker", "run", "--rm", "--network", "none",
-                     "--cap-drop", "ALL", official, "version", timeout=35)
-    require(result.returncode == 0 and ("Xray " + tag) in result.stdout,
+    metadata, = json.loads(details.stdout)
+    digest = metadata.get("Id", "")
+    require(metadata.get("Architecture") == "amd64" and metadata.get("Os") == "linux"
+            and DIGEST.fullmatch(digest), "unexpected image platform or digest")
+    pinned_refs = {ref for ref in metadata.get("RepoDigests") or []
+                   if ref.startswith(REGISTRY + "@")
+                   and DIGEST.fullmatch(ref.split("@", 1)[1])}
+    require(len(pinned_refs) == 1, "official registry digest unavailable or ambiguous")
+    pinned, = pinned_refs
+    verified = command("docker", "pull", "--platform", "linux/amd64", pinned, timeout=240)
+    require(verified.returncode == 0, "official pinned image unavailable")
+    inspected = command("docker", "image", "inspect", "--format", "{{.Id}}", pinned)
+    require(inspected.returncode == 0 and inspected.stdout.strip() == digest,
+            "official image digest mismatch")
+    # All executable checks and local tagging refer to the verified image ID.
+    result = command("docker", "run", "--rm", "--pull", "never", "--network", "none",
+                     "--cap-drop", "ALL", digest, "version", timeout=35)
+    fields = result.stdout.splitlines()[0].split() if result.stdout else []
+    require(result.returncode == 0 and fields[:2] == ["Xray", tag],
             "official image version does not match selected release")
-    command("docker", "tag", official, local)
-    # Reuse the exact existing production Xray config with immutable mounts.
-    candidate = command("docker", "run", "--rm", "--network", "none",
-                        "--cap-drop", "ALL",
-                        "-v", "/etc/xray:/etc/xray:ro",
-                        "-v", "/usr/local/share/xray:/usr/local/share/xray:ro",
-                        *(["-v", "/opt/router-orchestrator/tls:/etc/router-orchestrator/tls:ro"]
-                          if Path("/opt/router-orchestrator/tls").is_dir() else []),
-                        local, "run", "-test",
-                        "-config", "/etc/xray/owrt-remote.json", timeout=45)
-    require(candidate.returncode == 0, "candidate core rejected current config")
-    STAGED.mkdir(mode=0o700, parents=True, exist_ok=True)
-    destination = STAGED / (tag + ".json")
+    lifecycle.candidate_test(digest)
+    # A repeated prepare may refresh a manifest for the same image, but
+    # must never replace a retained version tag with different bytes.
+    current = command("docker", "image", "inspect", "--format", "{{.Id}}", local)
+    require(current.returncode != 0 or current.stdout.strip() == digest,
+            "local version tag already points to a different image")
+    tagged = command("docker", "tag", digest, local)
+    require(tagged.returncode == 0, "verified image could not be tagged")
+    if staged is None:
+        staged = STAGED
+    staged.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination = staged / (tag + ".json")
     document = {"version": version, "image": local, "image_id": digest,
-                "official_image": official, "validation": "config-only",
+                "official_image": official, "official_digest_ref": pinned, "validation": "config-only",
                 "live_routers_verified": False}
-    fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as out:
-        json.dump(document, out, indent=2)
-        out.write("\n")
+    lifecycle.atomic(destination, (json.dumps(document, indent=2) + "\n").encode())
     print(json.dumps(document, indent=2))
     print("CANDIDATE PREPARED: do not treat config-only validation as live router acceptance")
 
@@ -121,9 +134,7 @@ def main():
     if args.action == "list":
         print("\n".join(stable_release_tags()))
         return
-    available = stable_release_tags()
-    require(available, "no stable releases found")
-    prepare(args.version or available[0])
+    prepare(args.version or stable_release_tags()[0])
 
 
 if __name__ == "__main__":

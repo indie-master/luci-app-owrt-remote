@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
-"""Operator-run, fixed-container Xray lifecycle with automatic local rollback.
-
-This tool never downloads arbitrary remote code. Candidate images must already
-be available locally, verified separately, and use the approved repository.
-The command is intentionally not invoked directly by web-origin data.
-"""
+"""Legacy Xray status and recovery helpers for the existing watchdog."""
 from __future__ import annotations
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -52,17 +46,26 @@ def atomic(path, content):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
 def docker(*args, timeout=90):
-    return run("/usr/bin/docker", *args, timeout=timeout)
+    from manager import inherited_lock, local_docker_env
+
+    return subprocess.run(("/usr/bin/docker", "--host", "unix:///var/run/docker.sock", *args),
+                          capture_output=True, text=True, timeout=timeout,
+                          env=local_docker_env(), pass_fds=inherited_lock())
 
 
 def compose(*args, timeout=120):
     return docker("compose", "--project-directory", str(ROOT),
-                  "-f", str(COMPOSE), *args, timeout=timeout)
+                  "--env-file", str(ENV), "-f", str(COMPOSE), *args, timeout=timeout)
 
 
 def env_image(data):
@@ -77,10 +80,11 @@ def replace_image(data, image):
     require(IMAGE_RE.fullmatch(image) is not None, "unapproved image name")
     original = data.decode()
     old = env_image(data)
-    lines = original.splitlines()
-    updated = [f"RO_XRAY_IMAGE={image}" if line == f"RO_XRAY_IMAGE={old}"
-               else line for line in lines]
-    return ("\n".join(updated) + "\n").encode()
+    key = "RO_XRAY_IMAGE="
+    return "".join(
+        key + image + line[len(key + old):] if line.rstrip("\r\n") == key + old else line
+        for line in original.splitlines(keepends=True)
+    ).encode()
 
 
 def container_state():
@@ -125,36 +129,65 @@ def wait_healthy(attempts=30):
     return False
 
 
+def active_config():
+    result = docker("inspect", "--format", "{{json .Mounts}}", CONTAINER)
+    require(result.returncode == 0, "unable to inspect managed Xray mounts")
+    targets = {"/etc/xray", "/usr/local/share/xray", "/etc/router-orchestrator/tls"}
+    mounts = {}
+    for mount in json.loads(result.stdout):
+        target = mount.get("Destination")
+        if target not in targets:
+            continue
+        source = mount.get("Source", "")
+        require(mount.get("Type") == "bind" and mount.get("RW") is False
+                and Path(source).is_absolute() and "," not in source and target not in mounts,
+                "unexpected managed Xray mount")
+        mounts[target] = source
+    require({"/etc/xray", "/usr/local/share/xray"} <= mounts.keys(),
+            "managed Xray config or assets mount is missing")
+    return mounts
+
+
 def candidate_test(image):
-    require(IMAGE_RE.fullmatch(image) is not None, "unapproved candidate image")
-    image_id(image)
-    tls = ROOT / "tls"
-    mounts = ["-v", str(tls) + ":/etc/router-orchestrator/tls:ro"] if tls.is_dir() else []
-    result = docker("run", "--rm", "--network", "none",
+    require(re.fullmatch(r"sha256:[0-9a-f]{64}", image), "invalid candidate image ID")
+    mounts = active_config()
+    args = []
+    for target, source in mounts.items():
+        args.extend(("--mount", f"type=bind,src={source},dst={target},readonly"))
+    user = docker("inspect", "--format", "{{.Config.User}}", CONTAINER)
+    require(user.returncode == 0, "unable to inspect managed Xray container user")
+    if user.stdout.strip():
+        args.extend(("--user", user.stdout.strip()))
+    result = docker("run", "--rm", "--pull", "never", "--network", "none", "--read-only",
                     "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                    "-v", "/etc/xray:/etc/xray:ro",
-                    "-v", "/usr/local/share/xray:/usr/local/share/xray:ro",
-                    *mounts, image, "run", "-test",
+                    "--tmpfs", "/tmp:rw,nosuid,nodev,size=32m",
+                    "-e", "XRAY_LOCATION_ASSET=/usr/local/share/xray",
+                    *args, image, "run", "-test",
                     "-config", "/etc/xray/owrt-remote.json", timeout=45)
     require(result.returncode == 0, "candidate Xray config test failed")
 
 
-def write_journal(old_image, old_id, new_image, new_id, phase):
+def config_digest(config):
+    return hashlib.sha256(Path(config).read_bytes()).hexdigest()
+
+
+def write_journal(transaction, phase):
     atomic(JOURNAL, (json.dumps({
-        "old_image": old_image, "old_image_id": old_id,
-        "new_image": new_image, "new_image_id": new_id,
-        "phase": phase, "updated_unix": int(time.time()),
+        **transaction, "phase": phase, "updated_unix": int(time.time()),
     }, indent=2) + "\n").encode())
 
 
-def swap(image, before, *, rollback_image=None):
+def swap(image, before, *, expected_id):
+    require(image_id(image) == expected_id, "Xray image changed before recreation")
     atomic(ENV, replace_image(before, image))
     result = compose("up", "-d", "--no-deps", "--no-build",
                      "--force-recreate", "xray")
     require(result.returncode == 0, "Xray container recreation failed")
     require(wait_healthy(), "Docker Xray did not recover both inbounds")
     state = container_state()
-    require(state and state[1] == image, "new Xray image mismatch")
+    running = docker("inspect", "--format", "{{.Image}}", CONTAINER)
+    require(state and state[1] == image and running.returncode == 0
+            and running.stdout.strip() == expected_id, "new Xray image mismatch")
 
 
 def online_router_baseline(env_content):
@@ -205,11 +238,31 @@ def wait_canary(database, baseline, since):
     return False
 
 
+def retain_versions(history, *verified):
+    retained = []
+    for version in (*verified, *history):
+        if all(item["image_id"] != version["image_id"] for item in retained):
+            retained.append(version)
+        if len(retained) == 3:
+            break
+    return retained
+
+
+def terminal_journal():
+    if not JOURNAL.exists():
+        return {}
+    previous = json.loads(JOURNAL.read_text())
+    require(previous.get("phase") in ("committed", "rolled-back"),
+            "unfinished upgrade; recover from journal first")
+    return previous
+
+
 def apply(image):
     require(ENV.is_file() and COMPOSE.is_file(), "unified deployment missing")
-    require(not TRANSPORT_HOLD.exists(), "shadow transport migration active: lifecycle mutation blocked")
+    require(not (TRANSPORT_HOLD.exists() or TRANSPORT_HOLD.is_symlink()), "shadow transport migration active: lifecycle mutation blocked")
     require(run("systemctl", "is-active", "--quiet", SERVICE).returncode != 0,
             "host systemd Xray must remain inactive")
+    previous = terminal_journal()
     before = ENV.read_bytes()
     old_image = env_image(before)
     require(active(), "current Xray not healthy: use audited manual recovery")
@@ -221,65 +274,88 @@ def apply(image):
     manifest_path = ROOT / "data" / "xray-candidates" / (tag + ".json")
     require(manifest_path.is_file(), "stable release manifest is missing")
     manifest = json.loads(manifest_path.read_text())
+    pinned = manifest.get("official_digest_ref", "")
     require(manifest.get("image") == image and manifest.get("image_id") == new_id
-            and manifest.get("validation") == "config-only",
+            and manifest.get("validation") == "config-only"
+            and isinstance(pinned, str)
+            and re.fullmatch(r"ghcr\.io/xtls/xray-core@sha256:[0-9a-f]{64}", pinned)
+            and image_id(pinned) == new_id,
             "candidate image digest differs from verified release")
     database, baseline = online_router_baseline(before)
     require(baseline, "no recently online routers available for canary validation")
-    candidate_test(image)
+    config = str(Path(active_config()["/etc/xray"]) / "owrt-remote.json")
+    config_before = config_digest(config)
+    candidate_test(new_id)
+    require(config_digest(config) == config_before, "Xray configuration changed during validation")
     # Do not silently overwrite an in-progress or crash-interrupted journal.
-    if JOURNAL.exists():
-        previous = json.loads(JOURNAL.read_text())
-        require(previous.get("phase") in ("committed", "rolled-back"),
-                "unfinished upgrade; recover from journal first")
-    write_journal(old_image, old_id, image, new_id, "switching")
+    transaction = {
+        "known_good": retain_versions(previous.get("known_good", []),
+                                      {"image": old_image, "image_id": old_id}),
+        "old_image": old_image, "old_image_id": old_id,
+        "new_image": image, "new_image_id": new_id,
+        "config_path": config, "config_sha256": config_before,
+        "old_env_sha256": hashlib.sha256(before).hexdigest(),
+        "new_env_sha256": hashlib.sha256(replace_image(before, image)).hexdigest(),
+    }
+    write_journal(transaction, "switching")
     started = int(time.time())
     try:
-        swap(image, before)
+        swap(image, before, expected_id=new_id)
         require(wait_canary(database, baseline, started),
                 "candidate failed live router heartbeat and SSH canary")
-        write_journal(old_image, old_id, image, new_id, "committed")
-        print("XRAY UPGRADE: PASS")
-        print("RUNNING IMAGE:", image)
-        print("WARNING: confirm live router reverse access before pruning old images")
     except BaseException:
-        write_journal(old_image, old_id, image, new_id, "rolling-back")
         try:
-            # Do NOT require new container health to perform recovery.
-            atomic(ENV, before)
-            restore = compose("up", "-d", "--no-deps", "--no-build",
-                              "--force-recreate", "xray")
-            require(restore.returncode == 0 and wait_healthy(),
-                    "rollback failed: requires operator recovery")
-            write_journal(old_image, old_id, image, new_id, "rolled-back")
+            rollback()
             print("XRAY ROLLBACK: PASS", file=sys.stderr)
         except Exception as error:
             print("CRITICAL ROLLBACK ERROR:", str(error), file=sys.stderr)
         raise
+    transaction["known_good"] = retain_versions(
+        transaction["known_good"], {"image": image, "image_id": new_id})
+    write_journal(transaction, "committed")
+    print("XRAY UPGRADE: PASS")
+    print("RUNNING IMAGE:", image)
 
 
 def rollback():
-    """Manual recovery of last committed candidate, including if Xray is down."""
+    """Restore the known-good image after failure, interruption or explicit rollback."""
     require(JOURNAL.is_file(), "no lifecycle journal")
-    previous = json.loads(JOURNAL.read_text())
-    require(previous.get("phase") in ("committed", "rolling-back"),
+    transaction = json.loads(JOURNAL.read_text())
+    phase = transaction.get("phase")
+    require(phase in ("committed", "switching", "rolling-back"),
             "journal is not in recoverable state")
-    old = previous["old_image"]
-    new = previous["new_image"]
+    old = transaction["old_image"]
+    new = transaction["new_image"]
     require(IMAGE_RE.fullmatch(old) is not None and IMAGE_RE.fullmatch(new) is not None,
             "invalid journal image name")
-    require(image_id(old) == previous["old_image_id"],
-            "known-good image digest changed")
+    if "config_sha256" in transaction:
+        require(config_digest(transaction["config_path"]) == transaction["config_sha256"],
+                "Xray configuration changed since core transaction")
     before = ENV.read_bytes()
-    require(env_image(before) == new, "deployed image does not match journal")
+    deployed = env_image(before)
+    if "old_env_sha256" in transaction:
+        expected = {"committed": (transaction["new_env_sha256"],),
+                    "switching": (transaction["old_env_sha256"], transaction["new_env_sha256"]),
+                    "rolling-back": (transaction["old_env_sha256"], transaction["new_env_sha256"])}
+        require(hashlib.sha256(before).hexdigest() in expected[phase],
+                "deployment environment changed since core transaction")
+    else:
+        # Earlier committed journals can still be rolled back. An old
+        # switching journal has no evidence that its environment is intact.
+        require(phase != "switching" and deployed == new,
+                "deployment environment cannot be verified against legacy journal")
+    require(deployed in (old, new), "deployed image does not match journal")
     require(run("systemctl", "is-active", "--quiet", SERVICE).returncode != 0,
             "legacy systemd Xray is active")
-    write_journal(old, previous["old_image_id"], new,
-                  previous["new_image_id"], "rolling-back")
-    swap(old, before)
-    write_journal(old, previous["old_image_id"], new,
-                  previous["new_image_id"], "rolled-back")
-    print("MANUAL XRAY ROLLBACK: PASS")
+    require(image_id(old) == transaction["old_image_id"],
+            "known-good image digest changed")
+    write_journal(transaction, "rolling-back")
+    swap(old, before, expected_id=transaction["old_image_id"])
+    transaction["known_good"] = retain_versions(
+        transaction.get("known_good", []),
+        {"image": old, "image_id": transaction["old_image_id"]})
+    write_journal(transaction, "rolled-back")
+    print("XRAY ROLLBACK: PASS")
     print("RUNNING IMAGE:", old)
 
 
@@ -289,25 +365,9 @@ def main():
     parser.add_argument("--image", help="pre-verified local Xray image for upgrade")
     args = parser.parse_args()
     require(os.geteuid() == 0, "root required")
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if args.action == "status":
-            print(json.dumps({"running": active(), "container": container_state(),
-                              "journal": str(JOURNAL)}, indent=2))
-        elif args.action == "restart":
-            require(not TRANSPORT_HOLD.exists(), "shadow transport migration active")
-            require(active(), "Xray unhealthy; restart requires manual recovery")
-            result = compose("restart", "xray")
-            require(result.returncode == 0 and wait_healthy(),
-                    "restart failed; operator should inspect container")
-            print("XRAY RESTART: PASS")
-        elif args.action == "rollback":
-            require(not TRANSPORT_HOLD.exists(), "shadow transport migration active")
-            rollback()
-        else:
-            require(args.image, "--image is required")
-            apply(args.image)
+    require(args.action == "status", "Core maintenance requires a managed unified Docker stack")
+    print(json.dumps({"running": active(), "container": container_state(),
+                      "journal": str(JOURNAL)}, indent=2))
 
 
 if __name__ == "__main__":

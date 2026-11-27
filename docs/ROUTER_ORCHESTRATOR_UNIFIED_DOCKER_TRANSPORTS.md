@@ -109,3 +109,32 @@ Compose configuration as a baseline; it has not yet been activated.
 - Host nginx and Remnawave are untouched.
 - Only afterwards: remove staging containers and unused project images,
   retaining the last known-good releases and backups.
+
+
+## Core Manager recovery and image retention
+
+For an approved unified host configuration, keep the Stack inputs and private
+state under `/opt/router-orchestrator` and the reviewed source under
+`/opt/router-orchestrator/src`. Validate the Stack, then prepare its units
+with `sudo python3 docker/manager.py stack --env-file /absolute/path/to/stack.env install-host-services`.
+This writes the adapter, watchdog and timer unit files and their shared,
+root-owned `/opt/router-orchestrator/managed-stack.conf`. Running the same
+command again validates the existing files. A conflicting selector, unit or
+drop-in requires operator review. Service activation is a separate approved step.
+
+The watchdog and adapter startup retry interrupted Core Manager transactions.
+If a switch left Xray absent, recovery creates only Xray using the previous
+verified image. A restart job is settled after the original core and recorded
+router channels are verified, without issuing another restart.
+
+For cleanup, supply the same `RO_MANAGED_STACK_ENV` from the trusted operator
+environment. The default is dry-run. The plan is computed under the deployment
+and lifecycle locks and keeps immutable IDs as well as references. Apply
+requires the existing release-acceptance marker and clear transaction state.
+
+The Docker integration workflow pins two distinct official Linux amd64 Xray
+images by digest and checks their versions.
+The fixture exercises restart, upgrade, rollback and automatic recovery from
+a stopped or removed candidate across the matrix. It exercises real reverse LuCI and SSH connections and
+uses synthetic timestamps in the HUB database as heartbeat evidence. Physical
+OpenWrt acceptance remains a separate release gate.
