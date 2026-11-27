@@ -1098,13 +1098,13 @@ def test_core_restart(stack, project, profile_id):
                                 admin_target=targets[0], ssh_target=targets[1], core_version=version,
                                 proxy_protocol=False)
         outbounds = [item for item in client["outbounds"] if item["protocol"] == "vless"]
-        for outbound, identity in zip(outbounds, assignment["clients"]):
+        for outbound, credential_id in zip(outbounds, assignment["clients"]):
             old = outbound["settings"]["reverse"]["tag"]
-            outbound["settings"]["id"] = identity
-            outbound["settings"]["reverse"]["tag"] = clients[identity]
+            outbound["settings"]["id"] = credential_id
+            outbound["settings"]["reverse"]["tag"] = clients[credential_id]
             for rule in client["routing"]["rules"]:
                 if rule["inboundTag"] == [old]:
-                    rule["inboundTag"] = [clients[identity]]
+                    rule["inboundTag"] = [clients[credential_id]]
         directory = Path(resources.enter_context(tempfile.TemporaryDirectory(dir=stack.path.parent)))
         document = directory / "client.json"
         document.write_text(json.dumps(fixture_tls_client(client)))
