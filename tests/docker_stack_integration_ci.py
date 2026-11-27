@@ -532,6 +532,57 @@ def error_category(error):
     return "unexpected_error"
 
 
+def adapter_failure_sites(error):
+    """Report only fixed exception labels and trusted source coordinates.
+
+    Include the exception chain: rollback errors can otherwise hide the
+    original publication failure. Never emit messages, locals or raw paths.
+    """
+    sources = {
+        "tests/docker_stack_integration_ci.py",
+        "docker/unified_transport_runtime.py",
+        "docker/unified_transport_catalog.py",
+        "docker/unified_xray_adapter.py",
+        "docker/unified_xray_state.py",
+        "docker/secure_reverse_probe.py",
+        "docker/secure_profile_store.py",
+        "docker/secure_profile_catalog.py",
+        "docker/transport_canary.py",
+        "docker/transport_profiles.py",
+        "docker/manager.py",
+        "docker/stack_runtime.py",
+        "docker/secure_ingress.py",
+        "docker/secure_publication_transaction.py",
+        "tools/rehearse_secure_reverse.py",
+    }
+    kinds = {cls: cls.__name__ for cls in (
+        AttributeError, KeyError, TypeError, IndexError, NameError,
+        UnboundLocalError, RuntimeError, ValueError, RecursionError,
+        AssertionError, OSError, PermissionError, FileNotFoundError,
+        TimeoutError, subprocess.CalledProcessError, subprocess.TimeoutExpired,
+        sqlite3.Error, sqlite3.OperationalError, sqlite3.IntegrityError,
+        ProfileError, m.Blocked,
+    )}
+    seen = set()
+    details = []
+    while error is not None and id(error) not in seen and len(details) < 4:
+        seen.add(id(error))
+        frames = []
+        tb = error.__traceback__
+        while tb is not None:
+            try:
+                name = Path(tb.tb_frame.f_code.co_filename).relative_to(ROOT).as_posix()
+            except ValueError:
+                name = None
+            if name in sources:
+                frames.append(f"{name}:{tb.tb_lineno}")
+            tb = tb.tb_next
+        details.append(kinds.get(type(error), "other") + "@" +
+                       ",".join(frames[-8:] or ["unknown"]))
+        error = error.__cause__ if error.__cause__ is not None else error.__context__
+    return ";".join(details)
+
+
 @contextlib.contextmanager
 def adapter_check(stage, check):
     try:
@@ -977,6 +1028,8 @@ def test_profile_lifecycle(env, config, project, backend_port, transport="wss", 
                             outcome = "reverse_proof_failed"
                         print(f"stage=profile-lifecycle check={operation.removeprefix('transport.')} "
                               f"error={outcome}", file=sys.stderr, flush=True)
+                        print("CI adapter exception sites: " + adapter_failure_sites(error),
+                              file=sys.stderr, flush=True)
                     raise
 
     with adapter_process(stack, FixtureTrustAdapter):

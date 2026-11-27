@@ -21,7 +21,7 @@ from test_orchestrator_stack_config import fixture
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
-from docker_stack_integration_ci import AdapterCheckFailed, adapter_check, hub_check
+from docker_stack_integration_ci import (AdapterCheckFailed, adapter_check, adapter_failure_sites, hub_check)
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
 from unified_transport_runtime import Runtime as TransportRuntime, receipt
@@ -41,6 +41,28 @@ def router(port=30100):
 
 
 class CIDiagnosticsTests(unittest.TestCase):
+    def test_adapter_failure_sites_excludes_private_data_and_preserves_cause(self):
+        try:
+            try:
+                exec(compile("raise TypeError('private-inner')",
+                             str(ROOT / "docker/unified_transport_runtime.py"), "exec"), {})
+            except TypeError as cause:
+                exec(compile("raise KeyError('private-outer') from cause",
+                             str(ROOT / "docker/unified_xray_state.py"), "exec"),
+                     {"cause": cause})
+        except KeyError as error:
+            detail = adapter_failure_sites(error)
+        else:
+            self.fail("expected chained exception")
+        self.assertEqual(detail, "KeyError@docker/unified_xray_state.py:1;"
+                                 "TypeError@docker/unified_transport_runtime.py:1")
+        try:
+            exec(compile("raise ValueError('private-value')",
+                         "/private/secret-path.py", "exec"), {})
+        except ValueError as error:
+            self.assertEqual(adapter_failure_sites(error), "ValueError@unknown")
+
+
     def test_runtime_error_reports_only_a_known_ipc_outcome(self):
         body = "with check('profile-lifecycle', 'publish'):\n    ipc('transport.publish')"
         for message, outcome in (
