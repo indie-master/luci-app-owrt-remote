@@ -560,6 +560,9 @@ def adapter_failure_sites(error):
         "docker/unified_transport_runtime.py",
         "docker/unified_transport_catalog.py",
         "docker/unified_xray_adapter.py",
+        "docker/unified_core_manager.py",
+        "docker/core_job_runner.py",
+        "docker/xray_releases.py",
         "docker/unified_xray_state.py",
         "docker/secure_reverse_probe.py",
         "docker/secure_profile_store.py",
@@ -607,6 +610,8 @@ def adapter_check(stage, check):
     except AdapterCheckFailed:
         raise
     except Exception as error:
+        print("CI adapter exception sites: " + adapter_failure_sites(error),
+              file=sys.stderr, flush=True)
         raise AdapterCheckFailed(f"stage={stage} check={check} error={error_category(error)}") from None
 
 
@@ -1122,7 +1127,11 @@ def test_core_restart(stack, project, profile_id):
                 core_baseline(stack, transport)
                 break
             except m.Blocked:
-                assert time.monotonic() < deadline, "Core fixture reverse channels unavailable"
+                if time.monotonic() >= deadline:
+                    for role, container in (("client", name), ("server", stack.name + "-xray")):
+                        print(f"CI core reverse {role}: " + fixture_probe_summary(container),
+                              file=sys.stderr, flush=True)
+                    raise AssertionError("Core fixture reverse channels unavailable")
                 time.sleep(0.5)
         heartbeat_marker = stack.state / ".ci-core-restored"
         resources.callback(heartbeat_marker.unlink, missing_ok=True)
@@ -1415,7 +1424,8 @@ with check('profile-assignment', 'transport-task-replay'):
     request(200, 'POST', agent_task, ack, bearer=token, https=True)
     assert json.loads(request(200, 'POST', agent_task, claim, bearer=token, https=True))['task'] is None
 """)
-        test_core_restart(stack, project, name)
+        with adapter_check("core-lifecycle", "fixture"):
+            test_core_restart(stack, project, name)
         hub_check(project, """
 with check('profile-assignment', 'remove-fixture-assignment'):
     assert ipc('transport.unassign', router_id='ci-router', confirmed=True)['applied']
