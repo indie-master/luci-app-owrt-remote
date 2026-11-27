@@ -974,6 +974,45 @@ with check('sigkill-recovery', 'reconcile'):
             cli(env, "validate")
 
 
+def probe_log_categories(output):
+    """Classify disposable fixture logs without exposing any raw text."""
+    text = output.lower()
+    patterns = {
+        "tls-trust": ("unknown authority", "certificate signed", "certificate verify", "x509:"),
+        "tls-handshake": ("tls handshake", "bad certificate", "remote error: tls"),
+        "websocket": ("bad handshake", "websocket", "unexpected http status"),
+        "permission": ("permission denied", "read-only file system"),
+        "connection-refused": ("connection refused",),
+        "network-timeout": ("i/o timeout", "context deadline exceeded"),
+        "routing-denied": ("blocked by", "access denied", "rejected"),
+        "config-error": ("failed to load config", "failed to build", "failed to start"),
+        "reverse": ("reverse",),
+        "eof": ("unexpected eof", "connection reset",),
+    }
+    return ",".join(label for label, terms in patterns.items()
+                    if any(term in text for term in terms)) or "none-recognized"
+
+
+def fixture_probe_summary(container):
+    """Only fixed status values and log categories leave the CI runner."""
+    try:
+        base = ("docker", "--host", "unix:///var/run/docker.sock")
+        status = m.call(*base, "inspect", "--format", "{{.State.Status}}", container,
+                        check=False, env=m.local_docker_env(), timeout=5)
+        state = status.stdout.strip()
+        if status.returncode or state not in {
+            "created", "running", "paused", "restarting", "removing", "exited", "dead",
+        }:
+            state = "unavailable"
+        logs = m.call(*base, "logs", "--tail", "100", container, check=False,
+                      env=m.local_docker_env(), timeout=5)
+        categories = ("unavailable" if logs.returncode else
+                      probe_log_categories(logs.stdout + "\n" + logs.stderr))
+        return f"state={state} categories={categories}"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "state=unavailable categories=unavailable"
+
+
 def test_profile_lifecycle(env, config, project, backend_port, transport="wss", target_port=None):
     stack = Stack(env, config)
     state = XrayState(stack)
@@ -1001,14 +1040,25 @@ def test_profile_lifecycle(env, config, project, backend_port, transport="wss", 
                 return super().restart(stack, release, container, routers, extra_ports=extra_ports)
 
         def handle(self, stack, release, records, request):
+            probe_id = None
+            summaries = {}
+
             def docker_with_fixture_ca(*args, **kwargs):
+                nonlocal probe_id
+                if args[:3] == ("rm", "-f", "-v") and len(args) == 4 and args[3] == probe_id:
+                    summaries["client"] = fixture_probe_summary(probe_id)
+                    summaries["server"] = fixture_probe_summary(stack.name + "-xray")
                 if args[:2] == ("run", "-d") and transport != "reality-tcp":
                     certificate = f"/etc/router-orchestrator/tls/{host}/fullchain.pem"
                     tls = stack.config["RO_TLS_DIR"]
                     options = ("--mount", f"type=bind,src={tls},dst=/etc/router-orchestrator/tls,readonly",
                                "--env", "SSL_CERT_FILE=" + certificate)
-                    return docker(args[0], *options, *args[1:], **kwargs)
-                return docker(*args, **kwargs)
+                    result = docker(args[0], *options, *args[1:], **kwargs)
+                else:
+                    result = docker(*args, **kwargs)
+                if args[:2] == ("run", "-d") and re.fullmatch(r"[a-f0-9]{64}", result.strip()):
+                    probe_id = result.strip()
+                return result
 
             with patch("unified_xray_adapter.docker", docker_with_fixture_ca):
                 try:
@@ -1026,6 +1076,9 @@ def test_profile_lifecycle(env, config, project, backend_port, transport="wss", 
                         outcome = error_category(error)
                         if isinstance(error, m.Blocked) and str(error) == "Ingress reverse probe failed":
                             outcome = "reverse_proof_failed"
+                            for role in ("client", "server"):
+                                print(f"CI reverse {role}: " + summaries.get(role, "unavailable"),
+                                      file=sys.stderr, flush=True)
                         print(f"stage=profile-lifecycle check={operation.removeprefix('transport.')} "
                               f"error={outcome}", file=sys.stderr, flush=True)
                         print("CI adapter exception sites: " + adapter_failure_sites(error),

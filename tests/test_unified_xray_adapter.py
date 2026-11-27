@@ -21,7 +21,8 @@ from test_orchestrator_stack_config import fixture
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker"))
 import manager as m
-from docker_stack_integration_ci import (AdapterCheckFailed, adapter_check, adapter_failure_sites, hub_check)
+from docker_stack_integration_ci import (AdapterCheckFailed, adapter_check, adapter_failure_sites,
+                                         fixture_probe_summary, hub_check, probe_log_categories)
 from stack_runtime import OWNER, REVISION, Stack
 from unified_xray_adapter import MAX_REQUEST, XRAY_TMPFS, Adapter, parameters, read_request
 from unified_transport_runtime import Runtime as TransportRuntime, receipt
@@ -41,6 +42,17 @@ def router(port=30100):
 
 
 class CIDiagnosticsTests(unittest.TestCase):
+    def test_probe_diagnostics_never_forward_raw_log_text(self):
+        sample = "x509: certificate signed by unknown authority PRIVATE-TEST-VALUE"
+        self.assertEqual(probe_log_categories(sample), "tls-trust")
+        self.assertEqual(probe_log_categories("PRIVATE-TEST-VALUE"), "none-recognized")
+        with patch("docker_stack_integration_ci.m.call", side_effect=[
+            subprocess.CompletedProcess([], 0, "running\n", ""),
+            subprocess.CompletedProcess([], 0, "", sample),
+        ]):
+            self.assertEqual(fixture_probe_summary("fixture"),
+                             "state=running categories=tls-trust")
+
     def test_adapter_failure_sites_excludes_private_data_and_preserves_cause(self):
         try:
             try:
