@@ -1,0 +1,22 @@
+[Unit]
+Description=Router Orchestrator durable server publication recovery
+After=docker.service nginx.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/src/docker/secure_publication_worker.py recover
+TimeoutStartSec=480
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/xray /etc/nginx /opt/router-orchestrator/data /var/lib/router-orchestrator-secure-profiles /run/docker.sock /var/run/docker.sock
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+StandardOutput=journal
+StandardError=journal

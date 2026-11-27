@@ -1,0 +1,32 @@
+[Unit]
+Description=Router Orchestrator constrained Docker Xray host control adapter
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/router-orchestrator/src/docker/host_adapter.py --peer-uid 23088 --allow-xray-restart --allow-xray-apply
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=router-orchestrator
+RuntimeDirectoryMode=0750
+StateDirectory=router-orchestrator-secure-profiles
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/xray /run/router-orchestrator /opt/router-orchestrator/data /opt/router-orchestrator/tls
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

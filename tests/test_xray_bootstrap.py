@@ -130,6 +130,47 @@ opkg() {
         self.assertIn('без загрузки из интернета', result.stderr)
         self.assert_clean()
 
+    def test_missing_explicit_persistent_pin_never_downloads_or_selects_other_binary(self):
+        # Use an invalid hash so this fixture never reads or executes a
+        # real system file. A valid RAM fallback exists but must be ignored.
+        self.make_binary()
+        pinned = "/etc/owrt-remote/xray-boot/xray-invalid-test-pin"
+        self.config(enabled="1", wan_direct="0", xray_bin=pinned)
+        result = self.shell('xray_bin_path; echo; ensure_xray_available',
+                            mocks='prepare_xray_tmp() { echo forbidden-network >&2; return 99; }')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), pinned)
+        self.assertNotIn("forbidden-network", result.stderr)
+        self.assertFalse((self.directory / "commits").exists())
+
+    def test_legacy_zip_cache_restores_softfloat_without_network(self):
+        data = self.make_binary("Xray legacy softfloat")
+        cached = self.cache(data)
+        legacy = self.store / ("Xray-linux-mips32le.zip." + hashlib.sha256(data).hexdigest() + ".gz")
+        cached.rename(legacy)
+        self.binary.unlink()
+        selected = self.runtime / "xray_softfloat"
+        self.config(enabled="1", wan_direct="0", xray_bin=selected.as_posix())
+        before = legacy.stat().st_mtime_ns
+        result = self.shell("ensure_xray_available",
+                            mocks='fetch_file() { echo forbidden-network >&2; return 99; }')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(selected.read_bytes(), data)
+        self.assertFalse(self.binary.exists())
+        self.assertEqual(legacy.stat().st_mtime_ns, before)
+        self.assertNotIn("forbidden-network", result.stderr)
+        self.assert_clean()
+
+    def test_ambiguous_cache_is_not_selected_arbitrarily(self):
+        data = self.make_binary()
+        self.cache(data)
+        another = b"#!/bin/sh\necho another\n"
+        (self.store / ("other." + hashlib.sha256(another).hexdigest() + ".gz")).write_bytes(gzip.compress(another))
+        self.binary.unlink()
+        result = self.shell("xray_cache_restore")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.binary.exists())
+
     def test_unchanged_binary_does_not_rewrite_flash(self):
         self.make_binary()
         self.assertEqual(self.shell('prepare_xray').returncode, 0)

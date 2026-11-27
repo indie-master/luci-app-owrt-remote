@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Router Orchestrator · Профили</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui,-apple-system,Segoe UI,sans-serif;background:#10151d;color:#eef1f7}
+*{box-sizing:border-box}body{max-width:1000px;margin:auto;padding:20px}header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}h1{font-size:24px}h2{font-size:18px}
+a{color:#95beff}.panel{background:#19222e;border:1px solid #344254;border-radius:12px;padding:18px;margin:16px 0}.muted{color:#a3b0c2}
+label{display:flex;flex-direction:column;gap:5px;font-size:14px}select,button{background:#101823;color:#eef1f7;border:1px solid #52647a;padding:10px;border-radius:8px;font:inherit;min-width:0}button{background:#295f99;cursor:pointer}button:disabled{opacity:.5;cursor:default}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.item{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid #344254;padding:12px 0}.item:last-child{border:0}.state{font-size:13px}.error{color:#ffaaa9} [hidden]{display:none!important}
+</style></head><body data-csrf="__TRANSPORT_CSRF__">
+<header><h1>Транспортные профили</h1><nav><a href="/">HUB</a> · <a href="/transport-configurator/">Создать профиль</a></nav></header>
+<section class="panel"><h2>Публикация</h2><p id="publication-status" role="status">Проверка доступности…</p><button id="refresh-job" type="button">Обновить статус</button></section>
+<section class="panel"><h2>Каталог</h2><p class="muted">Черновики не создают серверные входы. Только опубликованные ревизии можно выбрать для роутера.</p><div id="catalog" aria-live="polite">Загрузка…</div></section>
+<section class="panel"><h2>Настройки конкретного роутера</h2>
+<label>Роутер<select id="router"><option value="">Выбрать устройство</option></select></label>
+<p id="active" class="muted">Текущий транспорт будет показан после выбора устройства.</p>
+<form id="preferences">
+<div class="grid">
+<label>Основной профиль<select id="primary" required></select></label>
+<label>Резервный профиль 1<select id="fallback1"></select></label>
+<label>Резервный профиль 2<select id="fallback2"></select></label>
+</div><p class="muted" id="hint">Сохранение меняет только желаемый порядок профилей. Автоматическое применение и failover ещё отключены.</p>
+<button id="save" disabled type="submit">Сохранить выбор</button>
+</form>
+<p id="message" role="status"></p></section>
+<script>
+const get=id=>document.getElementById(id),router=get('router'),selects=['primary','fallback1','fallback2'].map(get);
+let routers=[],available=[],selectionToken=0,loaded=false,saving=false,publicationEnabled=false,publicationBusy=true;
+const publishButtons=[];
+function message(value,error=false){get('message').textContent=value;get('message').classList.toggle('error',error)}
+async function api(path,body){
+ const opts={credentials:'same-origin',cache:'no-store'};
+ if(body!==undefined){opts.method='POST';opts.headers={'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf};opts.body=JSON.stringify(body)}
+ const response=await fetch(path,opts),data=await response.json();
+ if(!response.ok||!data.ok)throw Error(data.error||'Запрос не выполнен');
+ return data;
+}
+async function refreshJob(){
+ try{
+  const data=await api('/api/secure-profiles/job'),job=data.job;
+  publicationEnabled=data.enabled;
+  publicationBusy=['pending','running','recovery_required'].includes(job.status);
+  const labels={none:'Нет операций',pending:'В очереди',running:'Выполняется',success:'Опубликовано',failed:'Не выполнено',recovery_required:'Требуется проверка восстановления'};
+  get('publication-status').textContent=(publicationEnabled?'Публикация разрешена':'Публикация отключена на VPS')+
+   ' · '+(labels[job.status]||job.status)+(job.profile_id?' · '+job.profile_id+' rev '+job.revision:'')+(job.message?' · '+job.message:'');
+ }catch(err){publicationEnabled=false;publicationBusy=true;get('publication-status').textContent=String(err.message||err)}
+ for(const refresh of publishButtons)refresh();
+}
+get('refresh-job').addEventListener('click',refreshJob);
+const key=p=>p.profile_id+':'+p.revision;
+function option(value,label){const node=document.createElement('option');node.value=value;node.textContent=label;return node}
+function fill(desired){
+ for(let i=0;i<selects.length;i++){
+  const el=selects[i];
+  el.replaceChildren(option('',i===0?'Выбрать основной':'Не используется'));
+  for(const p of available)el.appendChild(option(key(p),p.label+' · '+p.transport+' · rev '+p.revision));
+  el.value=desired[i]?key(desired[i]):'';
+ }
+ check();
+}
+function check(){
+ const vals=selects.map(s=>s.value),selected=vals.filter(Boolean);
+ get('save').disabled=!loaded||saving||!router.value||!vals[0]||(!vals[1]&&!!vals[2])||new Set(selected).size!==selected.length;
+ for(const s of selects)for(const o of s.options)o.disabled=!!o.value&&selects.some(other=>other!==s&&other.value===o.value);
+}
+selects.forEach(s=>s.addEventListener('change',check));
+async function loadRouter(){
+ const token=++selectionToken,id=router.value;loaded=false;get('save').disabled=true;
+ for(const s of selects)s.disabled=true;
+ fill([]);get('save').disabled=true;message('');
+ const current=routers.find(r=>r.id===id);
+ get('active').textContent=current?'Последний известный транспорт: '+current.transport:'Устройство не выбрано';
+ if(!id)return;
+ try{
+  const data=await api('/api/secure-profiles/router?router_id='+encodeURIComponent(id));
+  if(token!==selectionToken)return;
+  available=data.available;loaded=true;fill(data.desired);
+  message(available.length?'Выбери опубликованные ревизии.':'Нет опубликованных профилей. Черновики пока не доступны для назначения.');
+ }catch(err){if(token===selectionToken)message(String(err.message||err),true)}
+ finally{if(token===selectionToken){for(const s of selects)s.disabled=false;check()}}
+}
+router.addEventListener('change',loadRouter);
+get('preferences').addEventListener('submit',async e=>{
+ e.preventDefault();check();if(get('save').disabled)return;
+ const id=router.value,token=selectionToken;
+ const profiles=selects.map(s=>available.find(p=>key(p)===s.value)).filter(Boolean).map(p=>({profile_id:p.profile_id,revision:p.revision}));
+ saving=true;check();
+ try{
+  await api('/api/secure-profiles/select',{router_id:id,profiles});
+  if(token===selectionToken)message('Желаемые профили сохранены. Настройки и работающие процессы роутера не изменены.');
+ }catch(err){if(token===selectionToken)message(String(err.message||err),true)}
+ finally{saving=false;check()}
+});
+(async()=>{
+ try{
+  const data=await api('/api/secure-profiles');
+  routers=data.routers;available=data.available;
+  const catalog=get('catalog');catalog.replaceChildren();
+  for(const p of data.revisions){
+   const item=document.createElement('div'),info=document.createElement('div'),name=document.createElement('strong'),detail=document.createElement('div'),state=document.createElement('span');
+   item.className='item';name.textContent=p.label+' · rev '+p.revision;detail.className='muted';detail.textContent=p.transport+' · '+p.hostname+':'+p.public_port+' · backend '+p.backend_port+' · SNI: '+p.server_names.join(', ');
+   state.className='state';state.textContent=p.published?'Опубликован':'Черновик';
+   info.append(name,detail);item.append(info,state);
+   if(!p.published){
+    const validate=document.createElement('button'),result=document.createElement('p');
+    validate.type='button';validate.textContent='Проверить';
+    result.className='muted';result.setAttribute('role','status');
+    validate.addEventListener('click',async()=>{
+     validate.disabled=true;result.textContent='Проверка сохранённой ревизии действующим ядром…';
+     try{
+      const check=await api('/api/secure-profiles/validate',{profile_id:p.profile_id,revision:p.revision});
+      result.textContent=(check.xray_validated?'Xray: PASS':'Xray: FAIL')+
+       (check.certificate_validated?' · Сертификат: PASS':'')+
+       ' · Внешний nginx не проверен. Профиль не опубликован.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{validate.disabled=false}
+    });
+    let sealedDigest="";
+    const publish=document.createElement("button");
+    publish.type="button";publish.textContent="Опубликовать";
+    const updatePublish=()=>{publish.disabled=!publicationEnabled||publicationBusy||!sealedDigest;};
+    publishButtons.push(updatePublish);updatePublish();
+    const plan=document.createElement('button');
+    plan.type='button';plan.textContent='План публикации';
+    plan.addEventListener('click',async()=>{
+     sealedDigest='';updatePublish();plan.disabled=true;validate.disabled=true;
+     result.textContent='Проверка выделенных SNI, портов и серверной конфигурации…';
+     try{
+      const candidate=await api('/api/secure-profiles/plan',{profile_id:p.profile_id,revision:p.revision});
+      sealedDigest=candidate.artifact_sha256;updatePublish();
+      result.textContent='План готов · Xray: PASS · '+candidate.routes.map(route=>route.sni+' → '+route.upstream).join(' · ')+
+       ' · Конфигурация nginx на диске сверена. Вход не активирован, роутеры не изменены.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{plan.disabled=false;validate.disabled=false}
+    });
+    const approve=document.createElement('button');
+    approve.type='button';approve.textContent='Разрешить SNI';
+    approve.addEventListener('click',async()=>{
+     if(!confirm('Разрешить SNI: '+p.server_names.join(', ')+'? DNS, nginx и роутеры сейчас не изменятся.'))return;
+     approve.disabled=true;plan.disabled=true;
+     try{
+      const data=await api('/api/secure-profiles/approve',{profile_id:p.profile_id,revision:p.revision,confirmed:true});
+      result.textContent='Разрешены SNI: '+data.approved_names.join(', ')+' · Теперь можно проверить план публикации.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{approve.disabled=false;plan.disabled=false}
+    });
+    publish.addEventListener('click',async()=>{
+     if(publish.disabled||!confirm('Опубликовать '+p.label+'? Xray будет перезапущен дважды; существующие reverse-сессии кратковременно прервутся. Настройки роутеров не изменятся.'))return;
+     publicationBusy=true;for(const refresh of publishButtons)refresh();
+     try{
+      await api('/api/secure-profiles/publish',{profile_id:p.profile_id,revision:p.revision,artifact_sha256:sealedDigest,confirmed:true});
+      result.textContent='Задание принято. Проверяй состояние публикации; после успеха обнови страницу.';
+     }catch(err){result.textContent=String(err.message||err)}
+     finally{await refreshJob()}
+    });
+    item.append(validate,approve,plan,publish,result);
+   }
+   catalog.append(item);
+  }
+  if(!data.revisions.length)catalog.textContent='Пока нет профилей. Создай первый в конфигураторе.';
+  for(const r of routers)router.appendChild(option(r.id,r.name+' · '+r.id));
+  const requested=new URLSearchParams(location.search).get('router_id');
+  if(routers.some(r=>r.id===requested))router.value=requested;
+  fill([]);await loadRouter();await refreshJob();
+ }catch(err){get('catalog').textContent='Каталог недоступен';message(String(err.message||err),true)}
+})();
+</script></body></html>

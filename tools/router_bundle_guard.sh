@@ -118,16 +118,51 @@ preflight_live() {
         [ "${RO_TEST_PORT:-}" = 18443 ] || abort 'test port mismatch'
         return
     fi
+    [ "$(id -u)" = 0 ] || abort 'root required for persistent snapshot'
+    [ -r /etc/openwrt_release ] || abort 'not an OpenWrt device'
     command -v uci >/dev/null || abort 'uci missing'
     command -v jq >/dev/null || abort 'jq missing'
-    [ "$(uci -q get owrtremote.main.router_id)" = main ] || abort 'this pilot is for router main only'
+    # The caller must pin the selected enrolled router and its CURRENT
+    # transport. Preparing an update must not silently migrate the tunnel.
+    rid="$(uci -q get owrtremote.main.router_id || true)"
+    case "$rid" in ''|*[!a-zA-Z0-9_.-]*) abort 'invalid router identity' ;; esac
+    [ "$rid" = "${RO_EXPECT_ROUTER_ID:-}" ] || abort 'router identity mismatch'
     tr="$(uci -q get owrtremote.main.vps_transport || true)"
-    [ "${tr:-tcp}" = tcp ] || abort 'not TCP; no upgrade allowed'
-    [ "$(uci -q get owrtremote.main.vps_port)" = 18443 ] || abort 'port not 18443'
+    tr="${tr:-tcp}"
+    case "$tr" in tcp|ws) ;; *) abort 'only existing TCP/WSS may be prepared' ;; esac
+    [ "$tr" = "${RO_EXPECT_TRANSPORT:-}" ] || abort 'existing transport mismatch'
+    port="$(uci -q get owrtremote.main.vps_port || true)"
+    case "$port" in ''|*[!0-9]*) abort 'invalid current port' ;; esac
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || abort 'port out of range'
+    [ "$port" = "${RO_EXPECT_PORT:-}" ] || abort 'current port mismatch'
     config="$(uci -q get owrtremote.main.xray_config || true)"
     config="${config:-/etc/xray/owrt-remote-client.json}"
-    [ -s "$config" ] || abort 'current Xray client config missing'
-    jq -e '[.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn") | .streamSettings] as $x | ($x|length==2) and all($x[]; (.network // "tcp")=="tcp" and (.security // "none")=="none")' "$config" >/dev/null || abort 'reverse not exactly 2 x TCP none'
+    # The existing snapshot/rollback contract only covers this path.
+    [ "$config" = /etc/xray/owrt-remote-client.json ] || abort 'custom Xray path requires separate review'
+    [ -f "$config" ] && [ ! -L "$config" ] && [ -s "$config" ] || abort 'current Xray config missing or unsafe'
+    sni="$(uci -q get owrtremote.main.vps_sni || true)"
+    [ -n "$sni" ] || sni="$(uci -q get owrtremote.main.vps_host || true)"
+    ws_path="$(uci -q get owrtremote.main.vps_ws_path || true)"
+    ws_path="${ws_path:-/owrt-ws/}"
+    jq -e --arg tr "$tr" --arg port "$port" --arg sni "$sni" --arg path "$ws_path" '
+      [.outbounds[]? | select(.tag=="vps-interconn" or .tag=="vps-ssh-interconn")] as $links
+      | ($links|length==2) and ([$links[].tag]|unique|length==2)
+      and all($links[];
+        .protocol=="vless"
+        and (.settings.port == ($port|tonumber))
+        and (if $tr=="tcp" then
+          ((.streamSettings.network // "tcp")=="tcp")
+          and ((.streamSettings.security // "none")=="none")
+        else
+          $sni!="" and (.streamSettings.network=="ws")
+          and (.streamSettings.security=="tls")
+          and (.streamSettings.tlsSettings.serverName==$sni)
+          and (.streamSettings.tlsSettings.allowInsecure==false)
+          and (.streamSettings.tlsSettings.alpn|index("http/1.1")!=null)
+          and (.streamSettings.wsSettings.path==$path)
+          and (.streamSettings.wsSettings.host==$sni)
+        end))
+    ' "$config" >/dev/null || abort 'existing reverse links disagree with pinned transport/port'
 }
 
 stage() {
@@ -163,6 +198,11 @@ stage() {
     done
     check_payload "$STATE/stage/unpacked"
     printf '%s\n' "$expected" > "$STATE/stage/archive.sha256"
+    if [ "${RO_TEST_MODE:-0}" != 1 ]; then
+        printf '%s\n' "$rid" "$tr" "$port" > "$STATE/stage/target"
+        sha_file /etc/config/owrtremote > "$STATE/stage/uci.sha256"
+        sha_file "$config" > "$STATE/stage/xray.sha256"
+    fi
     trap - EXIT HUP INT TERM
     info 'GUARD: STAGED - archive and file hashes verified. Router software unchanged.'
 }
@@ -173,6 +213,11 @@ snapshot() {
     preflight_live
     check_router_tree
     [ -s "$STATE/stage/archive.sha256" ] || abort 'verified stage missing'
+    if [ "${RO_TEST_MODE:-0}" != 1 ]; then
+        [ "$(cat "$STATE/stage/target")" = "$(printf '%s\n' "$rid" "$tr" "$port")" ] || abort 'stage belongs to another target'
+        [ "$(sha_file /etc/config/owrtremote)" = "$(cat "$STATE/stage/uci.sha256")" ] || abort 'UCI changed after stage'
+        [ "$(sha_file "$config")" = "$(cat "$STATE/stage/xray.sha256")" ] || abort 'Xray JSON changed after stage'
+    fi
     [ ! -e "$STATE/backup" ] || abort 'backup already exists; never overwrite'
     [ ! -e "$STATE/pending" ] || abort 'pending transaction exists'
     [ "$(sha_file "$STATE/stage/candidate.tar")" = "$(cat "$STATE/stage/archive.sha256")" ] || abort 'stage hash changed'
@@ -202,11 +247,56 @@ snapshot() {
         cp -p "$old" "$STATE/backup/files/$rel"
         sha_file "$old" >> "$STATE/backup/critical.sha256"
     done
+    if [ "${RO_TEST_MODE:-0}" != 1 ]; then
+        [ "$(sha_file /etc/config/owrtremote)" = "$(cat "$STATE/stage/uci.sha256")" ] || abort 'UCI changed during snapshot'
+        [ "$(sha_file "$config")" = "$(cat "$STATE/stage/xray.sha256")" ] || abort 'Xray JSON changed during snapshot'
+        [ "$(sha_file "$STATE/backup/files/etc/config/owrtremote")" = "$(cat "$STATE/stage/uci.sha256")" ] || abort 'UCI backup digest mismatch'
+        [ "$(sha_file "$STATE/backup/files/etc/xray/owrt-remote-client.json")" = "$(cat "$STATE/stage/xray.sha256")" ] || abort 'Xray backup digest mismatch'
+        sync
+    fi
     trap - EXIT HUP INT TERM
     info 'GUARD: SNAPSHOT READY - original files backed up on persistent overlay; no installation performed.'
 }
 
+
+# No persistent writes. This checks real-device prerequisites before stage.
+inspect() {
+    [ "$#" -eq 0 ] || abort 'usage: inspect'
+    [ "${RO_TEST_MODE:-0}" != 1 ] || abort 'inspect requires real OpenWrt'
+    preflight_live
+    check_router_tree
+    [ -z "$(uci -q changes owrtremote)" ] || abort 'uncommitted UCI changes'
+    for tool in tar sha256sum awk sed cmp df sync ubus; do
+        command -v "$tool" >/dev/null 2>&1 || abort "missing tool: $tool"
+    done
+    [ -x /sbin/procd ] || abort 'procd unavailable'
+    ubus -t 3 list service | grep -qx service || abort 'procd service API unavailable'
+    free_kb="$(df -Pk /etc | awk 'END {print $4}')"
+    ram_kb="$(awk '$1=="MemAvailable:" {print $2}' /proc/meminfo)"
+    case "$free_kb" in ''|*[!0-9]*) abort 'overlay space unavailable' ;; esac
+    case "$ram_kb" in ''|*[!0-9]*) abort 'available RAM unknown' ;; esac
+    info "GUARD: TARGET $rid transport=$tr port=$port"
+    info "GUARD: FREE OVERLAY KiB=$free_kb; AVAILABLE RAM KiB=$ram_kb"
+    [ "$free_kb" -ge 24576 ] || abort 'less than 24 MiB persistent overlay free'
+    [ "$ram_kb" -ge 20480 ] || abort 'less than 20 MiB available RAM'
+    for entry in pending armed stage backup transaction.sh; do
+        [ ! -e "$STATE/$entry" ] && [ ! -L "$STATE/$entry" ] ||
+            abort "existing transaction artifact: $entry; inspect manually"
+    done
+    present_count=0
+    for rel in $FILES; do
+        if [ -f "$(path "$rel")" ]; then
+            present_count=$((present_count + 1))
+        elif [ -e "$(path "$rel")" ]; then
+            abort "unexpected file type: $rel"
+        fi
+    done
+    info "GUARD: EXISTING FILES=$present_count/10"
+    info 'GUARD: INSPECT PASS - no persistent files or services changed.'
+}
+
 case "${1:-}" in
+    inspect) shift; inspect "$@" ;;
     stage) shift; stage "$@" ;;
     snapshot) shift; snapshot "$@" ;;
     *) abort 'supported now: stage bundle.tar SHA256 | snapshot. Apply/confirm/watchdog not yet enabled.' ;;

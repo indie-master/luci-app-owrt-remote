@@ -5,7 +5,10 @@
 !docker/
 !docker/hub/
 !docker/hub/Dockerfile
+!docker/hub/askpass.sh
 !docker/hub/requirements.lock
+!docker/transport_profiles.py
+!docker/xray_releases.py
 !vps/
 !vps/owrt-remote-hub.py
 !vps/static/

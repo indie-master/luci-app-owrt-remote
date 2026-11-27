@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Router Orchestrator · Transport Configurator</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui,-apple-system,Segoe UI,sans-serif;background:#10151d;color:#eef1f7}
+*{box-sizing:border-box}body{margin:0 auto;max-width:1040px;padding:24px}header{display:flex;align-items:center;justify-content:space-between;gap:16px}
+h1{font-size:25px}h2{font-size:18px}.muted{color:#9aa8b9}a{color:#95beff}.panel{background:#19222e;border:1px solid #344254;border-radius:12px;padding:20px;margin:18px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:14px}label{display:flex;flex-direction:column;gap:7px;font-size:13px}
+input,select,textarea,button{background:#0f1823;color:#f3f6fb;border:1px solid #52647a;padding:11px;border-radius:8px;font:inherit;min-width:0}
+button{cursor:pointer;background:#2a5e9a;border-color:#2a5e9a;font-weight:600}button:disabled{opacity:.4;cursor:default}
+button.secondary{background:#293749;border-color:#53647b}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c1219;padding:16px;border-radius:8px;min-height:80px}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.advanced{margin-top:18px;border-top:1px solid #344254;padding-top:14px}.advanced summary{cursor:pointer;font-weight:600;margin-bottom:12px}@media(max-width:500px){body{padding:14px}header{flex-wrap:wrap}.grid{grid-template-columns:minmax(0,1fr)}.actions>*{max-width:100%;width:100%}}[hidden]{display:none!important}.note{border-left:3px solid #c8a661;padding:10px 14px;background:#26251d}.error{color:#ffaaa9}
+</style></head><body data-csrf="__TRANSPORT_CSRF__" data-stage-enabled="__TRANSPORT_STAGE_ENABLED__">
+<header><div><h1>Конфигуратор транспортов</h1><div class="muted">Создание защищённого профиля</div></div><a href="/secure-profiles/">← Каталог</a></header>
+<div class="note">Сохрани профиль в каталоге. Сертификаты, REALITY-ключи и внутренний порт могут подбираться автоматически. Для новых входов используй свободный домен; существующие SNI сайта или HUB не переназначаются.</div>
+<form class="panel" id="editor">
+<h2>Новый транспорт управления</h2><p class="muted">Основной сценарий: сохрани черновик, затем проверь его в каталоге. Пустые поля пары TLS подбираются из подключённого хранилища; пустые REALITY-ключи генерируются на сервере. Это не запускает серверный вход.</p>
+<div class="grid">
+<label>Идентификатор профиля<input name="name" placeholder="например, management-wss" maxlength="64" pattern="[A-Za-z0-9_-]{1,64}" required></label>
+<label>Название в каталоге<input name="label" placeholder="Например, WSS основной" maxlength="100" required></label>
+<label>Публичный порт (для каталога)<input name="public_port" type="number" min="1" max="65535" value="443" required></label>
+<label>Транспорт<select id="transportFamily"><option value="tcp">TCP / RAW</option><option value="ws">WebSocket</option><option value="xhttp">XHTTP</option><option value="grpc">gRPC</option></select></label>
+<label>Защита<select id="transportSecurity"><option value="tls">TLS</option><option value="reality">REALITY</option></select></label>
+<input type="hidden" id="transport" name="transport" value="tcp-tls">
+<label>Внутренний порт Xray (0 — автоматически)<input name="port" type="number" min="0" max="65535" value="0" required></label>
+<label>Хост VPS для подключения роутера<input name="remote_host" placeholder="Новый DNS-адрес входа" maxlength="255" required></label>
+<label data-field="server_name">SNI / домен<input name="server_name" placeholder="SNI нового входа" required></label>
+<label data-field="path">URL path<input name="path" value="/owrt-remote"></label>
+<label data-field="service_name">gRPC service name<input name="service_name" value="owrt_remote"></label>
+<label data-field="target_host">REALITY target host<input name="target_host" placeholder="REALITY target с TLS 1.3 / h2"></label>
+<label data-field="server_names">Дополнительные serverNames (через запятую или с новой строки)<textarea name="server_names" rows="3" placeholder="www.example.org"></textarea></label>
+</div>
+<p class="actions"><button type="button" id="saveDraft">Сохранить черновик</button><a href="/secure-profiles/">Открыть каталог профилей</a></p>
+<details class="advanced"><summary>Дополнительные параметры и диагностика</summary>
+<div class="grid">
+<label>UUID роутера (необязательно; только для клиентского JSON)<input name="router_uuid" autocomplete="off" placeholder="UUID из карточки роутера"></label>
+<label>Роутер для теневого reverse-пилота<select name="router_id" id="router_id"><option value="">Без роутера — проверка схемы</option></select></label>
+<label>Тестовый LuCI-порт VPS<input name="admin_test_port" type="number" value="21080" min="1024" max="65535"></label>
+<label>Тестовый SSH-порт VPS<input name="ssh_test_port" type="number" value="22080" min="1024" max="65535"></label>
+<label>SSH-пароль роутера (необязательно)<input name="ssh_password" type="password" autocomplete="off" placeholder="Если ключ SSH не настроен"></label>
+<label data-field="certificate_file">Сертификат (необязательно для черновика)<input name="certificate_file" placeholder="Автоподбор при сохранении"></label>
+<label data-field="key_file">Ключ TLS (необязательно для черновика)<input name="key_file" placeholder="Автоподбор при сохранении"></label>
+<label data-field="target_port">REALITY target port<input name="target_port" type="number" value="443"></label>
+<label data-field="short_ids">REALITY short IDs, через запятую<input name="short_ids" placeholder="Генерируется автоматически"></label>
+<label data-field="private_key">REALITY private key<input name="private_key" type="password" autocomplete="off" placeholder="Вставить только для предварительной проверки"></label>
+<label data-field="public_key">REALITY public key (для роутера)<input name="public_key" autocomplete="off" placeholder="Публичный ключ из Xray"></label>
+</div><p id="realityActions" hidden><button type="button" class="secondary" id="generateReality">Создать пару ключей и Short ID</button> <button type="button" class="secondary" id="generateShortId">Новый Short ID</button></p>
+<div class="actions"><button type="submit" class="secondary">Расширенная проверка JSON</button><button type="button" class="secondary" id="routerPreflight" disabled>Проверить на OpenWrt без изменений</button><button type="button" class="secondary" id="stagePilot" disabled>Запустить тестовый серверный вход (10 мин)</button></div>
+<p class="muted">Настройка и публикация — через каталог. Фактическое применение профиля на роутере ещё не включено.</p>
+</details>
+</form>
+<div class="panel" id="pilotPanel" hidden>
+<h2>Активный серверный пилот</h2>
+<p class="muted" id="pilotStatus" aria-live="polite">Проверка статуса…</p>
+<button type="button" class="secondary" id="pilotRefresh">Обновить статус</button>
+<button type="button" class="secondary" id="clientPilot" disabled>Проверить shadow-транспорт на OpenWrt (3 мин)</button>
+<button type="button" class="secondary" id="pilotRollback" disabled>Немедленно откатить пилот</button>
+</div>
+<div class="panel"><h2>Результат проверки</h2><pre id="output" aria-live="polite">Заполни параметры и сохрани черновик.</pre></div>
+<script>
+const form=document.getElementById('editor'),output=document.getElementById('output'),choice=document.getElementById('transport');
+const realityFields=['server_name','server_names','target_host','target_port','short_ids','private_key','public_key'];
+const fields={'tcp-tls':['server_name','certificate_file','key_file'],wss:['server_name','path','certificate_file','key_file'],'reality-tcp':realityFields,xhttp:['server_name','path','certificate_file','key_file'],grpc:['server_name','service_name','certificate_file','key_file'],'reality-xhttp':[...realityFields,'path'],'reality-grpc':[...realityFields,'service_name']};
+function isReality(t){return t.startsWith('reality-')}
+function names(values){return [...new Set([values.server_name,...values.server_names.split(/[\s,]+/)].map(x=>x.trim()).filter(Boolean))]}
+function randomShortId(){return Array.from(crypto.getRandomValues(new Uint8Array(8)),v=>v.toString(16).padStart(2,'0')).join('')}
+function base64url(bytes){return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+document.getElementById('generateShortId').addEventListener('click',()=>{form.elements.short_ids.value=randomShortId()});
+document.getElementById('generateReality').addEventListener('click',async()=>{
+ try{
+  // WebCrypto runs locally in the browser, never calls a third-party key service.
+  const pair=await crypto.subtle.generateKey({name:'X25519'},true,['deriveBits']);
+  const pkcs8=new Uint8Array(await crypto.subtle.exportKey('pkcs8',pair.privateKey));
+  const pub=new Uint8Array(await crypto.subtle.exportKey('raw',pair.publicKey));
+  const prefix='302e020100300506032b656e04220420';
+  if(pkcs8.length!==48||pub.length!==32||Array.from(pkcs8.slice(0,16),v=>v.toString(16).padStart(2,'0')).join('')!==prefix)throw Error('Неподдерживаемый формат X25519');
+  form.elements.private_key.value=base64url(pkcs8.slice(16));
+  form.elements.public_key.value=base64url(pub);
+  form.elements.short_ids.value=randomShortId();
+  output.classList.remove('error');output.textContent='Ключи созданы локально. Сохрани профиль только после проверки.';
+ }catch(error){output.classList.add('error');output.textContent='Браузер не поддерживает генерацию X25519 в этом контексте. Используй HTTPS и современный браузер либо вставь пару из xray x25519.'}
+});
+function refresh(){const allowed=new Set(fields[choice.value]);for(const label of form.querySelectorAll('[data-field]'))label.hidden=!allowed.has(label.dataset.field);document.getElementById('realityActions').hidden=!isReality(choice.value)}
+const family=document.getElementById('transportFamily'),protection=document.getElementById('transportSecurity');
+function selectWireProfile(){
+ const ws=family.value==='ws';
+ protection.querySelector('option[value="reality"]').disabled=ws;
+ if(ws)protection.value='tls';
+ choice.value=protection.value==='reality'?'reality-'+family.value:
+    ({tcp:'tcp-tls',ws:'wss',xhttp:'xhttp',grpc:'grpc'})[family.value];
+ form.elements.target_host.required=isReality(choice.value);
+ refresh();
+}
+family.addEventListener('change',selectWireProfile);
+protection.addEventListener('change',selectWireProfile);
+selectWireProfile();
+const stageAvailable=document.body.dataset.stageEnabled==='1';
+document.getElementById('pilotPanel').hidden=!stageAvailable;
+document.getElementById('stagePilot').hidden=!stageAvailable;
+(async()=>{
+ try{
+  const response=await fetch('/api/transports/routers',{credentials:'same-origin'});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Не удалось загрузить роутеры');
+  const dropdown=document.getElementById('router_id');
+  for(const router of result.routers){
+   const option=document.createElement('option');
+   option.value=router.id;
+   option.textContent=router.name+' ('+router.id+', '+router.transport+')';
+   dropdown.appendChild(option);
+  }
+ }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
+})();
+const routerSelect=document.getElementById('router_id'),preflight=document.getElementById('routerPreflight');
+routerSelect.addEventListener('change',()=>{preflight.disabled=!routerSelect.value});
+preflight.addEventListener('click',async()=>{
+ if(!routerSelect.value)return;
+ const values=Object.fromEntries(new FormData(form).entries());
+ const data={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])data[key]=values[key];
+ if(isReality(values.transport)){
+  data.target_port=Number(values.target_port);
+  data.short_ids=values.short_ids.split(',').map(x=>x.trim());
+  data.server_names=names(values);
+ }
+ preflight.disabled=true;
+ output.classList.remove('error');
+ output.textContent='Проверка кандидата установленным Xray на OpenWrt (текущий туннель остаётся без изменений)…';
+ try{
+  const response=await fetch('/api/transports/router/preflight',{
+   method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',
+   body:JSON.stringify({profiles:[data],router_id:values.router_id,
+                        remote_host:values.remote_host,ssh_password:values.ssh_password})
+  });
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Router preflight failed');
+  output.textContent='OpenWrt Xray: PASS. UCI, работающий туннель и Xray не изменялись.';
+ }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
+ finally{preflight.disabled=!routerSelect.value}
+});
+const pilotStatus=document.getElementById('pilotStatus'),pilotRollback=document.getElementById('pilotRollback'),clientPilot=document.getElementById('clientPilot');
+async function refreshPilotStatus(){
+ try{
+  const response=await fetch('/api/transports/stage/status',{credentials:'same-origin',cache:'no-store'});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Статус пилота недоступен');
+  pilotStatus.textContent=result.active
+    ? 'Роутер: '+result.router_id+' · '+result.phase+' · осталось '+result.seconds_remaining+' с'
+    : 'Активных пилотов нет · '+result.phase;
+  pilotRollback.disabled=!(document.body.dataset.stageEnabled==='1'&&['STAGED','VERIFIED'].includes(result.phase));
+  clientPilot.disabled=!(document.body.dataset.stageEnabled==='1'&&result.phase==='STAGED'&&result.seconds_remaining>=100&&result.router_id===routerSelect.value);
+ }catch(error){pilotStatus.textContent=String(error.message||error);pilotRollback.disabled=true;clientPilot.disabled=true}
+}
+document.getElementById('pilotRefresh').addEventListener('click',refreshPilotStatus);
+clientPilot.addEventListener('click',async()=>{
+ if(clientPilot.disabled||!routerSelect.value)return;
+ if(!confirm('Запустить отдельное Xray-ядро на выбранном OpenWrt на 3 минуты и проверить обратный SSH-канал? Основная конфигурация останется без изменений.'))return;
+ clientPilot.disabled=true;
+ const fields=Object.fromEntries(new FormData(form).entries());
+ pilotStatus.textContent='Запускаю тестовый Xray на OpenWrt и проверяю shadow reverse SSH…';
+ try{
+  const response=await fetch('/api/transports/router/pilot/start',{
+   method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+   body:JSON.stringify({router_id:routerSelect.value,ssh_password:fields.ssh_password||''})
+  });
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'OpenWrt pilot failed');
+  pilotStatus.textContent='Проверка успешна: shadow SSH reverse работает. Основная UCI не изменена. Тестовый Xray на роутере завершится автоматически через 180 секунд.';
+ }catch(error){pilotStatus.textContent=String(error.message||error)}
+ finally{await refreshPilotStatus()}
+});
+
+pilotRollback.addEventListener('click',async()=>{
+ if(pilotRollback.disabled)return;
+ if(!confirm('Немедленно восстановить прежний Xray-конфиг и перезапустить Docker Xray? Текущие туннели кратковременно прервутся.'))return;
+ pilotRollback.disabled=true;
+ pilotStatus.textContent='Запрошен откат пилота…';
+ try{
+  const response=await fetch('/api/transports/stage/rollback',{method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+    body:JSON.stringify({confirmed:true})});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Не удалось запустить откат');
+  pilotStatus.textContent='Откат выполняется. Проверь статус через несколько секунд.';
+ }catch(error){pilotStatus.textContent=String(error.message||error)}
+});
+refreshPilotStatus();
+const stageButton=document.getElementById('stagePilot');
+stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value;
+routerSelect.addEventListener('change',()=>{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value});
+routerSelect.addEventListener('change',refreshPilotStatus);
+stageButton.addEventListener('click',async()=>{
+ if(document.body.dataset.stageEnabled!=='1'||!routerSelect.value)return;
+ const values=Object.fromEntries(new FormData(form).entries());
+ const profile={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])profile[key]=values[key];
+ if(isReality(profile.transport)){
+  profile.target_port=Number(values.target_port);
+  profile.short_ids=values.short_ids.split(',').map(x=>x.trim());
+  profile.server_names=names(values);
+ }
+ if(!confirm('Пилот перезапустит Docker Xray один раз и создаст дополнительный вход на 10 минут. Действующие соединения на время рестарта прервутся. Продолжить?'))return;
+ stageButton.disabled=true;
+ output.classList.remove('error');output.textContent='Создание серверного shadow-пилота…';
+ try{
+  const request={profiles:[profile],router_id:values.router_id,remote_host:values.remote_host,
+   admin_test_port:Number(values.admin_test_port),ssh_test_port:Number(values.ssh_test_port),confirmed:true};
+  const response=await fetch('/api/transports/stage/start',{method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+   body:JSON.stringify(request)});
+  const start=await response.json();if(!response.ok||!start.ok)throw Error(start.error||'Ошибка запуска пилота');
+  output.textContent='Задание '+start.job_id+'; ожидание результата…';
+  for(let count=0;count<130;count++){
+   await new Promise(resolve=>setTimeout(resolve,2000));
+   const check=await fetch('/api/transports/stage/job/'+encodeURIComponent(start.job_id),{credentials:'same-origin'});
+   const result=await check.json();if(!check.ok||!result.ok)throw Error(result.error||'Ошибка статуса');
+   output.textContent=JSON.stringify(result.job,null,2);
+   if(result.job.status==='success'||result.job.status==='failed')break;
+  }
+ }catch(error){output.classList.add('error');output.textContent=String(error.message||error)}
+ finally{stageButton.disabled=document.body.dataset.stageEnabled!=='1'||!routerSelect.value;refreshPilotStatus()}
+});
+document.getElementById('saveDraft').addEventListener('click',async()=>{
+ if(!form.reportValidity())return;
+ const button=document.getElementById('saveDraft');
+ const values=Object.fromEntries(new FormData(form).entries());
+ const profile={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])profile[key]=values[key];
+ if(isReality(values.transport)){
+  profile.target_port=Number(values.target_port);
+  profile.short_ids=values.short_ids.split(',').map(x=>x.trim()).filter(Boolean);
+  profile.server_names=names(values);
+ }
+ button.disabled=true;output.classList.remove('error');output.textContent='Сохранение приватного черновика…';
+ try{
+  const response=await fetch('/api/secure-profiles/draft',{method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','X-Transport-Action-CSRF':document.body.dataset.csrf},
+   body:JSON.stringify({profile,label:values.label,remote_host:values.remote_host,public_port:Number(values.public_port)})});
+  const result=await response.json();
+  if(!response.ok||!result.ok)throw Error(result.error||'Не удалось сохранить');
+  output.textContent='Черновик '+result.draft.profile_id+' · ревизия '+result.draft.revision+' · внутренний порт '+result.draft.backend_port+
+   '\nСохранён на сервере. Если поля ключей оставлены пустыми, REALITY-ключи созданы сервером.'+
+   '\nСерверный вход не опубликован, роутеры не изменены.';
+ }catch(err){output.classList.add('error');output.textContent=String(err.message||err)}
+ finally{button.disabled=false}
+});
+form.addEventListener('submit',async e=>{
+ e.preventDefault();output.classList.remove('error');output.textContent='Проверка…';
+ const values=Object.fromEntries(new FormData(form).entries());
+ const data={name:values.name,port:Number(values.port),transport:values.transport};
+ for(const key of fields[values.transport])data[key]=values[key];
+ if(isReality(values.transport)){data.target_port=Number(values.target_port);data.short_ids=values.short_ids.split(',').map(x=>x.trim());data.server_names=names(values)}
+ try{
+ const isPilot=!!values.router_id;
+ const route=isPilot?'/api/transports/canary/preview':'/api/transports/preview';
+ const body={profiles:[data],router_uuid:values.router_uuid,remote_host:values.remote_host};
+ if(isPilot){body.router_id=values.router_id;body.admin_test_port=Number(values.admin_test_port);body.ssh_test_port=Number(values.ssh_test_port)}
+ const response=await fetch(route,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});
+ const result=await response.json();
+ if(!response.ok||!result.ok)throw Error(result.error||'Ошибка');
+ output.textContent=JSON.stringify(isPilot?{pilot:result.pilot,clientOutbounds:result.client_outbounds,validatedByXray:result.validated_by_xray,applied:false}:{server:result.preview,routerOutbound:result.router_outbound||null,validatedByXray:result.validated_by_xray},null,2)
+}
+ catch(err){output.classList.add('error');output.textContent=String(err.message||err)}
+});
+</script></body></html>

@@ -2,6 +2,9 @@
 import hashlib
 import importlib.util
 import io
+import json
+import re
+import shutil
 import os
 from pathlib import Path
 import subprocess
@@ -144,6 +147,41 @@ class GuardedBundleTests(unittest.TestCase):
         self.assertNotEqual(p.returncode,0)
         self.assertIn('not yet enabled',p.stderr)
         self.assertTrue((self.router/'usr/sbin/owrt-remote').read_text().startswith('ORIGINAL'))
+
+@unittest.skipUnless(shutil.which("jq"), "jq required for live parity filter tests")
+class LiveStageParityTests(unittest.TestCase):
+    def validate(self, transport, ports, *, insecure=False, duplicate=False,
+                 second_transport=None):
+        script = GUARD.read_text()
+        match = re.search(r"""jq -e --arg tr "\$tr" --arg port "\$port" --arg sni "\$sni" --arg path "\$ws_path" '(.*?)' "\$config" """, script, re.S)
+        self.assertIsNotNone(match)
+        links = []
+        for index, port in enumerate(ports):
+            tr = transport if index == 0 else (second_transport or transport)
+            stream = {"network": "tcp", "security": "none"} if tr == "tcp" else {
+                "network": "ws", "security": "tls",
+                "tlsSettings": {"serverName": "hub.example", "allowInsecure": insecure,
+                                "alpn": ["http/1.1"]},
+                "wsSettings": {"path": "/custom/", "host": "hub.example"}}
+            links.append({"tag": "vps-interconn" if index == 0 or duplicate else "vps-ssh-interconn",
+                          "protocol": "vless", "settings": {"port": port},
+                          "streamSettings": stream})
+        return subprocess.run(["jq", "-e", "--arg", "tr", transport, "--arg", "port", "19001",
+                               "--arg", "sni", "hub.example", "--arg", "path", "/custom/",
+                               match.group(1)], input=json.dumps({"outbounds": links}),
+                              capture_output=True, text=True, timeout=5).returncode
+
+    def test_arbitrary_tcp_and_wss_ports(self):
+        for tr in ("tcp", "ws"):
+            self.assertEqual(self.validate(tr, [19001, 19001]), 0)
+            self.assertNotEqual(self.validate(tr, [19001, 19002]), 0)
+            self.assertNotEqual(self.validate(tr, [19001]), 0)
+            self.assertNotEqual(self.validate(tr, [19001, 19001], duplicate=True), 0)
+
+    def test_mixed_and_insecure_wss_rejected(self):
+        self.assertNotEqual(self.validate("ws", [19001, 19001], insecure=True), 0)
+        self.assertNotEqual(self.validate("ws", [19001, 19001], second_transport="tcp"), 0)
+
 
 if __name__ == '__main__':
     unittest.main()

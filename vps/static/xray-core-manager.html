@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Router Orchestrator · Xray Core Manager</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui,sans-serif;background:#10151d;color:#eef1f7}
+*{box-sizing:border-box}body{max-width:980px;margin:0 auto;padding:24px}a{color:#9bbfff}
+.panel{background:#19232f;border:1px solid #364457;border-radius:12px;padding:20px;margin:18px 0}
+h1{font-size:24px}h2{font-size:18px}.muted{color:#a2afbf}
+button,select{background:#294974;color:#fff;border:1px solid #53677f;padding:11px;border-radius:8px;font:inherit}
+button{cursor:pointer}button.danger{background:#5f3037}button:disabled{opacity:.45}
+.actions{display:flex;flex-wrap:wrap;gap:9px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c121b;padding:16px;border-radius:8px}
+.warning{border-left:3px solid #e9ae59;background:#2b261d;padding:12px 16px}
+</style></head>
+<body data-csrf="__CSRF_TOKEN__">
+<a href="/">← Router Orchestrator</a>
+<h1>Xray Core Manager</h1>
+<div class="warning">Обновления ядра нарушают активные туннели на короткое время. Перед обновлением сохраняется предыдущий образ; новый считается исправным только после проверки heartbeat и SSH ранее активных роутеров. Для критичной инфраструктуры сначала проверь совместимость на пилотном роутере.</div>
+<section class="panel">
+<h2>Текущее состояние</h2><p id="running" class="muted">Загрузка состояния…</p><p id="maintenance" role="status" class="muted"></p>
+<div class="actions"><button id="refresh">Обновить сведения</button><button class="danger" data-action="restart" disabled>Перезапустить Xray</button><button class="danger" data-action="rollback" disabled>Откатить ядро</button></div>
+</section>
+<section class="panel">
+<h2>Стабильные выпуски</h2>
+<p>Предварительные релизы не предлагаются. Образ скачивается из официального GHCR, проверяется с действующим конфигом и закрепляется по digest.</p>
+<p id="releaseStatus" class="muted" role="status">Загрузка списка…</p><select id="version" disabled aria-label="Стабильная версия Xray"><option value="">Загрузка версий…</option></select>
+<div class="actions" style="margin-top:14px">
+<button id="retryVersions" type="button">Обновить список версий</button><button data-action="prepare" disabled>Подготовить образ</button>
+<button class="danger" data-action="upgrade" disabled id="upgrade">Установить подготовленную версию</button>
+</div>
+</section>
+<section class="panel"><h2>Операция</h2><pre id="job" aria-live="polite">Операций нет.</pre></section>
+<script>
+const byId=id=>document.getElementById(id);
+const csrf=document.body.dataset.csrf,version=byId('version'),job=byId('job'),info=byId('running');
+let preparedVersion=null, statusKnown=false, active=false, held=true, busy=false, versionsReady=false, loadingVersions=false;
+let capabilities={};
+function controls(){
+ for(const button of document.querySelectorAll('[data-action]')){
+  const action=button.dataset.action;
+  const permission={prepare:'may_prepare',upgrade:'may_upgrade',restart:'may_restart',rollback:'may_restart'}[action];
+  button.disabled=busy||!statusKnown||capabilities[permission]!==true||(action==='prepare'?!versionsReady||!version.value:
+   held||(action!=='rollback'&&!active)||(action==='upgrade'&&(!versionsReady||!version.value||preparedVersion!==version.value)));
+ }
+ version.disabled=busy||!versionsReady;byId('refresh').disabled=busy;
+ byId('retryVersions').disabled=busy||loadingVersions;
+}
+async function api(path,options){
+ const r=await fetch(path,Object.assign({credentials:'same-origin',cache:'no-store'},options||{}));
+ let data;try{data=await r.json()}catch{throw Error('Сервер вернул не-JSON ответ')}
+ if(!r.ok||!data.ok)throw Error(data.error||'Ошибка запроса');
+ return data;
+}
+async function refreshStatus(){
+ statusKnown=false;controls();
+ try{
+  const s=await api('/api/xray/core/info');
+  active=s.active===true;held=s.maintenance_hold!==false;statusKnown=true;
+  capabilities=s;
+  info.textContent=[active?'Работает':'Недоступен','Docker',s.version&&'Xray '+s.version,s.architecture,s.image||'неизвестный образ'].filter(Boolean).join(' · ');
+  byId('maintenance').textContent=held?'Включён maintenance HOLD. Операции обслуживания заблокированы.':
+   s.recovery_pending?'Есть прерванная операция. Core Manager сначала восстановит рабочую версию.':
+   s.may_restart?'Операции обслуживания доступны.':'Для обслуживания нужен управляемый unified Docker-стек.';
+ }catch(e){info.textContent='Не удалось получить состояние: '+String(e.message||e);byId('maintenance').textContent='Изменения заблокированы до получения статуса.'}
+ finally{controls()}
+}
+async function refreshVersions(){
+ if(loadingVersions)return;
+ loadingVersions=true;versionsReady=false;controls();
+ const previous=version.value;
+ byId('releaseStatus').textContent='Получение стабильных версий GitHub…';
+ version.replaceChildren(new Option('Загрузка…',''));
+ try{
+  const data=await api('/api/xray/core/versions');
+  if(!Array.isArray(data.versions)||!data.versions.length)throw Error('Нет стабильных выпусков');
+  version.replaceChildren(...data.versions.map(tag=>new Option(tag,tag)));
+  if(data.versions.includes(previous))version.value=previous;
+  versionsReady=true;
+  byId('releaseStatus').textContent='Доступно стабильных версий: '+data.versions.length;
+ }catch(e){
+  version.replaceChildren(new Option('Список недоступен',''));
+  byId('releaseStatus').textContent='GitHub: '+String(e.message||e)+' · нажми «Обновить список версий».';
+ }finally{loadingVersions=false;controls()}
+}
+async function refresh(){await Promise.all([refreshStatus(),refreshVersions()])}
+async function watch(id){
+ for(let i=0;i<465;i++){
+  try{
+   const data=await api('/api/xray/core/job/'+encodeURIComponent(id)),state=data.job;
+   job.textContent=JSON.stringify(state,null,2);
+   if(['success','failed'].includes(state.status)){
+    if(state.status==='success'&&state.action==='prepare')preparedVersion=state.version;
+    await refreshStatus();return;
+   }
+  }catch(e){job.textContent='Повторная проверка статуса: '+String(e.message||e)+' · ID '+id}
+  await new Promise(resolve=>setTimeout(resolve,2000));
+ }
+ job.textContent='Задание ещё не подтверждено · ID '+id;
+}
+byId('refresh').onclick=refreshStatus;
+byId('retryVersions').onclick=refreshVersions;
+version.onchange=controls;
+document.querySelectorAll('[data-action]').forEach(button=>button.onclick=async()=>{
+ if(button.disabled)return;
+ const action=button.dataset.action,v=version.value;
+ if(action!=='prepare'&&!confirm('Подтвердить операцию? Активные соединения могут прерваться.'))return;
+ busy=true;controls();
+ try{
+  const result=await api('/api/xray/core/start',{method:'POST',headers:{'Content-Type':'application/json','X-Core-Action-CSRF':csrf},body:JSON.stringify({action,confirmed:action!=='prepare',version:(action==='prepare'||action==='upgrade')?v:''})});
+  job.textContent='Операция запущена: '+result.job_id;await watch(result.job_id);
+ }catch(e){job.textContent=String(e.message||e)}
+ finally{busy=false;controls()}
+});
+controls();refresh();
+</script></body></html>

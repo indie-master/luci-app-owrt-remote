@@ -61,12 +61,15 @@ EOF
 	# A tmpfs/root overlay and an unmounted /overlay are never persistent storage.
 	[ "$mount" != /overlay ] || [ -d /overlay ]
 }
-log_init() {
-	local candidate selected mount fs flags free
+log_runtime_init() {
 	umask 077
 	log_ram_storage || { printf 'Remote: runtime directory must be tmpfs.\n' >&2; return 1; }
 	mkdir -p "$RUN_DIR" || return 1
 	chmod 700 "$RUN_DIR" || return 1
+}
+log_init() {
+	local candidate selected mount fs flags free
+	# Storage selection runs only after acquiring the journal lock.
 	# Pin one storage choice for this boot; never interleave two journal IDs.
 	selected="$(cat "$RUN_DIR/storage" 2>/dev/null)"
 	if [ -n "$selected" ]; then
@@ -105,26 +108,27 @@ EOF
 	fi
 }
 log_lock() {
-	local attempt owner
-	log_init || return 1
+	local attempt
+	log_runtime_init || return 1
+	# All journal writers use the SAME inode for the lifetime of this boot.
+	# Never unlink it: the kernel releases flock when the last owning FD closes,
+	# including on SIGKILL. No PID-file inspection or stale-owner reaping.
+	command -v flock >/dev/null 2>&1 || { log_diag flock-unavailable; return 1; }
+	[ ! -L "$RUN_DIR/journal.flock" ] || return 1
+	exec 9>>"$RUN_DIR/journal.flock" || return 1
 	attempt=0
-	while ! mkdir "$RUN_DIR/lock" 2>/dev/null; do
-		owner="$(cat "$RUN_DIR/lock/pid" 2>/dev/null)"
-		case "$owner" in
-			''|*[!0-9]*)
-				[ "$attempt" -lt 20 ] || log_reap_lock "$RUN_DIR/lock" "$attempt" ;;
-			*) kill -0 "$owner" 2>/dev/null || log_reap_lock "$RUN_DIR/lock" "$attempt" ;;
-		esac
+	while ! flock -n -x 9; do
 		log_pause
-		attempt=$((attempt + LOG_PAUSE_TENTHS)); [ "$attempt" -lt 100 ] || { log_diag lock-timeout; return 1; }
+		attempt=$((attempt + LOG_PAUSE_TENTHS))
+		[ "$attempt" -lt 100 ] || { exec 9>&-; log_diag lock-timeout; return 1; }
 	done
-	log_self_pid >"$RUN_DIR/lock/pid"
-	# Another first writer may have selected storage while we waited.
-	if [ -s "$RUN_DIR/storage" ]; then
-		LOG_DIR="$(cat "$RUN_DIR/storage")"
-		[ "$LOG_DIR" != "$RUN_DIR/fallback" ] || { PERSISTENT=0; LOG_LIMIT=65536; LOG_PART_LIMIT=8; }
-	else
-		printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage"
+	# Initialize storage and all associated limits together under the lock.
+	# A losing first writer must never carry a stale RAM-fallback flag.
+	log_init || { log_unlock; return 1; }
+	if [ ! -s "$RUN_DIR/storage" ]; then
+		printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage.new" &&
+			mv -f "$RUN_DIR/storage.new" "$RUN_DIR/storage" ||
+			{ log_unlock; return 1; }
 	fi
 	# Change storage only under the same append/export lock. On write/mount
 	# failure preserve the Flash queue and switch this boot to a bounded fallback.
@@ -133,6 +137,8 @@ log_lock() {
 	fi
 }
 log_reap_lock() {
+	# Collector lifecycle only. Never reap the kernel journal lock.
+	[ "$1" = "$RUN_DIR/collector-lock" ] || return 1
 	local owner reap_owner
 	# Serialize stale-lock removal itself, so two contenders cannot remove a
 	# freshly acquired lock after observing the same previous dead owner.
@@ -172,10 +178,14 @@ log_reap_lock() {
 log_fallback_locked() {
 	LOG_DIR="$RUN_DIR/fallback"; PERSISTENT=0; LOG_LIMIT=65536; LOG_PART_LIMIT=8
 	mkdir -p "$LOG_DIR" || return 1
-	printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage"
+	printf '%s\n' "$LOG_DIR" >"$RUN_DIR/storage.new" &&
+		mv -f "$RUN_DIR/storage.new" "$RUN_DIR/storage" || return 1
 	rm -f "$RUN_DIR/recovered" "$RUN_DIR/recovered-v2" "$RUN_DIR/ack"
 }
-log_unlock() { rm -f "$RUN_DIR/lock/pid"; rmdir "$RUN_DIR/lock" 2>/dev/null || true; }
+log_unlock() {
+	flock -u 9 || true
+	exec 9>&-
+}
 log_warn_locked() {
 	# One warning until successful recovery; never feed our own collector a loop.
 	if [ ! -f "$RUN_DIR/$1" ]; then
@@ -516,7 +526,7 @@ log_new_fact_locked() {
 	return 0
 }
 log_event_health_locked() {
-	local epoch uptime accepted_epoch accepted_up accepted suppressed failed extra
+	local epoch uptime accepted_epoch accepted_up accepted suppressed failed extra temp
 	accepted_epoch=0; accepted_up=0; accepted=0; suppressed=0; failed=0
 	if [ -s "$RUN_DIR/event-health" ]; then
 		read -r epoch uptime accepted_epoch accepted_up accepted suppressed failed extra <"$RUN_DIR/event-health"
@@ -528,8 +538,14 @@ log_event_health_locked() {
 		suppressed) [ "$suppressed" -ge 2147483647 ] || suppressed=$((suppressed + 1)) ;;
 		failed) [ "$failed" -ge 2147483647 ] || failed=$((failed + 1)) ;;
 	esac
-	printf '%s %s %s %s %s %s %s\n' "$epoch" "$uptime" "$accepted_epoch" "$accepted_up" "$accepted" "$suppressed" "$failed" >"$RUN_DIR/event-health.new" &&
-		mv -f "$RUN_DIR/event-health.new" "$RUN_DIR/event-health"
+	# Randomized temp file; publication is protected by the kernel journal lock.
+	temp="$(mktemp "$RUN_DIR/.event-health.XXXXXX")" || return 1
+	if ! printf '%s %s %s %s %s %s %s\n' "$epoch" "$uptime" "$accepted_epoch" "$accepted_up" "$accepted" "$suppressed" "$failed" >"$temp"; then
+		rm -f "$temp"; return 1
+	fi
+	if ! mv -f "$temp" "$RUN_DIR/event-health"; then
+		rm -f "$temp"; return 1
+	fi
 }
 log_append() {
 	local line size bytes dropped outcome
@@ -931,7 +947,7 @@ log_collect() {
 case "${1:-}" in
 	check) log_open && log_close ;;
 	status) log_status ;;
-	diagnostics) log_init && { [ ! -f "$RUN_DIR/diagnostics" ] || cat "$RUN_DIR/diagnostics"; } ;;
+	diagnostics) log_runtime_init && { [ ! -f "$RUN_DIR/diagnostics" ] || cat "$RUN_DIR/diagnostics"; } ;;
 	migrate) log_migrate ;;
 	flush) log_flush "${2:-}" ;;
 	collect) log_collect ;;

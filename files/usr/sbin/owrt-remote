@@ -374,6 +374,9 @@ active_ssh_session() {
 xray_bin_path() {
 	local configured candidate
 	configured="$(uci_get xray_bin /usr/bin/xray)"
+	# A content-addressed persistent executable is an explicit operator pin.
+	# Never select an unrelated RAM or system binary when that pin is missing.
+	case "$configured" in /etc/owrt-remote/xray-boot/xray-*) printf '%s' "$configured"; return;; esac
 	if [ -x "$configured" ]; then
 		printf '%s' "$configured"
 		return
@@ -505,8 +508,18 @@ install_package() {
 }
 
 ensure_xray_available() {
-	local configured candidate found
+	local configured candidate found pinned
 	configured="$(uci_get xray_bin /usr/bin/xray)"
+	case "$configured" in
+		/etc/owrt-remote/xray-boot/xray-*)
+			pinned="${configured##*/xray-}"
+			case "$pinned" in ''|*[!0-9a-f]*) log 'Xray: некорректный SHA256 закреплённого ядра'; return 1;; esac
+			[ "${#pinned}" = 64 ] && [ -f "$configured" ] && [ ! -L "$configured" ] && [ -x "$configured" ] &&
+				[ "$(xray_digest "$configured")" = "$pinned" ] ||
+				{ log 'Xray: закреплённое ядро отсутствует или повреждено; автоматическая смена версии запрещена'; return 1; }
+			return 0
+			;;
+	esac
 	[ -x "$configured" ] && return 0
 
 	for candidate in /usr/bin/xray /usr/bin/xray-core /usr/local/bin/xray /opt/bin/xray /tmp/owrt-xray/xray /tmp/xray; do
@@ -603,7 +616,7 @@ xray_reverse_finalrules_required() {
 }
 
 render_client_config() (
-	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir vps_transport vps_sni vps_ws_path stream_fields admin_rules ssh_rules
+	local temp_dir rc xray_host out stdout router_id vps_host vps_port uuid ssh_uuid encryption flow reverse_tag ssh_reverse_tag admin_host admin_port ssh_host ssh_port xray_config xray_config_dir vps_transport vps_sni vps_ws_path vps_xhttp_path vps_grpc_service vps_reality_public_key vps_reality_short_id stream_fields admin_rules ssh_rules
 	temp_dir=""
 	out=""
 	trap 'rm -f "$out"; [ -z "$temp_dir" ] || rmdir "$temp_dir" 2>/dev/null || true' EXIT
@@ -615,10 +628,14 @@ render_client_config() (
 	fi
 
 	router_id="$(safe_id "$(uci_get router_id main)")"
-	vps_host="$(uci_get vps_host '')"
-	vps_transport="$(uci_get vps_transport tcp)"
-	vps_sni="$(uci_get vps_sni "$vps_host")"
-	vps_ws_path="$(uci_get vps_ws_path /owrt-ws/)"
+	vps_host="${OWRT_REMOTE_CANDIDATE_HOST:-$(uci_get vps_host '')}"
+	vps_transport="${OWRT_REMOTE_CANDIDATE_TRANSPORT:-$(uci_get vps_transport tcp)}"
+	vps_sni="${OWRT_REMOTE_CANDIDATE_SNI:-$(uci_get vps_sni "$vps_host")}"
+	vps_ws_path="${OWRT_REMOTE_CANDIDATE_WS_PATH:-$(uci_get vps_ws_path /owrt-ws/)}"
+	vps_xhttp_path="${OWRT_REMOTE_CANDIDATE_XHTTP_PATH:-$(uci_get vps_xhttp_path /owrt-xhttp/)}"
+	vps_grpc_service="${OWRT_REMOTE_CANDIDATE_GRPC_SERVICE:-$(uci_get vps_grpc_service owrt_remote)}"
+	vps_reality_public_key="${OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY:-$(uci_get vps_reality_public_key '')}"
+	vps_reality_short_id="${OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID:-$(uci_get vps_reality_short_id '')}"
 	local wan_sockopt wan_xray_device
 	wan_sockopt=''
 	if truthy "$(uci_get wan_direct 0)"; then
@@ -628,13 +645,13 @@ render_client_config() (
 		wan_xray_device="$(wan_device)" || die "выбранный WAN интерфейс отключился"
 		wan_sockopt=", \"sockopt\": {\"mark\": $((PODKOP_BYPASS_MARK)), \"interface\": \"$(json_escape "$wan_xray_device")\"}"
 	fi
-	vps_port="$(xray_port vps_port "$(uci_get vps_port 8443)")" || return 1
-	uuid="$(uci_get vless_uuid '')"
-	ssh_uuid="$(uci_get ssh_vless_uuid '')"
+	vps_port="$(xray_port vps_port "${OWRT_REMOTE_CANDIDATE_PORT:-$(uci_get vps_port 8443)}")" || return 1
+	uuid="${OWRT_REMOTE_CANDIDATE_UUID:-$(uci_get vless_uuid '')}"
+	ssh_uuid="${OWRT_REMOTE_CANDIDATE_SSH_UUID:-$(uci_get ssh_vless_uuid '')}"
 	encryption="$(uci_get vless_encryption none)"
 	flow="$(uci_get vless_flow '')"
-	reverse_tag="$(uci_get reverse_tag reverse-in)"
-	ssh_reverse_tag="$(uci_get ssh_reverse_tag "${reverse_tag}-ssh")"
+	reverse_tag="${OWRT_REMOTE_CANDIDATE_REVERSE_TAG:-$(uci_get reverse_tag reverse-in)}"
+	ssh_reverse_tag="${OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG:-$(uci_get ssh_reverse_tag "${reverse_tag}-ssh")}"
 	admin_host="$(uci_get admin_host 127.0.0.1)"
 	admin_port="$(xray_port admin_port "$(uci_get admin_port 80)")" || return 1
 	ssh_host="$(uci_get ssh_host 127.0.0.1)"
@@ -657,16 +674,50 @@ render_client_config() (
 		fi
 	done
 	case "$vps_host" in *://*|*/*) die "vps_host должен содержать IP или домен без http(s):// и пути" ;; esac
-	case "$vps_transport" in tcp|ws) ;; *) die "vps_transport должен быть tcp или ws" ;; esac
+	case "$vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc|reality-xhttp|reality-grpc) ;; *) die "vps_transport: неподдерживаемый транспорт" ;; esac
 	stream_fields='"network": "tcp", "security": "none"'
 	admin_rules=''
 	ssh_rules=''
-	if [ "$vps_transport" = ws ]; then
-		[ -n "$vps_sni" ] || die "WSS требует vps_sni"
+	if [ "$vps_transport" != tcp ]; then
+		[ -n "$vps_sni" ] || die "транспорт требует vps_sni"
 		case "$vps_sni" in *://*|*/*|*[!a-zA-Z0-9._-]*) die "Некорректный vps_sni" ;; esac
-		case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
-		stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
 	fi
+	case "$vps_transport" in
+		tcp-tls)
+			stream_fields="\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false}"
+			;;
+		ws)
+			case "$vps_ws_path" in /*) ;; *) die "vps_ws_path должен начинаться с /" ;; esac
+			case "$vps_ws_path" in *[!a-zA-Z0-9/._~-]*) die "Недопустимый vps_ws_path" ;; esac
+			stream_fields="\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"http/1.1\"]}, \"wsSettings\": {\"path\": \"$(json_escape "$vps_ws_path")\", \"host\": \"$(json_escape "$vps_sni")\"}"
+			;;
+		reality-tcp|reality-xhttp|reality-grpc)
+			printf '%s\n' "$vps_reality_public_key" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{43}$' || die "REALITY: некорректный публичный ключ"
+			printf '%s\n' "$vps_reality_short_id" | LC_ALL=C grep -Eq '^[0-9a-fA-F]{0,16}$' || die "REALITY: некорректный shortId"
+			[ $((${#vps_reality_short_id} % 2)) -eq 0 ] || die "REALITY: shortId должен иметь чётную длину"
+			stream_fields="\"network\": \"${vps_transport#reality-}\", \"security\": \"reality\", \"realitySettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"fingerprint\": \"chrome\", \"publicKey\": \"$(json_escape "$vps_reality_public_key")\", \"shortId\": \"$(json_escape "$vps_reality_short_id")\"}"
+			case "$vps_transport" in
+				reality-xhttp)
+					case "$vps_xhttp_path" in /*) ;; *) die "XHTTP: path должен начинаться с /" ;; esac
+					case "$vps_xhttp_path" in *[!a-zA-Z0-9/._~-]*) die "XHTTP: недопустимый path" ;; esac
+					stream_fields="$stream_fields, \"xhttpSettings\": {\"path\": \"$(json_escape "$vps_xhttp_path")\", \"mode\": \"auto\"}"
+					;;
+				reality-grpc)
+					printf '%s\n' "$vps_grpc_service" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,64}$' || die "gRPC: некорректное имя сервиса"
+					stream_fields="$stream_fields, \"grpcSettings\": {\"serviceName\": \"$(json_escape "$vps_grpc_service")\"}"
+					;;
+			esac
+			;;
+		xhttp)
+			case "$vps_xhttp_path" in /*) ;; *) die "XHTTP: path должен начинаться с /" ;; esac
+			case "$vps_xhttp_path" in *[!a-zA-Z0-9/._~-]*) die "XHTTP: недопустимый path" ;; esac
+			stream_fields="\"network\": \"xhttp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false}, \"xhttpSettings\": {\"path\": \"$(json_escape "$vps_xhttp_path")\", \"mode\": \"auto\"}"
+			;;
+		grpc)
+			printf '%s\n' "$vps_grpc_service" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,64}$' || die "gRPC: некорректное имя сервиса"
+			stream_fields="\"network\": \"grpc\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$(json_escape "$vps_sni")\", \"allowInsecure\": false, \"alpn\": [\"h2\"]}, \"grpcSettings\": {\"serviceName\": \"$(json_escape "$vps_grpc_service")\"}"
+			;;
+	esac
 	if xray_reverse_finalrules_required; then
 		# Modern Xray blocks reverse-originated Freedom requests by default.
 		# Scope access to the exact LuCI/SSH redirect ports, on both transports.
@@ -763,7 +814,7 @@ render_client_config() (
       }
     ]
   },
-  "remarks": "OpenWrt Remote client for $(json_escape "$router_id")"
+  "remarks": "$(json_escape "${OWRT_REMOTE_CANDIDATE_REF:-OpenWrt Remote client for $router_id}")"
 }
 EOF
 	rc=$?
@@ -781,26 +832,597 @@ EOF
 	printf '%s\n' "$xray_config"
 )
 
-run_xray() {
-	local enabled xray_bin xray_config
-	enabled="$(uci_get enabled 0)"
-	truthy "$enabled" || die "сервис выключен: включи option enabled '1'"
+# Validate candidate using installed router Xray without changing active UCI
+# or the currently active reverse tunnel.
+transport_preflight() (
+	umask 077
+	local directory candidate
+	directory="$(mktemp -d "${TMPDIR:-/tmp}/owrt-transport-candidate.XXXXXX")" || return 1
+	trap 'rm -f "$directory/config.json"; rmdir "$directory" 2>/dev/null || true' EXIT
+	trap 'exit 1' INT TERM
+	candidate="$directory/config.json"
+	render_client_config --stdout >"$candidate" || return $?
+	validate_xray_config "$candidate" || return $?
+	printf 'TRANSPORT PREFLIGHT: PASS (no UCI changes, no Xray restart)\n'
+)
 
-	ensure_xray_available
-	xray_bin="$(xray_bin_path)"
-	xray_config="$(render_client_config)" || die "не удалось создать конфигурацию Xray"
-	[ -n "$xray_config" ] && [ -s "$xray_config" ] || die "конфигурация Xray отсутствует или пуста"
-	[ -x "$xray_bin" ] || die "xray не найден или не исполняемый: $xray_bin"
 
-	if "$xray_bin" help 2>/dev/null | grep -q 'run'; then
-		exec "$xray_bin" run -config "$xray_config"
+# Time-boxed, isolated Xray shadow reverse. Never modifies active UCI/procd.
+pilot_dir=/etc/router-orchestrator/transport-pilot
+pilot_matches() {
+	case "$1" in ""|*[!0-9]*) return 1 ;; esac
+	[ -r "/proc/$1/cmdline" ] || return 1
+	tr "\000" "\n" <"/proc/$1/cmdline" | grep -Fxq -- "$pilot_dir/client.json"
+}
+pilot_stop() {
+	local pid
+	pid="$(cat "$pilot_dir/pid" 2>/dev/null || true)"
+	if pilot_matches "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+	rm -f "$pilot_dir/pid" "$pilot_dir/pending" "$pilot_dir/client.json"
+	rmdir "$pilot_dir" 2>/dev/null || true
+	printf 'TRANSPORT PILOT: STOPPED (primary unchanged)\n'
+}
+pilot_expire() {
+	# An earlier pilot's timer must never act on the current pilot or its files.
+	local pid started
+	pid="$1"
+	started="$2"
+	case "$started" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$pid" = "$(cat "$pilot_dir/pid" 2>/dev/null)" ] || return 0
+	if pilot_matches "$pid" && [ "$started" = "$(xray_process_start "$pid")" ]; then
+		kill -TERM "$pid" 2>/dev/null || true
 	fi
-	exec "$xray_bin" -config "$xray_config"
+}
+pilot_status() {
+	local pid
+	pid="$(cat "$pilot_dir/pid" 2>/dev/null || true)"
+	if pilot_matches "$pid"; then
+		printf 'TRANSPORT PILOT: RUNNING (primary unchanged)\n'
+	else
+		printf 'TRANSPORT PILOT: INACTIVE\n'
+	fi
+}
+pilot_start() (
+	umask 077
+	local source="${1:-}"
+	if [ -z "$source" ]; then
+	[ -n "$OWRT_REMOTE_CANDIDATE_TRANSPORT" ] || die "candidate transport missing"
+	[ -n "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" ] || die "candidate reverse tag missing"
+	[ -n "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" ] || die "candidate SSH reverse tag missing"
+	[ "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" != "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" ] || die "duplicate pilot tags"
+	[ "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" != "$(uci_get reverse_tag reverse-in)" ] || die "pilot would reuse current admin reverse tag"
+	[ "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" != "$(uci_get ssh_reverse_tag reverse-in-ssh)" ] || die "pilot would reuse current SSH reverse tag"
+	fi
+	[ -r /proc/meminfo ] || die "pilot memory metrics missing"
+	awk '/^MemAvailable:/ { if ($2 < 65536) exit 1; found=1 } END { if (!found) exit 1 }' /proc/meminfo || die "pilot requires 64 MiB available"
+	[ ! -L "$pilot_dir" ] || die "unsafe pilot directory"
+	[ ! -e "$pilot_dir/pending" ] || die "pilot already running"
+	mkdir -p "$pilot_dir" || return 1
+	chmod 700 "$pilot_dir" || return 1
+	local xray candidate pid started
+	xray="$(xray_bin_path)"
+	candidate="$pilot_dir/client.json"
+	[ ! -e "$candidate" ] || die "stale pilot candidate exists"
+	if [ -n "$source" ]; then
+		cat "$source" >"$candidate" || { rm -f "$candidate"; return 1; }
+	else
+		render_client_config --stdout > "$candidate" || { rm -f "$candidate"; return 1; }
+	fi
+	chmod 600 "$candidate" || { rm -f "$candidate"; return 1; }
+	validate_xray_config "$candidate" || { rm -f "$candidate"; return 1; }
+	printf "pending\n" > "$pilot_dir/pending"
+	nohup "$xray" run -config "$candidate" </dev/null >/dev/null 2>&1 &
+	pid=$!
+	printf "%s\n" "$pid" > "$pilot_dir/pid"
+	started="$(xray_process_start "$pid")"
+	sleep 2
+	if ! pilot_matches "$pid"; then pilot_stop; die "pilot Xray failed to start"; fi
+	case "$started" in ""|*[!0-9]*) pilot_stop; die "pilot process identity unavailable" ;; esac
+	nohup sh -c 'sleep 180; exec /usr/sbin/owrt-remote transport-pilot-expire "$1" "$2"' \
+		transport-pilot "$pid" "$started" </dev/null >/dev/null 2>&1 &
+	printf 'TRANSPORT PILOT: STARTED (TTL=180s, primary unchanged)\n'
+)
+
+transport_dir=/etc/router-orchestrator/transport
+
+transport_store() (
+	umask 077
+	local source="$1" dest="$2" tmp
+	tmp="$(mktemp "$(dirname "$dest")/.owrt-profile.XXXXXX")" || return 1
+	trap 'rm -f "$tmp"' EXIT
+	cat "$source" >"$tmp" && sync && mv -f "$tmp" "$dest" && sync
+)
+
+transport_profile_target() {
+	local profile="$1" revision="$2" assignment="$3"
+	printf '%s:%s:%s\n' "$profile" "$revision" "$assignment" |
+		LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,64}:[1-9][0-9]{0,14}:[0-9a-f]{64}$' || return 1
+	printf '{"profile_id":"%s","revision":%s,"assignment_id":"%s"}' "$profile" "$revision" "$assignment"
 }
 
+transport_assignment_target() {
+	local file="$1" base="@.profiles[$2]" profile revision assignment
+	profile="$(jsonfilter -i "$file" -e "$base.profile_id")" &&
+	revision="$(jsonfilter -i "$file" -e "$base.revision")" &&
+	assignment="$(jsonfilter -i "$file" -e "$base.assignment_id")" || return 1
+	transport_profile_target "$profile" "$revision" "$assignment"
+}
+
+transport_ref() {
+	local ref identity assignment
+	[ -s "$1" ] || { printf 'null'; return 0; }
+	ref="$(jsonfilter -i "$1" -e '@.remarks')" || return 1
+	case "$ref" in
+		'OpenWrt Remote client for '*) printf 'null' ;;
+		ro-profile:*)
+			ref="${ref#ro-profile:}"
+			ref="${ref%%|*}"
+			identity="$(jsonfilter -i "$1" -e '@.outbounds[2].settings.id')" || return 1
+			printf '%s\n' "$identity" | LC_ALL=C grep -Eq '^[0-9a-f-]{36}$' || return 1
+			assignment="$(printf 'ro-assignment:%s' "$identity" | sha256sum)" || return 1
+			transport_profile_target "${ref%:*}" "${ref#*:}" "${assignment%% *}"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+transport_request() (
+	umask 077
+	local operation="$1" ref="${2:-}" url identity router payload response origin
+	url="$(uci_get hub_url '')"
+	identity="$(transport_active_identity)" || return 1
+	router="$(safe_id "$(uci_get router_id main)")"
+	origin="$(remote_url_origin "$url")" || return 1
+	case "$origin" in https://*) ;; *) return 1 ;; esac
+	[ -n "$identity" ] && command -v curl >/dev/null 2>&1 || return 1
+	payload="$(mktemp "${TMPDIR:-/tmp}/owrt-transport-request.XXXXXX")" || return 1
+	trap 'rm -f "$payload"' EXIT
+	if [ "$operation" = task ] && [ -n "$ref" ]; then
+		printf '{"id":"%s","task_id":"%s","target":%s,"succeeded":%s}\n' "$router" "$ref" "$3" "$4" >"$payload"
+	elif [ "$operation" = task ]; then
+		printf '{"id":"%s","protocol":2}\n' "$router" >"$payload"
+	elif [ -n "$ref" ]; then
+		printf '{"id":"%s","profile":%s}\n' "$router" "$ref" >"$payload"
+	else
+		printf '{"id":"%s"}\n' "$router" >"$payload"
+	fi
+	response="$(post_json "${url%/}/api/agent/transport-$operation" "$identity" "$payload" 2>/dev/null)" || return 1
+	[ "$(printf '%s' "$response" | jsonfilter -e '@.ok')" = true ] || return 1
+	printf '%s\n' "$response"
+)
+
+transport_render_assignment() (
+	local index="$1" source="${2:-}" base ref revision address first second remarks
+	case "$index" in 0|1|2) ;; *) return 1 ;; esac
+	if [ -z "$source" ]; then
+		source="$transport_work/assignments.json"
+		base="@.profiles[$index]"
+		first='.outbounds[0]'
+		second='.outbounds[1]'
+		ref="$(jsonfilter -i "$source" -e "$base.profile_id")"
+		revision="$(jsonfilter -i "$source" -e "$base.revision")"
+		OWRT_REMOTE_CANDIDATE_TRANSPORT="$(jsonfilter -i "$source" -e "$base.transport")"
+	else
+		base='@'
+		first='.outbounds[2]'
+		second='.outbounds[3]'
+		remarks="$(jsonfilter -i "$source" -e '@.remarks')" || return 1
+		case "$remarks" in ro-profile:*\|*) ;; *) return 1 ;; esac
+		address="${remarks##*|}"
+		remarks="${remarks#ro-profile:}"
+		remarks="${remarks%%|*}"
+		ref="${remarks%:*}"
+		revision="${remarks#*:}"
+		OWRT_REMOTE_CANDIDATE_TRANSPORT="$(jsonfilter -i "$source" -e "@$first.streamSettings.network")"
+		[ "$OWRT_REMOTE_CANDIDATE_TRANSPORT" != tcp ] ||
+			OWRT_REMOTE_CANDIDATE_TRANSPORT=reality-tcp
+	fi
+	field() { jsonfilter -i "$source" -e "$base$1" 2>/dev/null; }
+	printf '%s:%s\n' "$ref" "$revision" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{1,64}:[1-9][0-9]{0,14}$' || return 1
+	case "$OWRT_REMOTE_CANDIDATE_TRANSPORT" in
+		wss) OWRT_REMOTE_CANDIDATE_TRANSPORT=ws ;;
+		ws|reality-tcp|xhttp|grpc) ;;
+		*) return 1 ;;
+	esac
+	[ "$OWRT_REMOTE_CANDIDATE_TRANSPORT" != reality-tcp ] || {
+		OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY="$(field "$first.streamSettings.realitySettings.publicKey")"
+		OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID="$(field "$first.streamSettings.realitySettings.shortId")"
+	}
+	OWRT_REMOTE_CANDIDATE_SNI="$(field "$first.streamSettings.tlsSettings.serverName")"
+	[ -n "$OWRT_REMOTE_CANDIDATE_SNI" ] ||
+		OWRT_REMOTE_CANDIDATE_SNI="$(field "$first.streamSettings.realitySettings.serverName")"
+	OWRT_REMOTE_CANDIDATE_WS_PATH="$(field "$first.streamSettings.wsSettings.path")"
+	OWRT_REMOTE_CANDIDATE_XHTTP_PATH="$(field "$first.streamSettings.xhttpSettings.path")"
+	OWRT_REMOTE_CANDIDATE_GRPC_SERVICE="$(field "$first.streamSettings.grpcSettings.serviceName")"
+	OWRT_REMOTE_CANDIDATE_HOST="${address:-$(field "$first.settings.address")}"
+	OWRT_REMOTE_CANDIDATE_PORT="$(field "$first.settings.port")"
+	OWRT_REMOTE_CANDIDATE_UUID="$(field "$first.settings.id")"
+	OWRT_REMOTE_CANDIDATE_SSH_UUID="$(field "$second.settings.id")"
+	OWRT_REMOTE_CANDIDATE_REVERSE_TAG="$(field "$first.settings.reverse.tag")"
+	OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG="$(field "$second.settings.reverse.tag")"
+	[ -n "$OWRT_REMOTE_CANDIDATE_HOST" ] && [ -n "$OWRT_REMOTE_CANDIDATE_SNI" ] &&
+	[ -n "$OWRT_REMOTE_CANDIDATE_PORT" ] && [ -n "$OWRT_REMOTE_CANDIDATE_UUID" ] &&
+	[ -n "$OWRT_REMOTE_CANDIDATE_SSH_UUID" ] && [ -n "$OWRT_REMOTE_CANDIDATE_REVERSE_TAG" ] &&
+	[ -n "$OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG" ] || return 1
+	OWRT_REMOTE_CANDIDATE_REF="ro-profile:$ref:$revision|$OWRT_REMOTE_CANDIDATE_HOST"
+	render_client_config --stdout
+)
+
+transport_stage() {
+	local index="$1" expected="${2:-}" tmp="$transport_work/stage-new.json"
+	if [ "$index" = enrollment ]; then
+		render_client_config --stdout >"$tmp" || return 1
+	else
+		transport_render_assignment "$index" >"$tmp" || return 1
+	fi
+	[ -z "$expected" ] || [ "$(transport_ref "$tmp")" = "$expected" ] || return 1
+	validate_xray_config "$tmp" || return 1
+	if [ "$transport_stage_file" = "$transport_work/staged.json" ]; then
+		mv -f "$tmp" "$transport_stage_file"
+	else
+		transport_store "$tmp" "$transport_stage_file"
+	fi
+}
+
+transport_wait() {
+	local operation="$1" ref="$2" attempts=0 response
+	while [ "$attempts" -lt 5 ]; do
+		response="$(transport_request "$operation" "$ref")" && { printf '%s\n' "$response"; return 0; }
+		attempts=$((attempts + 1))
+		sleep 2
+	done
+	return 1
+}
+
+transport_stop_pilot() {
+	local pid attempts=0
+	pid="$(cat "$pilot_dir/pid" 2>/dev/null || true)"
+	pilot_stop >/dev/null
+	while pilot_matches "$pid"; do
+		[ "$attempts" -lt 5 ] || return 1
+		attempts=$((attempts + 1))
+		sleep 1
+	done
+}
+
+transport_recover() {
+	local pending="$transport_dir/pending.json" previous current
+	[ -s "$pending" ] || return 0
+	previous="$(transport_ref "$pending")" || return 1
+	current="$(transport_ref "$transport_dir/active.json")" || return 1
+	transport_stop_pilot || return 1
+	if [ "$current" != "$previous" ] ||
+	   [ "$(transport_ref "$(uci_get xray_config /etc/xray/owrt-remote-client.json)")" != "$previous" ]; then
+		transport_store "$pending" "$transport_dir/active.json" || return 1
+		stop_xray >/dev/null || return 1
+	fi
+	send_heartbeat >/dev/null && transport_wait activate "$previous" >/dev/null || return 1
+	rm -f "$pending" && sync
+}
+
+transport_commit_promotion() {
+	local pending="$transport_dir/pending.json"
+	transport_store "$pending" "$transport_dir/last-good.json" &&
+		rm -f "$pending" && sync
+}
+
+transport_promote() {
+	local candidate="$transport_stage_file" active="$transport_dir/active.json" previous="$transport_work/previous.json"
+	local pending="$transport_dir/pending.json" current ref response latency
+	[ -s "$candidate" ] || return 1
+	ref="$(transport_ref "$candidate")" && current="$(transport_ref "$active")" || return 1
+	[ "$ref" != "$current" ] || return 0
+	send_heartbeat >/dev/null || return 1
+	if [ -s "$active" ]; then
+		cat "$active" >"$previous" || return 1
+	else
+		render_client_config --stdout >"$previous" || return 1
+	fi
+	transport_stop_pilot && pilot_start "$candidate" >/dev/null || return 1
+	response="$(transport_wait probe "$ref")" || { transport_stop_pilot; return 1; }
+	latency="$(printf '%s' "$response" | jsonfilter -e '@.latency_ms')"
+	case "$latency" in ''|*[!0-9]*) transport_stop_pilot; return 1 ;; esac
+	if { [ -n "${TRANSPORT_LATENCY_LIMIT:-}" ] && [ "$latency" -ge "$TRANSPORT_LATENCY_LIMIT" ]; } ||
+	   ! transport_store "$previous" "$pending"; then
+		transport_stop_pilot
+		return 1
+	fi
+	if transport_store "$candidate" "$active" && transport_stop_pilot &&
+	   stop_xray >/dev/null && send_heartbeat >/dev/null && transport_wait activate "$ref" >/dev/null &&
+	   transport_commit_promotion; then
+		log 'Transport: verified profile activated'
+		return 0
+	fi
+	transport_recover || log 'Transport: recovery remains pending'
+	return 1
+}
+
+transport_manager() (
+	umask 077
+	local operation="$1" index="${2:-0}" ref active transport_stage_file transport_work TRANSPORT_LATENCY_LIMIT=''
+	command -v jsonfilter >/dev/null 2>&1 || return 1
+	[ ! -L "$transport_dir" ] || return 1
+	mkdir -p "$transport_dir" && chmod 700 "$transport_dir" || return 1
+	xray_bootstrap_lock transport || return 1
+	transport_work=''
+	trap '[ -z "$transport_work" ] || { rm -f "$transport_work/"*.json; rmdir "$transport_work"; }; xray_bootstrap_unlock' EXIT
+	trap 'exit 1' INT TERM
+	transport_work="$(mktemp -d "$(xray_runtime_dir)/transport.XXXXXX")" || return 1
+	transport_stage_file="$transport_dir/staged.json"
+	if [ "$operation" = run-task ]; then
+		transport_run_task
+		return
+	fi
+	[ ! -e "$transport_dir/task-journal" ] || return 1
+	transport_recover || return 1
+	case "$operation" in
+		stage)
+			transport_request profiles >"$transport_work/assignments.json" && transport_stage "$index" || return 1
+			;;
+	esac
+	case "$operation" in
+		stage) ;;
+		probe)
+			ref="$(transport_ref "$transport_dir/staged.json")" &&
+			active="$(transport_ref "$transport_dir/active.json")" || return 1
+			send_heartbeat >/dev/null || return 1
+			if [ "$ref" != "$active" ]; then
+				transport_stop_pilot && pilot_start "$transport_dir/staged.json" >/dev/null || return 1
+			fi
+			transport_wait probe "$ref" && transport_stop_pilot
+			;;
+		activate) transport_promote ;;
+		rollback)
+			[ -s "$transport_dir/last-good.json" ] &&
+			transport_store "$transport_dir/last-good.json" "$transport_dir/staged.json" &&
+			transport_promote
+			;;
+		recover) ;;
+		tick)
+			transport_stage_file="$transport_work/staged.json"
+			transport_tick
+			;;
+	esac
+)
+
+# Runs under the same lock as manual operations and autonomous fallback.
+transport_run_task() {
+	local response task action slot target state confirmed=false journal="$transport_dir/task-journal"
+	local scratch="$transport_work/task.json" profile revision assignment
+	if [ -e "$journal" ]; then
+		read -r task action slot target state <"$journal" || return 1
+		if [ "$state" = started ]; then
+			transport_stop_pilot || return 1
+			# The target may already be serving both channels after a lost
+			# activation response or an exit before the local commit.
+			case "$action" in
+				activate|rollback)
+					if [ -s "$transport_dir/pending.json" ] &&
+					   [ "$(transport_ref "$transport_dir/active.json")" = "$target" ] &&
+					   [ "$(transport_ref "$(uci_get xray_config /etc/xray/owrt-remote-client.json)")" = "$target" ] &&
+					   xray_running && send_heartbeat >/dev/null &&
+					   transport_wait activate "$target" >/dev/null; then
+						transport_commit_promotion || return 1
+						confirmed=true
+					fi
+					;;
+			esac
+			transport_recover || return 1
+			state=false
+			case "$action" in
+				stage)
+					if [ -s "$transport_stage_file" ] &&
+					   [ "$(transport_ref "$transport_stage_file")" = "$target" ]; then state=true; fi
+					;;
+				activate|rollback)
+					if [ "$(transport_ref "$transport_dir/active.json")" = "$target" ] &&
+					   [ ! -e "$transport_dir/pending.json" ]; then
+						if [ "$confirmed" != true ]; then
+							send_heartbeat >/dev/null && transport_wait activate "$target" >/dev/null || return 1
+						fi
+						state=true
+					fi
+					;;
+			esac
+		fi
+	else
+		response="$(transport_request task)" || return 1
+		task="$(printf '%s' "$response" | jsonfilter -e '@.task.task_id')"
+		[ -n "$task" ] || return 0
+		action="$(printf '%s' "$response" | jsonfilter -e '@.task.action')"
+		slot="$(printf '%s' "$response" | jsonfilter -e '@.task.slot')"
+		profile="$(printf '%s' "$response" | jsonfilter -e '@.task.target.profile_id')"
+		revision="$(printf '%s' "$response" | jsonfilter -e '@.task.target.revision')"
+		assignment="$(printf '%s' "$response" | jsonfilter -e '@.task.target.assignment_id')"
+		if [ -z "$profile$revision$assignment" ] && [ "$slot" = enrollment ]; then
+			target=null
+		else
+			target="$(transport_profile_target "$profile" "$revision" "$assignment")" || return 1
+		fi
+		printf '%s\n' "$task" | LC_ALL=C grep -Eq '^[0-9a-f]{32}$' || return 1
+		case "$slot" in 0|1|2|enrollment) ;; *) return 1 ;; esac
+		case "$action" in stage|probe|activate|rollback) ;; *) return 1 ;; esac
+		transport_recover || return 1
+		printf '%s %s %s %s started\n' "$task" "$action" "$slot" "$target" >"$scratch" &&
+			transport_store "$scratch" "$journal" || return 1
+		state=false
+		transport_execute_task "$action" "$slot" "$target" >/dev/null 2>&1 && state=true
+	fi
+	printf '%s\n' "$task" | LC_ALL=C grep -Eq '^[0-9a-f]{32}$' || return 1
+	case "$state" in true|false) ;; *) return 1 ;; esac
+	printf '%s %s %s %s %s\n' "$task" "$action" "$slot" "$target" "$state" >"$scratch" &&
+		transport_store "$scratch" "$journal" || return 1
+	transport_stop_pilot && transport_recover || return 1
+	transport_request task "$task" "$target" "$state" >/dev/null || return 1
+	rm -f "$journal" && sync
+}
+
+transport_execute_task() {
+	local action="$1" slot="$2" target="$3"
+	if [ "$action" = rollback ]; then
+		[ -s "$transport_dir/last-good.json" ] &&
+			[ "$(transport_ref "$transport_dir/last-good.json")" = "$target" ] || return 1
+		if [ "$target" != null ]; then
+			transport_request profiles >"$transport_work/assignments.json" || return 1
+			local index current
+			for index in 0 1 2; do
+				current="$(transport_assignment_target "$transport_work/assignments.json" "$index")" || continue
+				[ "$current" != "$target" ] || break
+			done
+			[ "$current" = "$target" ] || return 1
+		fi
+		transport_store "$transport_dir/last-good.json" "$transport_stage_file" || return 1
+	else
+		if [ "$slot" != enrollment ]; then
+			transport_request profiles >"$transport_work/assignments.json" &&
+				[ "$(transport_assignment_target "$transport_work/assignments.json" "$slot")" = "$target" ] || return 1
+		fi
+		transport_stage "$slot" "$target" || return 1
+	fi
+	case "$action" in
+		stage) ;;
+		probe)
+			send_heartbeat >/dev/null || return 1
+			if [ "$(transport_ref "$transport_dir/active.json")" != "$target" ]; then
+				transport_stop_pilot && pilot_start "$transport_stage_file" >/dev/null || return 1
+			fi
+			transport_wait probe "$target" >/dev/null
+			;;
+		activate|rollback)
+			if [ "$(transport_ref "$transport_dir/active.json")" = "$target" ]; then
+				send_heartbeat >/dev/null && transport_wait activate "$target" >/dev/null
+			else
+				transport_promote
+			fi
+			;;
+	esac
+}
+
+transport_threshold() {
+	local value
+	value="$(safe_num "$(uci_get "transport_$1" "$2")" "$2")"
+	value="$(printf '%s' "$value" | sed 's/^0*//')"
+	[ -n "$value" ] && [ "${#value}" -le 5 ] || value="$2"
+	[ "$value" -ge "$3" ] && [ "$value" -le "$4" ] || value="$2"
+	printf '%s' "$value"
+}
+
+transport_tick() {
+	local runtime now active primary ref response latency samples bit failures last_ok changed stable stable_ref
+	local loss critical failed stable_for cooldown index reason stable_sample=0 heartbeat_seconds primary_latency
+	runtime="$(xray_runtime_dir)/transport-health"
+	now="$(awk '{print int($1)}' /proc/uptime)"
+	case "$now" in ''|*[!0-9]*) return 1 ;; esac
+	last_ok="$now"; changed=0; samples=1111; stable=0; stable_ref=none
+	[ ! -s "$runtime" ] || read -r last_ok changed samples stable stable_ref stable_sample <"$runtime"
+	loss="$(transport_threshold loss_seconds 60 10 900)"
+	critical="$(transport_threshold critical_latency_ms 1500 100 10000)"
+	failed="$(transport_threshold failed_percent 50 25 100)"
+	stable_for="$(transport_threshold primary_stable_seconds 180 30 900)"
+	cooldown="$(transport_threshold cooldown_seconds 120 10 900)"
+	heartbeat_seconds="$(safe_num "$(uci_get heartbeat_interval 30)" 30 | sed 's/^0*//')"
+	[ -n "$heartbeat_seconds" ] && [ "${#heartbeat_seconds}" -le 5 ] || heartbeat_seconds=30
+	active="$(transport_ref "$transport_dir/active.json")" || return 1
+	bit=0; latency=0; reason=''
+	if response="$(transport_request probe "$active")"; then
+		latency="$(printf '%s' "$response" | jsonfilter -e '@.latency_ms')"
+		case "$latency" in ''|*[!0-9]*) return 1 ;; esac
+		last_ok="$now"; bit=1
+	fi
+	samples="${samples#?}$bit"
+	failures="$(printf '%s' "$samples" | tr -cd 0)"
+	if [ $((now - last_ok)) -ge "$loss" ]; then
+		reason=loss
+	elif [ $(("${#failures}" * 25)) -ge "$failed" ]; then
+		reason=checks
+	elif [ "$latency" -ge "$critical" ]; then
+		reason=latency
+	fi
+	printf '%s %s %s %s %s %s\n' "$last_ok" "$changed" "$samples" "$stable" "$stable_ref" "${stable_sample:-0}" >"$runtime"
+	if ! transport_request profiles >"$transport_work/assignments.json"; then
+		if [ "$reason" = loss ] && ! xray_running; then
+			wan_recover_xray transport
+		fi
+		return 1
+	fi
+	[ "$(jsonfilter -i "$transport_work/assignments.json" -e '@.maintenance_hold')" != true ] || return 0
+	primary="$(transport_assignment_target "$transport_work/assignments.json" 0)" || return 1
+	if [ "$active" = null ] && [ -z "$reason" ]; then
+		reason=enrollment
+	fi
+	if [ -n "$reason" ]; then
+		[ "$bit" = 0 ] || [ $((now - changed)) -ge "$cooldown" ] || return 0
+		TRANSPORT_LATENCY_LIMIT=''
+		[ "$reason" != latency ] || TRANSPORT_LATENCY_LIMIT="$latency"
+		for index in 0 1 2; do
+			transport_stage "$index" || continue
+			ref="$(transport_ref "$transport_stage_file")" || continue
+			[ "$ref" != "$active" ] || continue
+			if transport_promote; then
+				printf '%s %s 1111 0 none\n' "$now" "$now" >"$runtime"
+				return 0
+			fi
+			[ ! -e "$transport_dir/pending.json" ] || return 1
+		done
+		if [ "$reason" = loss ] && [ $((now - changed)) -ge "$cooldown" ]; then
+			# Recover only the owned process when the assigned routes are lost.
+			stop_xray >/dev/null
+			printf '%s %s %s 0 none\n' "$last_ok" "$now" "$samples" >"$runtime"
+		fi
+		return 0
+	fi
+	[ "$active" != "$primary" ] || return 0
+	[ $((now - changed)) -ge "$cooldown" ] || return 0
+	transport_stage 0 || return 1
+	transport_stop_pilot && pilot_start "$transport_stage_file" >/dev/null || return 1
+	primary_latency=''
+	if response="$(transport_wait probe "$primary")"; then
+		primary_latency="$(printf '%s' "$response" | jsonfilter -e '@.latency_ms')"
+	fi
+	if [ "$(safe_num "$primary_latency" "$critical")" -lt "$critical" ]; then
+		# The stable window counts successful probes for this exact primary.
+		ref="$(printf '%s' "$primary" | sha256sum | cut -d ' ' -f 1)"
+		if [ "$stable_ref" != "$ref" ] || [ "$stable" -eq 0 ] ||
+		   [ $((now - ${stable_sample:-0})) -gt $((heartbeat_seconds * 2)) ]; then stable="$now"; fi
+		stable_ref="$ref"
+		stable_sample="$now"
+	else
+		stable=0; stable_ref=none
+	fi
+	transport_stop_pilot || return 1
+	printf '%s %s %s %s %s %s\n' "$last_ok" "$changed" "$samples" "$stable" "$stable_ref" "${stable_sample:-0}" >"$runtime"
+	TRANSPORT_LATENCY_LIMIT="$critical"
+	if [ "$stable" -gt 0 ] && [ $((now - stable)) -ge "$stable_for" ] && transport_promote; then
+		printf '%s %s 1111 0 none\n' "$now" "$now" >"$runtime"
+	fi
+}
+
+transport_active_config() (
+	umask 077
+	local active="$transport_dir/active.json" ref config scratch
+	ref="$(transport_ref "$active")" || return 1
+	if [ "$ref" = null ]; then
+		render_client_config
+		return $?
+	fi
+	config="$(uci_get xray_config /etc/xray/owrt-remote-client.json)"
+	mkdir -p "$(dirname "$config")" || return 1
+	scratch="$(mktemp -d "${TMPDIR:-/tmp}/owrt-transport-run.XXXXXX")" || return 1
+	trap 'rm -f "$scratch/config.json"; rmdir "$scratch"' EXIT
+	transport_render_assignment 0 "$active" >"$scratch/config.json" ||
+		return 1
+	validate_xray_config "$scratch/config.json" >/dev/null 2>&1 || return 1
+	transport_store "$scratch/config.json" "$config" || return 1
+	printf '%s\n' "$config"
+)
+
 heartbeat_json() {
-	local router_id router_name role public_url hub_url xray_state service_state ssh_state event heartbeat_interval
+	local router_id router_name role public_url hub_url xray_state service_state ssh_state event heartbeat_interval rollback_target
 	event="${1:-}"
+	rollback_target=''
+	if [ -n "${2:-}" ] && [ -s "$transport_dir/last-good.json" ]; then
+		rollback_target="$(transport_ref "$transport_dir/last-good.json")" || rollback_target=''
+	fi
 	router_id="$(safe_id "$(uci_get router_id main)")"
 	router_name="$(uci_get router_name "$router_id")"
 	role="$(uci_get role node)"
@@ -852,7 +1474,7 @@ heartbeat_json() {
   "xray": $(json_string "$xray_state"),
   "ssh": $(json_string "$ssh_state"),
   "event": $(json_string "$event"),
-  "service": $(json_string "$service_state")
+  "service": $(json_string "$service_state")${rollback_target:+, "transport_rollback_target":$rollback_target}
 }
 EOF
 }
@@ -900,13 +1522,15 @@ remote_curl_metrics() {
 }
 
 remote_curl_post() (
+	umask 077
 	local url token file mode dir rc hop origin next_origin redirect code dns tcp tls first total target device resolve started remaining resolver_started resolver_ms dns_ms dns_source OWRT_REMOTE_DNS_STATS_FILE
 	url="$1"; token="$2"; file="$3"; mode="${4:-normal}"
 	origin="$(remote_url_origin "$url")" || return 3
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/owrt-remote-http.XXXXXX")" || return 1
 	chmod 700 "$dir"
-	trap 'rm -f "$dir/body" "$dir/stats" "$dir/error" "$dir/dns"; rmdir "$dir" 2>/dev/null || true' EXIT
+	trap 'rm -f "$dir/body" "$dir/stats" "$dir/error" "$dir/dns" "$dir/auth"; rmdir "$dir" 2>/dev/null || true' EXIT
 	trap 'exit 1' INT TERM
+	printf 'Authorization: Bearer %s\n' "$token" >"$dir/auth" || return 1
 	started="$(remote_clock_ms)"; hop=0
 	while :; do
 		resolver_ms=0; dns_ms=''; dns_source=curl
@@ -929,7 +1553,7 @@ remote_curl_post() (
 		# drops Bearer auth on an origin change, including HTTP -> HTTPS.
 		curl "$@" --max-time "$remaining" -o "$dir/body" \
 			-w '%{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{redirect_url}\n' \
-			-H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+			-H "@$dir/auth" -H 'Content-Type: application/json' \
 			--data-binary "@$file" "$url" >"$dir/stats" 2>"$dir/error" || rc=$?
 		remote_curl_metrics "$dir/stats" "${url%%:*}" "$resolver_ms" "$hop" "$dns_ms" "$dns_source"
 		if [ "$rc" != 0 ]; then cat "$dir/error" >&2; return "$rc"; fi
@@ -1159,7 +1783,7 @@ heartbeat_set_url_if_changed() {
 }
 
 heartbeat_apply_hub_update() {
-	local response_file fallback_base next_hub_url next_public_url next_vps_host changed old_vps_host mode ignored_file ignored
+	local response_file fallback_base identity_origin next_hub_url next_public_url next_vps_host changed old_vps_host mode ignored_file ignored
 	# A WSS pilot uses byte-exact UCI snapshots for guarded confirmation and
 	# automatic rollback. Updating hub_url/public_url while the transaction
 	# is pending invalidates a healthy WSS cutover. Defer heartbeat-driven
@@ -1170,6 +1794,7 @@ heartbeat_apply_hub_update() {
 	fi
 	response_file="$1"
 	fallback_base="$2"
+	identity_origin="${3:-}"
 	next_hub_url="$(json_extract_object_string "$response_file" hub_update hub_url)"
 	next_public_url="$(json_extract_object_string "$response_file" hub_update public_url)"
 	next_vps_host="$(json_extract_object_string "$response_file" hub_update vps_host)"
@@ -1180,6 +1805,9 @@ heartbeat_apply_hub_update() {
 		next_hub_url="$fallback_base"
 	fi
 	changed=0
+	if [ -n "$identity_origin" ] && [ "$(remote_url_origin "$next_hub_url")" != "$identity_origin" ]; then
+		next_hub_url=''
+	fi
 	if heartbeat_set_url_if_changed hub_url "$next_hub_url"; then
 		changed=1
 	fi
@@ -1231,13 +1859,87 @@ heartbeat_diagnostics() {
 	if [ -r "$state" ]; then cat "$state"; else printf 'Замеров пока нет; выполни owrt-remote heartbeat.\n'; fi
 }
 
+transport_active_identity() {
+	local stored_origin identity
+	if [ ! -e "$transport_dir/identity" ]; then
+		uci_get transport_identity ''
+		return
+	fi
+	read -r stored_origin identity <"$transport_dir/identity" || return 1
+	[ "$stored_origin" = "$(remote_url_origin "$(uci_get hub_url '')")" ] || return 1
+	printf '%s' "$identity"
+}
+
+# Call with the identity lock held. A committed HUB rotation is retried with
+# the same candidate after an ambiguous response or a local write failure.
+transport_confirm_identity() (
+	umask 077
+	local pending="$transport_dir/identity-pending" origin identity url payload response
+	[ -e "$pending" ] || return 0
+	read -r origin identity <"$pending" || return 1
+	url="$(uci_get hub_url '')"
+	[ "$origin" = "$(remote_url_origin "$url")" ] || return 1
+	case "$origin" in https://*) ;; *) return 1 ;; esac
+	command -v curl >/dev/null 2>&1 || return 1
+	payload="$(mktemp "${TMPDIR:-/tmp}/owrt-identity-request.XXXXXX")" || return 1
+	trap 'rm -f "$payload"' EXIT
+	printf '{"id":"%s"}\n' "$(safe_id "$(uci_get router_id main)")" >"$payload" || return 1
+	response="$(post_json "${url%/}/api/agent/transport-identity" "$identity" "$payload" 2>/dev/null)" || return 1
+	[ "$(printf '%s' "$response" | jsonfilter -e '@.ok')" = true ] || return 1
+	case "$(printf '%s' "$response" | jsonfilter -e '@.identity_accepted')" in
+		true) transport_store "$pending" "$transport_dir/identity" || return 1 ;;
+		false) rm -f "$pending" && sync || return 1; return 2 ;;
+		*) return 1 ;;
+	esac
+	rm -f "$pending" && sync
+)
+
+transport_retry_identity() (
+	[ -e "$transport_dir/identity-pending" ] || return 0
+	xray_bootstrap_lock identity || return 1
+	trap 'xray_bootstrap_unlock' EXIT
+	trap 'exit 1' INT TERM
+	transport_confirm_identity
+)
+
+transport_bind_identity() (
+	umask 077
+	local identity origin scratch='' rc=0
+	command -v curl >/dev/null 2>&1 || die "transport identity requires curl"
+	origin="$(remote_url_origin "$(uci_get hub_url '')")" || return 1
+	case "$origin" in https://*) ;; *) die "transport identity requires HTTPS" ;; esac
+	IFS= read -r identity || die "transport identity is required on stdin"
+	printf '%s\n' "$identity" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{43}$' || die "invalid transport identity"
+	[ ! -L "$transport_dir" ] && mkdir -p "$transport_dir" && chmod 700 "$transport_dir" || return 1
+	xray_bootstrap_lock identity || return 1
+	trap '[ -z "$scratch" ] || rm -f "$scratch"; xray_bootstrap_unlock' EXIT
+	trap 'exit 1' INT TERM
+	if [ -e "$transport_dir/identity-pending" ]; then
+		transport_confirm_identity || rc=$?
+		[ "$rc" -ne 1 ] || die "transport identity confirmation remains pending"
+	fi
+	scratch="$(mktemp "$transport_dir/.identity.XXXXXX")" || return 1
+	printf '%s %s\n' "$origin" "$identity" >"$scratch" &&
+		transport_store "$scratch" "$transport_dir/identity-pending" || return 1
+	transport_confirm_identity
+)
+
 send_heartbeat() {
-	local hub_url token endpoint tmp response event used fallback_base errors rc dir metrics http attempt max_attempts reason previous previous_reason safe_endpoint elapsed started diagnostic
+	local hub_url token identity identity_origin endpoint tmp response event used fallback_base errors rc dir metrics http attempt max_attempts reason previous previous_reason safe_endpoint elapsed started diagnostic
 	(
 	event="${1:-}"
+	identity_origin=''
 	hub_url="$(uci_get hub_url '')"
 	token="$(uci_get hub_token '')"
+	transport_retry_identity || true
+	identity="$(transport_active_identity)" || return 1
 	[ -n "$hub_url" ] || die "hub_url пустой"
+	if [ -n "$identity" ]; then
+		command -v curl >/dev/null 2>&1 || die "transport identity requires curl"
+		identity_origin="$(remote_url_origin "$hub_url")" || return 1
+		case "$identity_origin" in https://*) ;; *) return 1 ;; esac
+		token="$identity"
+	fi
 	[ -n "$token" ] || die "hub_token пустой"
 	if truthy "$(uci_get wan_direct 0)"; then
 		command -v wan_prepare >/dev/null 2>&1 || die "WAN helper missing: $WAN_HELPER"
@@ -1253,12 +1955,13 @@ send_heartbeat() {
 	errors="$response.error"
 	metrics="$dir/metrics"
 	export OWRT_REMOTE_HTTP_METRICS="$metrics"
-	heartbeat_json "$event" >"$tmp"
+	heartbeat_json "$event" "${identity:+bound}" >"$tmp" || return 1
 	used=0
 	previous=''; previous_reason=''
 	for endpoint in $(heartbeat_candidate_endpoints); do
 		used=1
 		safe_endpoint="$(remote_url_origin "$endpoint")" || { log 'Heartbeat: ошибка; reason=invalid_endpoint'; continue; }
+		[ -z "$identity" ] || [ "$safe_endpoint" = "$identity_origin" ] || continue
 		if [ -n "$previous" ]; then
 			log "Heartbeat: fallback; from=$previous; to=$safe_endpoint; reason=$previous_reason; предыдущие попытки исчерпаны"
 		fi
@@ -1276,7 +1979,7 @@ send_heartbeat() {
 			mv -f "$dir/last" "${TMPDIR:-/tmp}/owrt-remote-heartbeat-last"
 			if [ "$rc" = 0 ] && grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$response"; then
 				fallback_base="$(heartbeat_base_from_endpoint "$endpoint")"
-				if ! heartbeat_apply_hub_update "$response" "$fallback_base"; then
+				if ! heartbeat_apply_hub_update "$response" "$fallback_base" "${identity_origin:-}"; then
 					log 'Heartbeat: Hub ответил, но обновление настроек не применилось'
 					return 1
 				fi
@@ -1284,7 +1987,11 @@ send_heartbeat() {
 				# fresh timings are available separately in network-diagnostics.
 				printf '%s\n' "endpoint=$safe_endpoint; attempt=$attempt/$max_attempts; rc=0; reason=ok; elapsed_ms=$elapsed; $(tail -n 1 "$metrics")" >"$dir/last"
 				mv -f "$dir/last" "${TMPDIR:-/tmp}/owrt-remote-heartbeat-last"
-				cat "$response"
+				if [ "${OWRT_REMOTE_HEARTBEAT_TASKS:-}" = 1 ]; then
+					if [ -n "$identity" ]; then jsonfilter -i "$response" -e '@.transport_task_waiting' 2>/dev/null; fi
+				else
+					cat "$response"
+				fi
 				log "Heartbeat: OK; Hub=$safe_endpoint; WAN_direct=$(uci_get wan_direct 0); WAN_active=$(cat "$WAN_STATE/active-interface" 2>/dev/null)"
 				return 0
 			fi
@@ -1350,7 +2057,9 @@ wan_recover_xray() {
 	if [ -r /proc/self/stat ]; then read -r owner rest </proc/self/stat || owner=$$; fi
 	printf '%s\n' "$owner" >"$lock/pid"
 	truthy "$(uci_get enabled 0)" || return 0
-	wan_select_interface >/dev/null || return 0
+	if [ "${1:-}" != transport ]; then
+		wan_select_interface >/dev/null || return 0
+	fi
 	xray_running && return 0
 	state="$(ubus call service list '{"name":"owrt-remote"}' 2>/dev/null)" || return 1
 	running="$(printf '%s' "$state" | jsonfilter -e '@["owrt-remote"].instances.xray.running' 2>/dev/null)"
@@ -1460,15 +2169,25 @@ heartbeat_self_heal() {
 }
 
 heartbeat_loop() {
-	local interval
+	local interval task_waiting
 	interval="$(safe_num "$(uci_get heartbeat_interval 30)" 30)"
 	[ "$interval" -lt 10 ] && interval=10
 	log "Heartbeat: цикл запущен; интервал=${interval}s"
 	while :; do
-		if send_heartbeat >/dev/null 2>&1; then
+		task_waiting=''
+		if task_waiting="$(OWRT_REMOTE_HEARTBEAT_TASKS=1 send_heartbeat 2>/dev/null)"; then
 			heartbeat_mark_ok
-		else
+		elif [ ! -s "$transport_dir/active.json" ] && [ ! -s "$transport_dir/pending.json" ]; then
 			heartbeat_self_heal
+		fi
+		if [ -n "$(transport_active_identity)" ]; then
+			if [ "$task_waiting" = true ] || [ -e "$transport_dir/task-journal" ]; then
+				transport_manager run-task || log 'Transport: task acknowledgement unavailable'
+			elif truthy "$(uci_get transport_fallback_enabled 0)"; then
+				transport_manager tick >/dev/null 2>&1 || true
+			elif [ -s "$transport_dir/pending.json" ]; then
+				transport_manager recover >/dev/null 2>&1 || true
+			fi
 		fi
 		sleep "$interval"
 	done
@@ -1544,8 +2263,9 @@ xray_process_identity() {
 	[ -n "$XRAY_SELF_BIRTH" ]
 }
 xray_bootstrap_lock() {
-	local owner attempt current saved
-	XRAY_LOCK="$(xray_runtime_dir)/bootstrap-lock"
+	local owner attempt current saved limit=150
+	XRAY_LOCK="$(xray_runtime_dir)/${1:-bootstrap}-lock"
+	[ "${1:-}" != transport ] || limit=12
 	mkdir -p "$(xray_runtime_dir)" || return 1
 	xray_process_identity || return 1
 	attempt=0
@@ -1559,7 +2279,7 @@ xray_bootstrap_lock() {
 			*) [ "$(xray_process_start "$owner")" = "$current" ] || current=stale ;;
 		esac
 		if [ "$current" = stale ]; then xray_bootstrap_reap "$saved" "$attempt"; fi
-		attempt=$((attempt+1)); [ "$attempt" -lt 150 ] || { log 'Xray: загрузчик уже работает; повтор будет выполнен позже'; return 1; }
+		attempt=$((attempt+1)); [ "$attempt" -lt "$limit" ] || { log 'Xray: загрузчик уже работает; повтор будет выполнен позже'; return 1; }
 		sleep 1
 	done
 	printf '%s %s\n' "$XRAY_SELF_PID" "$XRAY_SELF_BIRTH" >"$XRAY_LOCK/owner" || { rmdir "$XRAY_LOCK" 2>/dev/null || true; return 1; }
@@ -1638,7 +2358,11 @@ xray_cache_save() (
 	digest="$(xray_digest "$bin")" || return 1
 	target="$store/$asset.$digest.gz"
 	# An existing valid copy requires no Flash writes, including after reboot.
-	if [ -s "$target" ] && gzip -t "$target" 2>/dev/null; then return 0; fi
+	# Recognize an identical cache regardless of the old release asset prefix.
+	for cached in "$store/"*."$digest".gz; do
+		[ -f "$cached" ] && [ ! -L "$cached" ] && [ -s "$cached" ] || continue
+		if gzip -t "$cached" 2>/dev/null; then return 0; fi
+	done
 	umask 077
 	mkdir -p "$store" || return 1
 	chmod 700 "$store" || return 1
@@ -1668,31 +2392,41 @@ xray_cache_save() (
 )
 xray_cache_restore() (
 	store="$(xray_cache_dir)" || return 1
-	asset="$(xray_release_asset)" || return 1
 	dir="$(xray_runtime_dir)"; mkdir -p "$dir" || return 1
+	# A confirmed local boot copy may have been produced by an older agent,
+	# a different release provider, or a manually selected softfloat binary.
+	# The archive filename's release asset is not the binary's identity.
+	# Recover only an unambiguous cache, never choose an arbitrary version.
+	count=0; cache=''
+	for item in "$store/"*.gz; do
+		[ -f "$item" ] && [ ! -L "$item" ] && [ -s "$item" ] || continue
+		count=$((count+1)); cache="$item"
+	done
+	[ "$count" = 1 ] || { [ "$count" = 0 ] || log 'Xray: несколько загрузочных копий; требуется явный выбор'; return 1; }
+	name="${cache##*/}"; digest="${name%.gz}"; digest="${digest##*.}"
+	case "$digest" in ''|*[!0-9a-f]*) return 1;; esac
+	[ "${#digest}" = 64 ] && [ "$(wc -c <"$cache")" -le 16777216 ] || return 1
+	configured="$(uci_get xray_bin /usr/bin/xray)"
+	case "$configured" in
+		"$dir/xray"|"$dir/xray_softfloat") target="$configured";;
+		*) target="$dir/xray";;
+	esac
 	temp="$(mktemp "$dir/.restore.XXXXXX")" || return 1
 	trap 'rm -f "$temp"' EXIT
 	trap 'exit 1' INT TERM
-	for cache in "$store/$asset."*.gz; do
-		[ -s "$cache" ] || continue
-		[ "$(wc -c <"$cache")" -le 16777216 ] || continue
-		digest="${cache#"$store/$asset."}"; digest="${digest%.gz}"
-		case "$digest" in ''|*[!0-9a-f]*) continue ;; esac
-		[ "${#digest}" = 64 ] || continue
-		# Bound even an invalid compressed file; verify bytes before execution.
-		gzip -t "$cache" 2>/dev/null || { log 'Xray: повреждён постоянный кэш; требуется повторная загрузка'; continue; }
-		gzip -dc "$cache" | head -c 67108865 >"$temp"
-		size="$(wc -c <"$temp")"
-		[ "$size" -le 67108864 ] && [ "$(xray_digest "$temp")" = "$digest" ] || continue
-		chmod 755 "$temp" && "$temp" version >/dev/null 2>&1 || continue
-		mv -f "$temp" "$dir/xray" || return 1
-		if [ "$(uci_get xray_bin '')" != "$dir/xray" ]; then
-			uci set "$CONFIG.$SECTION.xray_bin=$dir/xray" && uci commit "$CONFIG" || return 1
-		fi
-		log 'Xray: восстановлен из постоянного кэша без загрузки из интернета'
-		return 0
-	done
-	return 1
+	# One bounded decompression; the full executable hash detects truncated
+	# or corrupted output before execution. Do not decompress twice at boot.
+	gzip -dc "$cache" | head -c 67108865 >"$temp"
+	size="$(wc -c <"$temp")"
+	[ "$size" -gt 0 ] && [ "$size" -le 67108864 ] &&
+		[ "$(xray_digest "$temp")" = "$digest" ] || { log 'Xray: повреждена загрузочная копия'; return 1; }
+	chmod 755 "$temp" && "$temp" version >/dev/null 2>&1 || return 1
+	mv -f "$temp" "$target" || return 1
+	if [ "$configured" != "$target" ]; then
+		uci set "$CONFIG.$SECTION.xray_bin=$target" && uci commit "$CONFIG" || return 1
+	fi
+	log 'Xray: восстановлен из постоянного кэша без загрузки из интернета'
+	return 0
 )
 
 # Keep a finite wait even without BusyBox's optional timeout applet. The
@@ -2026,9 +2760,12 @@ run_xray() {
 	# Missing WAN is a temporary condition, not a failed Xray configuration.
 	# Stay supervised instead of exhausting procd's six startup attempts.
 	wait_for_selected_wan || return 1
+	# After a reboot the transient pilot process is gone. Reap stale state
+	# before starting the primary procd Xray; never promote implicitly.
+	pilot_stop >/dev/null 2>&1 || true
 	ensure_xray_available_with_retry || die "cannot prepare Xray for tunnel"
 	xray_bin="$(xray_bin_path)"
-	xray_config="$(render_client_config)" || die "cannot create Xray configuration"
+	xray_config="$(transport_active_config)" || die "cannot create Xray configuration"
 	[ -n "$xray_config" ] && [ -s "$xray_config" ] || die "Xray configuration is missing or empty"
 	[ -x "$xray_bin" ] || die "xray not found or not executable: $xray_bin"
 	log "Xray: запуск туннеля; config=$xray_config; VPS=$(uci_get vps_host ''):$(uci_get vps_port 8443); WAN_direct=$(uci_get wan_direct 0); WAN_selected=$(uci_get wan_interface wan)"
@@ -2073,6 +2810,27 @@ case "$cmd" in
 		;;
 	stop-xray)
 		stop_xray
+		;;
+	transport-preflight)
+		transport_preflight || exit $?
+		;;
+	transport-bind-identity)
+		transport_bind_identity || exit $?
+		;;
+	transport-stage|transport-probe|transport-activate|transport-rollback|transport-recover)
+		transport_manager "${cmd#transport-}" "${1:-0}" || exit $?
+		;;
+	transport-pilot-start)
+		pilot_start || exit $?
+		;;
+	transport-pilot-stop)
+		pilot_stop || exit $?
+		;;
+	transport-pilot-expire)
+		pilot_expire "$1" "$2" || exit $?
+		;;
+	transport-pilot-status)
+		pilot_status || exit $?
 		;;
 	render-client)
 		xray_apply_trace render-client

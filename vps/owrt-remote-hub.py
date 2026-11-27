@@ -3,7 +3,7 @@ import argparse
 import base64
 import datetime as dt
 import dataclasses
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from collections import deque
 import enum
 from email.parser import BytesParser
@@ -148,6 +148,9 @@ NOTIFICATIONS_MAX = 220
 LUCI_ABSOLUTE_ROOTS = ("/ubus", "/cgi-bin/luci", "/luci-static")
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 VPS_TERMINAL_ID = "__vps__"
+XRAY_CORE_ACTION_CSRF = secrets.token_urlsafe(32)
+UNIFIED_XRAY_CSRF = secrets.token_urlsafe(32)
+TRANSPORT_STAGE_ACTION_CSRF = secrets.token_urlsafe(32)
 SSH_HTTP_SESSIONS = {}
 SSH_HTTP_LOCK = threading.Lock()
 ROUTER_PROXY_LOCK = threading.Lock()
@@ -1740,7 +1743,8 @@ def save_auth(username, password):
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
     try:
-        data = normalize_auth_state(load_auth())
+        # On first boot load_auth() itself calls save_auth().
+        data = normalize_auth_state(json.loads(AUTH_FILE.read_text(encoding="utf-8")))
     except Exception:
         data = normalize_auth_state({"username": username})
     data["username"] = username
@@ -3532,6 +3536,18 @@ def connect(db_path=DB_PATH):
 
 
 def init_db(conn):
+    if unified_xray_enabled():
+        conn.execute("create table if not exists xray_receipt (slot integer primary key check(slot=1), token text not null)")
+        conn.execute("""create table if not exists transport_router_identity (
+            router_id text primary key, active_hash text, pending_hash text)""")
+        conn.execute("""create table if not exists transport_router_task (
+            router_id text primary key, task_id text not null, action text not null,
+            slot text not null, state text not null, updated_at integer not null)""")
+        ensure_column(conn, "transport_router_task", "target", "text")
+        conn.execute("""create table if not exists transport_router_receipt (
+            router_id text not null, task_id text not null, target text not null, state text not null,
+            primary key(router_id, task_id))""")
+        conn.execute("update transport_router_task set state='failed' where target is null and state='queued'")
     conn.execute(
         """
         create table if not exists routers (
@@ -3594,6 +3610,10 @@ def init_db(conn):
     ensure_column(conn, "routers", "vps_transport", "text not null default 'tcp'")
     # Temporary TCP fallback for planned WSS migration; disabled for all existing rows.
     ensure_column(conn, "routers", "vps_allow_legacy", "integer not null default 0")
+    if unified_xray_enabled():
+        ensure_column(conn, "routers", "transport_luci_port", "integer not null default 0")
+        ensure_column(conn, "routers", "transport_ssh_port", "integer not null default 0")
+        ensure_column(conn, "routers", "transport_active_ref", "text not null default ''")
     conn.execute(
         """
         update routers
@@ -3675,6 +3695,15 @@ def get_active_router(conn, router_id):
     if router_deleted(row):
         return None
     return row
+
+
+def router_channel_port(row, *, ssh=False):
+    if not row:
+        return 0
+    profile_port = "transport_ssh_port" if ssh else "transport_luci_port"
+    base_port = "ssh_entry_port" if ssh else "entry_port"
+    selected = row_int_value(row, profile_port, 0) if unified_xray_enabled() else 0
+    return selected or int(row[base_port] or 0)
 
 
 def get_router_by_entry_port(conn, entry_port, exclude_id=""):
@@ -4007,6 +4036,8 @@ def router_current_hub_bundle(router, app_public_url="", request_origin="", fall
         or vps_host_name(router_fallback_hub_url(row, fallback_host, 8088))
         or ""
     )
+    if unified_xray_enabled():
+        config_vps_host = vps_host_name(app_origin)
     hub_update = {
         "hub_url": hub_url,
         "public_url": public_url,
@@ -4016,6 +4047,8 @@ def router_current_hub_bundle(router, app_public_url="", request_origin="", fall
 
 
 def restore_hub_backup(archive_path, db_path=DB_PATH, vps_host="", public_url=""):
+    if unified_xray_enabled():
+        raise ValueError("Unified Xray enrollment requires a coordinated stack restore")
     ensure_state()
     archive_path = Path(archive_path)
     restored_files = []
@@ -4067,7 +4100,7 @@ def restore_hub_backup(archive_path, db_path=DB_PATH, vps_host="", public_url=""
     }
 
 
-def upsert_router(conn, values):
+def upsert_router(conn, values, *, commit=True):
     router_id = clean_router_id(values.get("id"))
     current = get_router(conn, router_id)
     ts = now_ts()
@@ -4199,8 +4232,144 @@ def upsert_router(conn, values):
             """,
             payload,
         )
-    conn.commit()
+    if commit:
+        conn.commit()
     return get_router(conn, router_id)
+
+
+def transport_identity(conn, router_id, authorization, *, promote=False):
+    row = conn.execute("select active_hash, pending_hash from transport_router_identity where router_id=?",
+                       (router_id,)).fetchone()
+    match = re.fullmatch(r"Bearer ([A-Za-z0-9_-]{43})", authorization)
+    if not row or not match or not get_active_router(conn, router_id):
+        return False, bool(row and row["active_hash"])
+    digest = hashlib.sha256(match[1].encode("ascii")).hexdigest()
+    if secrets.compare_digest(digest, row["active_hash"] or ""):
+        return True, True
+    if promote and secrets.compare_digest(digest, row["pending_hash"] or ""):
+        changed = conn.execute("""update transport_router_identity set active_hash=pending_hash, pending_hash=null
+                     where router_id=? and pending_hash=?""", (router_id, digest))
+        if changed.rowcount == 1:
+            return True, True
+    return False, bool(row["active_hash"])
+
+
+def issue_transport_identity(conn, router_id):
+    if not get_active_router(conn, router_id):
+        raise ValueError("Router not found")
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    conn.execute("""insert into transport_router_identity(router_id, pending_hash) values (?,?)
+                 on conflict(router_id) do update set pending_hash=excluded.pending_hash""", (router_id, digest))
+    return token
+
+
+TRANSPORT_TARGET_KEYS = {"profile_id", "revision", "assignment_id"}
+
+
+def transport_target(target):
+    if target is not None and (
+            not isinstance(target, dict) or set(target) != TRANSPORT_TARGET_KEYS
+            or not isinstance(target["profile_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", target["profile_id"])
+            or type(target["revision"]) is not int or not 1 <= target["revision"] < 10**15
+            or not isinstance(target["assignment_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", target["assignment_id"])):
+        raise ValueError("Invalid transport target")
+    return json.dumps(target, sort_keys=True)
+
+
+def queue_transport_task(conn, router_id, action, slot, target):
+    if action not in {"stage", "probe", "activate", "rollback"} or slot not in {"0", "1", "2", "enrollment"}:
+        raise ValueError("Invalid transport action")
+    target_json = transport_target(target)
+    if action == "rollback":
+        row = get_active_router(conn, router_id)
+        if not row or reported_rollback_target(row) != {"transport_rollback_target": target}:
+            raise ValueError("Router rollback target changed")
+        slot = "enrollment" if target is None else "0"
+        unified_xray_request("transport.router_portals", router_id=router_id, profile=target)
+    elif slot == "enrollment":
+        if target is not None:
+            raise ValueError("Invalid enrollment target")
+    else:
+        profiles = unified_xray_request("transport.router_profiles", router_id=router_id)["profiles"]
+        index = int(slot)
+        if (target is None or index >= len(profiles)
+                or target != {key: profiles[index].get(key) for key in TRANSPORT_TARGET_KEYS}):
+            raise ValueError("Transport assignment changed")
+    queued = conn.execute("""insert into transport_router_task(router_id,task_id,action,slot,state,updated_at,target)
+        values (?,?,?,?,?,?,?) on conflict(router_id) do update set task_id=excluded.task_id,
+            action=excluded.action, slot=excluded.slot, state=excluded.state, updated_at=excluded.updated_at,
+            target=excluded.target where transport_router_task.state not in ('queued','running')""",
+        (router_id, uuid.uuid4().hex, action, slot, "queued", now_ts(), target_json))
+    if queued.rowcount != 1:
+        raise ValueError("A transport action is already pending")
+
+
+def claim_transport_task(conn, router_id):
+    conn.execute("""update transport_router_task set state='running', updated_at=?
+        where router_id=? and state='queued' and target is not null""", (now_ts(), router_id))
+    row = conn.execute("""select task_id,action,slot,target from transport_router_task
+        where router_id=? and state='running'""", (router_id,)).fetchone()
+    if row is None:
+        return None
+    if row["target"] is None:
+        raise ValueError("Unbound legacy task requires recovery")
+    return dict(row, target=json.loads(row["target"]))
+
+
+def acknowledge_transport_task(conn, router_id, task_id, target, succeeded):
+    if not isinstance(task_id, str) or not re.fullmatch(r"[0-9a-f]{32}", task_id) or type(succeeded) is not bool:
+        raise ValueError("Invalid task receipt")
+    target_json = transport_target(target)
+    state = "completed" if succeeded else "failed"
+    receipt = conn.execute("""select target,state from transport_router_receipt
+        where router_id=? and task_id=?""", (router_id, task_id)).fetchone()
+    if receipt is not None:
+        if (receipt["target"], receipt["state"]) != (target_json, state):
+            raise ValueError("Conflicting task receipt")
+        return
+    task = conn.execute("""select target,state,action from transport_router_task
+        where router_id=? and task_id=?""", (router_id, task_id)).fetchone()
+    if task is None or (task["target"], task["state"]) != (target_json, "running"):
+        raise ValueError("Task receipt does not match a running task")
+    if succeeded and task["action"] in {"activate", "rollback"}:
+        router = get_active_router(conn, router_id)
+        if not router or json.loads(router["transport_active_ref"] or "null") != target:
+            raise ValueError("Target activation is not confirmed")
+    conn.execute("update transport_router_task set state=?,updated_at=? where router_id=? and task_id=?",
+                 (state, now_ts(), router_id, task_id))
+    conn.execute("insert into transport_router_receipt values (?,?,?,?)",
+                 (router_id, task_id, target_json, state))
+
+
+def probe_transport_channels(ports):
+    started = time.monotonic()
+    try:
+        with closing(http.client.HTTPConnection("127.0.0.1", ports[0], timeout=2)) as luci:
+            luci.request("GET", "/cgi-bin/luci/")
+            with luci.getresponse() as response:
+                if response.status not in {200, 301, 302, 303, 307, 308, 401, 403}:
+                    return None
+        with socket.create_connection(("127.0.0.1", ports[1]), timeout=2) as ssh:
+            with ssh.makefile("rb") as stream:
+                if not stream.readline(255).startswith(b"SSH-"):
+                    return None
+    except (OSError, http.client.HTTPException):
+        return None
+    return round(1000 * (time.monotonic() - started))
+
+
+def reported_rollback_target(row):
+    try:
+        status = json.loads(row["status_json"] or "{}")
+        if isinstance(status, dict) and "transport_rollback_target" in status:
+            transport_target(status["transport_rollback_target"])
+            return {"transport_rollback_target": status["transport_rollback_target"]}
+    except (ValueError, TypeError):
+        pass
+    return {}
 
 
 def heartbeat(conn, payload):
@@ -4209,6 +4378,9 @@ def heartbeat(conn, payload):
     ts = now_ts()
     status_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     was_deleted = router_deleted(row)
+    managed = unified_xray_enabled()
+    if managed and (not row or was_deleted):
+        raise ValueError("Register the router in HUB before connecting")
     known_before = bool(row and not was_deleted)
     was_online = bool(row_to_router(row).get("online")) if known_before else False
     old_entry_port = int(row["entry_port"] or 0) if row else 0
@@ -4263,10 +4435,10 @@ def heartbeat(conn, payload):
             payload.get("name") or "",
             payload.get("role") or "",
             payload.get("public_url") or "",
-            payload.get("admin_host") or "",
-            int(payload["admin_port"]) if str(payload.get("admin_port", "")).isdigit() else None,
-            payload.get("ssh_host") or "",
-            ssh_port,
+            "" if managed else payload.get("admin_host") or "",
+            int(payload["admin_port"]) if not managed and str(payload.get("admin_port", "")).isdigit() else None,
+            "" if managed else payload.get("ssh_host") or "",
+            row["ssh_port"] if managed else ssh_port,
             ts,
             status_json,
             ts,
@@ -4523,12 +4695,18 @@ def make_router_xray_config(row):
     bridge_tag = row["reverse_tag"]
     ssh_bridge_tag = row["ssh_reverse_tag"] or f"{bridge_tag}-ssh"
     transport = row_str_value(row, "vps_transport", "tcp")
+    if transport not in ("tcp", "ws"):
+        # Prevent an unsupported profile being silently exported as
+        # insecure legacy TCP before transactional profile support ships.
+        raise ValueError("Client Xray export requires an applied supported transport")
     sni = (vps_host_name(os.environ.get("OWRT_REMOTE_PUBLIC_URL", ""))
            or vps_host_name(row_str_value(row, "public_url", ""))
            or row_str_value(row, "vps_host", ""))
+    ws_path = (unified_xray_request("status")["wss_path"]
+               if transport == "ws" and unified_xray_enabled() else "/owrt-ws/")
     stream = ({"network": "ws", "security": "tls",
                "tlsSettings": {"serverName": sni, "allowInsecure": False, "alpn": ["http/1.1"]},
-               "wsSettings": {"path": "/owrt-ws/", "host": sni}}
+               "wsSettings": {"path": ws_path, "host": sni}}
               if transport == "ws" else {"network": "tcp", "security": "none"})
     admin_settings = {"redirect": f"{row['admin_host']}:{int(row['admin_port'])}"}
     ssh_settings = {"redirect": f"{row['ssh_host'] or '127.0.0.1'}:{int(row['ssh_port'] or 22)}"}
@@ -4615,6 +4793,8 @@ def host_adapter_request(operation, payload=None):
     """One bounded, fixed-protocol request to the host control service."""
     if not DOCKER_RUNTIME:
         raise RuntimeError("Host adapter is only available in Docker runtime")
+    if unified_xray_enabled():
+        raise RuntimeError("Legacy host adapter is unavailable for this backend")
     path = os.environ.get("OWRT_REMOTE_HOST_ADAPTER_SOCKET", "/run/router-orchestrator/control.sock")
     data = {"op": operation}
     if payload is not None:
@@ -4623,7 +4803,7 @@ def host_adapter_request(operation, payload=None):
     if len(encoded) > 2 * 1024 * 1024:
         raise RuntimeError("Host adapter request exceeds size limit")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-        channel.settimeout(35)
+        channel.settimeout(90)
         channel.connect(path)
         channel.sendall(encoded)
         with channel.makefile("rb") as reader:
@@ -4634,6 +4814,138 @@ def host_adapter_request(operation, payload=None):
     if not data.get("ok"):
         raise RuntimeError("Host adapter: " + str(data.get("error") or "request rejected")[:180])
     return data
+
+
+def core_adapter_request(operation, payload=None):
+    if unified_xray_enabled():
+        return unified_xray_request(operation.removeprefix("xray."), **(payload or {}))
+    return host_adapter_request(operation, payload)
+
+
+def unified_xray_enabled():
+    return DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "unified_adapter"
+
+
+def unified_xray_request(op, **payload):
+    """The root peer owns the abstract socket in the host network namespace."""
+    if not unified_xray_enabled():
+        raise RuntimeError("Unified Xray control is disabled")
+    import struct
+
+    port = int(os.environ["OWRT_REMOTE_PORT"])
+    response_limit = 256 * 1024 if op == "transport.list" else 8192
+    data = (json.dumps({"op": op, **payload}, allow_nan=False) + "\n").encode()
+    if len(data) > 8192:
+        raise ValueError("Invalid Xray request size")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.settimeout(180 if op in {
+                "transport.publish", "transport.activate", "transport.disable", "transport.rollback",
+                "transport.assign", "transport.unassign",
+            } else 80)
+            channel.connect("\0router-orchestrator-xray-" + str(port))
+            _, uid, gid = struct.unpack("3i", channel.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            if (uid, gid) != (0, 0):
+                raise RuntimeError("Xray adapter peer verification failed")
+            channel.sendall(data)
+            with channel.makefile("rb") as reader:
+                raw = reader.readline(response_limit + 1)
+        if len(raw) > response_limit or not raw.endswith(b"\n"):
+            raise RuntimeError("Invalid Xray response")
+        response = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Xray adapter unavailable") from exc
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        raise RuntimeError("Xray adapter rejected the operation")
+    return response
+
+
+def reconcile_unified_xray(conn):
+    """Resolve a prepare using the receipt committed with the router row."""
+    owns_lock = not conn.in_transaction
+    if owns_lock:
+        conn.execute("begin immediate")
+    try:
+        status = unified_xray_request("status")
+        token = status.get("pending")
+        if token:
+            receipt = conn.execute("select token from xray_receipt where slot=1").fetchone()
+            if receipt and receipt[0] == token:
+                unified_xray_request("apply_config", commit=token)
+            else:
+                unified_xray_request("rollback", transaction=token)
+        return status
+    finally:
+        if owns_lock:
+            conn.rollback()
+
+
+def unified_router_spec(row):
+    if (row["vps_transport"] != "ws" or row["vps_allow_legacy"] or row["vless_flow"] or
+            row["vless_encryption"] != "none" or row["vless_decryption"] != "none"):
+        raise ValueError("Unified enrollment requires WSS without legacy fallback")
+    return {"id": row["id"], "clients": [row["vless_uuid"], row["ssh_vless_uuid"]],
+            "ports": [row["entry_port"], row["ssh_entry_port"]],
+            "targets": [[row["admin_host"], row["admin_port"]], [row["ssh_host"], row["ssh_port"]]]}
+
+
+def commit_unified_router(conn, router_id, row):
+    """Called with the HUB lock and SQLite write transaction held."""
+    token = uuid.uuid4().hex
+    try:
+        result = unified_xray_request("apply_config", transaction=token, router_id=router_id,
+                                      router=unified_router_spec(row) if row is not None else None)
+        if result["changed"]:
+            conn.execute("insert or replace into xray_receipt(slot,token) values (1,?)", (token,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        # The adapter may have applied the change before an IPC response was lost.
+        # If it is still busy, the monitor retries against the durable DB decision.
+        try:
+            reconcile_unified_xray(conn)
+        except (RuntimeError, sqlite3.Error):
+            pass
+        raise
+    if result["changed"]:
+        unified_xray_request("apply_config", commit=token)
+    return result
+
+
+def unified_router_edit(conn, router_id, payload, *, create=False):
+    if not isinstance(payload, dict):
+        raise ValueError("Router fields must be an object")
+    conn.execute("begin immediate")
+    status = reconcile_unified_xray(conn)
+    current = get_active_router(conn, router_id)
+    if create == bool(current):
+        raise ValueError("Router ID already exists" if create else "Router not found")
+    for key in ("entry_port", "ssh_entry_port"):
+        port = int(payload.get(key) or (current[key] if current else 0))
+        if not 1024 <= port <= 65535 or get_router_by_any_port(conn, port, router_id):
+            raise ValueError("Invalid or occupied router listener port")
+    if not router_group_exists(conn, payload.get("group_id", current["group_id"] if current else "")):
+        raise ValueError("Router group not found")
+    values = dict(current) if current else {}
+    allowed = {"entry_port", "ssh_entry_port", "admin_host", "admin_port", "ssh_host", "ssh_port"}
+    if create:
+        allowed |= {"name", "role", "group_id", "notes"}
+    values.update({key: payload[key] for key in allowed & payload.keys()})
+    values.update(id=router_id, vps_transport="ws", vless_port=status["public_port"],
+                  vps_host=vps_host_name(os.environ.get("OWRT_REMOTE_PUBLIC_URL", "")),
+                  reverse_tag="reverse-" + router_id, ssh_reverse_tag="reverse-" + router_id + "-ssh")
+    if current:
+        unified_router_spec(current)
+    else:
+        conn.execute("delete from transport_router_identity where router_id=?", (router_id,))
+        conn.execute("delete from transport_router_task where router_id=?", (router_id,))
+        conn.execute("delete from transport_router_receipt where router_id=?", (router_id,))
+        values.update(vless_uuid=str(uuid.uuid4()), ssh_vless_uuid=str(uuid.uuid4()),
+                      vless_encryption="none", vless_decryption="none")
+    row = upsert_router(conn, values, commit=False)
+    result = commit_unified_router(conn, router_id, row)
+    return row, result
 
 
 def build_additive_wss_candidate(current, rows, expected_new_id=None):
@@ -4909,6 +5221,9 @@ def reload_vps_xray(db_path=DB_PATH, expected_new_id=None):
 
 
 def restart_vps_xray():
+    if unified_xray_enabled():
+        with _XRAY_RELOAD_LOCK:
+            return unified_xray_request("restart")
     if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") == "host_adapter":
         return host_adapter_request("xray.restart")
     assert_xray_mutation_allowed()
@@ -4997,7 +5312,9 @@ def build_openwrt_config_payload(row, hub_url, vps_host_override="", public_url_
         "vps_port": row_int_value(row, "vless_port", DEFAULT_VLESS_PORT),
         "vps_transport": row_str_value(row, "vps_transport", "tcp"),
         "vps_sni": vps_host_name(hub_url) or effective_vps_host,
-        "vps_ws_path": "/owrt-ws/",
+        "vps_ws_path": (unified_xray_request("status")["wss_path"]
+                        if unified_xray_enabled() and row_str_value(row, "vps_transport", "tcp") == "ws"
+                        else "/owrt-ws/"),
         "vless_uuid": row_str_value(row, "vless_uuid"),
         "vless_encryption": row_str_value(row, "vless_encryption", "none"),
         "vless_flow": row_str_value(row, "vless_flow", ""),
@@ -5560,6 +5877,8 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
           </div>
           <div class="headerActions">
             <a class="badge" id="vpsTerminalLink" href="/vps-terminal/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Терминал VPS</a>
+            <a class="badge" id="transportCatalogLink" href="/secure-profiles/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Транспорты</a>
+            <a class="badge" id="xrayCoreLink" href="/xray-core/" target="_blank" rel="noopener noreferrer" {'hidden' if not is_owner else ''}>Xray Core</a>
             <button class="badge" id="xrayReload" type="button" {'hidden' if not is_owner else ''}>Обновить Xray CFG</button>
             <button class="badge" id="xrayRestart" type="button" {'hidden' if not is_owner else ''}>Рестарт Xray VPS</button>
             <button class="badge authToggle" id="authToggle" type="button">{safe_username}</button>
@@ -5893,6 +6212,8 @@ input,select{{min-width:0;border:1px solid var(--line);border-radius:8px;padding
     <div id="hubMenuPanelHost"></div>
     <div class="mobileOwnerTools" id="mobileOwnerTools" hidden>
       <a class="badge" href="/vps-terminal/" id="mobileVpsTerminal" target="_blank" rel="noopener noreferrer">Терминал VPS</a>
+      <a class="badge" href="/secure-profiles/" target="_blank" rel="noopener noreferrer">Транспорты</a>
+      <a class="badge" href="/xray-core/" target="_blank" rel="noopener noreferrer">Xray Core</a>
       <button class="badge" id="mobileXrayReload" type="button">Обновить Xray CFG</button>
       <button class="badge" id="mobileXrayRestart" type="button">Рестарт Xray VPS</button>
     </div>
@@ -8376,7 +8697,7 @@ function render(list) {{
       renderModelMetric(model, modelGetsLegendBadge(model)),
       metric('Система', release),
       metric('Xray', statusRu(xray)),
-      metric('Транспорт', r.vps_transport === 'ws' ? (Number(r.vps_allow_legacy || 0) ? 'WSS/TLS · 443 + TCP (временный fallback)' : 'WSS/TLS · 443') : 'TCP · ' + (r.vless_port || 18443)),
+      metric('Транспорт', r.vps_transport === 'ws' ? (Number(r.vps_allow_legacy || 0) ? 'WSS/TLS · 443 + TCP (временный fallback)' : 'WSS/TLS · ' + (r.vless_port || 443)) : 'TCP · ' + (r.vless_port || 18443)),
       metric('SSH', statusRu(ssh)),
       metric('В сети уже', uptime),
       metric('Был на связи', ago(r.last_seen_iso)),
@@ -8401,6 +8722,7 @@ function render(list) {{
         ${{sshButton}}
         ${{wolButton}}
         ${{logsButton}}
+        ${{authIsOwner() ? `<a class="btn" href="/secure-profiles/?router_id=${{encodeURIComponent(r.id)}}" target="_blank" rel="noopener noreferrer">Транспортные профили</a>` : ""}}
         ${{permissions.config ? `<a class="btn" href="${{escapeAttr(r.config_url)}}">OpenWrt config</a>` : '<span class="btn disabled">OpenWrt config</span>'}}
         ${{permissions.delete ? `<button class="btn" data-delete="${{escapeAttr(r.id)}}">Удалить</button>` : '<span class="btn disabled">Удалить</span>'}}
       </div>
@@ -8625,6 +8947,7 @@ render = function(list) {{
         ${{wolButton}}
         ${{notesButton}}
         ${{logsButton}}
+        ${{authIsOwner() ? `<a class="btn" href="/secure-profiles/?router_id=${{encodeURIComponent(r.id)}}" target="_blank" rel="noopener noreferrer">Транспортные профили</a>` : ""}}
         ${{permissions.config ? `<a class="btn" href="${{escapeAttr(r.config_url)}}">OpenWrt config</a>` : '<span class="btn disabled">OpenWrt config</span>'}}
         ${{permissions.delete ? `<button class="btn" data-delete="${{escapeAttr(r.id)}}">Удалить</button>` : '<span class="btn disabled">Удалить</span>'}}
       </div>
@@ -9153,7 +9476,7 @@ async function handleXrayReload() {{
 
 async function handleXrayRestart() {{
   showRouterMsg('Перезапускаю Xray на VPS...');
-  const res = await fetch('/api/xray/restart', {{method: 'POST'}});
+  const res = await fetch('/api/xray/restart', {{method: 'POST', headers: unifiedXrayHeaders()}});
   const text = await res.text();
   if (res.ok) {{
     let message = 'Xray VPS перезапущен.';
@@ -9249,7 +9572,7 @@ routerForm.addEventListener('submit', async (ev) => {{
     if (routerEntryPortInput) routerEntryPortInput.value = String(nextEntryPort(window.ROUTERS || []));
     return;
   }}
-  const res = await fetch('/api/router', {{method: 'POST', body}});
+  const res = await fetch('/api/router', {{method: 'POST', body, headers: unifiedXrayHeaders()}});
   if (res.ok) {{
     const data = await res.json().catch(() => ({{}}));
     ev.currentTarget.reset();
@@ -9618,7 +9941,7 @@ cards.addEventListener('click', async (ev) => {{
   const id = ev.target?.dataset?.delete;
   if (!id) return;
   if (!confirm('Удалить роутер ' + id + '?')) return;
-  const res = await fetch('/api/router/' + encodeURIComponent(id) + '/delete', {{method: 'POST'}});
+  const res = await fetch('/api/router/' + encodeURIComponent(id) + '/delete', {{method: 'POST', headers: unifiedXrayHeaders()}});
   if (res.ok) await loadRouters();
 }});
 
@@ -9733,6 +10056,10 @@ const socialProviderUi = {{
 }};
 let authHideTimer;
 let authMeta = {auth_bootstrap_json};
+function unifiedXrayHeaders() {{
+  return authMeta && authMeta.unified_xray_csrf
+    ? {{'X-Unified-Xray-CSRF': authMeta.unified_xray_csrf}} : {{}};
+}}
 let authTotpTicket = '';
 let authUsernameDraftDirty = false;
 let authUsernameServerValue = authUsernameField && 'value' in authUsernameField ? String(authUsernameField.value || '') : '';
@@ -10218,7 +10545,7 @@ function renderDelegatedOverview(meta) {{
 function syncOwnerChrome() {{
   const owner = authIsOwner();
   const canAddRouter = authCanAddRouter();
-  ['vpsTerminalLink', 'xrayReload', 'xrayRestart'].forEach((id) => {{
+  ['vpsTerminalLink', 'transportCatalogLink', 'xrayCoreLink', 'xrayReload', 'xrayRestart'].forEach((id) => {{
     const node = document.getElementById(id);
     if (node) node.hidden = !owner || mobileLayoutMq.matches;
   }});
@@ -10882,7 +11209,7 @@ function updateNotifyButton() {{
   syncNotificationFlags();
   notifyEnable.textContent = notificationPermissionText();
   if (notifyTest) notifyTest.disabled = hubPushServerReady === false;
-  notifyEnable.classList.toggle('on', Notification.permission === 'granted' && (localStorage.getItem('owrtNotifyEnabled') === '1' || localStorage.getItem('owrtPushEnabled') === '1'));
+  notifyEnable.classList.toggle('on', ('Notification' in window && Notification.permission === 'granted') && (localStorage.getItem('owrtNotifyEnabled') === '1' || localStorage.getItem('owrtPushEnabled') === '1'));
 }}
 
 function setNotifyStatus(text, bad = false) {{
@@ -12310,7 +12637,7 @@ def ssh_terminal_html(row, ws_token):
     router_id = row["id"]
     safe_id = html.escape(router_id, quote=True)
     safe_name = html.escape(row["name"] or router_id, quote=True)
-    ssh_port = int(row["ssh_entry_port"] or 0)
+    ssh_port = router_channel_port(row, ssh=True)
     quoted_id = urllib.parse.quote(router_id)
     ws_path = f"/ssh-ws/{quoted_id}?t={urllib.parse.quote(ws_token)}"
     check_path = f"/api/ssh/{quoted_id}/check?t={urllib.parse.quote(ws_token)}"
@@ -13274,7 +13601,7 @@ def ssh_terminal_html_v2(row, ws_token, quick_commands_html=""):
     connect_label = "VPS terminal" if is_vps_terminal else "SSH"
     closed_label = "VPS terminal закрыт" if is_vps_terminal else "SSH соединение закрыто"
     silent_label = "VPS terminal молчит больше 3 секунд" if is_vps_terminal else "SSH молчит больше 3 секунд"
-    ready_label = "VPS terminal запущен. Это root shell самого VPS. Команды ниже можно копировать или сразу отправлять в терминал." if is_vps_terminal else ""
+    ready_label = "VPS terminal запущен. Терминал VPS (пользователь roterm; sudo по паролю). Команды ниже можно копировать или сразу отправлять в терминал." if is_vps_terminal else ""
     force_http_only = str(os.environ.get("OWRT_REMOTE_TERMINAL_WS", "")).lower() not in {"1", "yes", "true", "on"}
     if is_vps_terminal:
         header_title = "VPS terminal"
@@ -15513,7 +15840,7 @@ class RouterUpdateManager:
                 self.job['finished_at'] = time.time()
 
     def _reboot_one(self, index, row, password, job_id):
-        if not int(row.get('ssh_entry_port') or 0):
+        if not router_channel_port(row, ssh=True):
             self._set(index, state='skipped', message='SSH-туннель не настроен; команда reboot не отправлена')
             return
         if self._cancelled():
@@ -15584,7 +15911,7 @@ class RouterUpdateManager:
                   + (' Последний ответ SSH: ' + last_error if last_error else ''))
 
     def _update_one(self, index, row, command, password, job_id):
-        if not int(row.get('ssh_entry_port') or 0):
+        if not router_channel_port(row, ssh=True):
             self._set(index, state='skipped', message='SSH-туннель не настроен')
             return
         task_id = job_id + '-' + str(index)
@@ -16063,12 +16390,26 @@ class App:
                 print(f"WARNING: router state monitor error: {exc}", file=sys.stderr)
             expire_ssh_http_sessions()
 
+    def unified_xray_recovery_loop(self):
+        while not self.router_monitor_stop.is_set():
+            if _XRAY_RELOAD_LOCK.acquire(blocking=False):
+                try:
+                    with self.conn() as conn:
+                        reconcile_unified_xray(conn)
+                except (RuntimeError, sqlite3.Error):
+                    pass  # Owner status shows unavailable or pending control.
+                finally:
+                    _XRAY_RELOAD_LOCK.release()
+            self.router_monitor_stop.wait(30)
+
     def start_router_state_monitor(self):
         if self.router_monitor_thread and self.router_monitor_thread.is_alive():
             return
         self.router_monitor_stop.clear()
         self.router_monitor_thread = threading.Thread(target=self.router_state_monitor_loop, daemon=True)
         self.router_monitor_thread.start()
+        if unified_xray_enabled():
+            threading.Thread(target=self.unified_xray_recovery_loop, daemon=True).start()
 
     def stop_router_state_monitor(self):
         self.router_monitor_stop.set()
@@ -16297,7 +16638,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(401, login_html().encode("utf-8"), "text/html; charset=utf-8")
         return False
 
-    def read_body(self):
+    def read_body(self, *, max_bytes=None):
+        if max_bytes is not None and self.headers.get("Transfer-Encoding"):
+            raise ValueError("Content-Length is required")
         if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
             chunks = []
             while True:
@@ -16322,15 +16665,15 @@ class Handler(BaseHTTPRequestHandler):
                 chunks.append(chunk)
             return b"".join(chunks)
         length = int(self.headers.get("Content-Length", "0") or "0")
-        if length < 0:
-            raise ValueError("negative content length")
+        if length < 0 or (max_bytes is not None and length > max_bytes):
+            raise ValueError("invalid content length")
         body = self.rfile.read(length) if length else b""
         if len(body) != length:
             raise ValueError("incomplete request body")
         return body
 
-    def read_payload(self, *, keep_blank_values=False):
-        body = self.read_body()
+    def read_payload(self, *, keep_blank_values=False, max_bytes=None):
+        body = self.read_body(max_bytes=max_bytes) if max_bytes is not None else self.read_body()
         ctype = self.headers.get("Content-Type", "")
         if "application/json" in ctype:
             return json.loads(body.decode("utf-8") or "{}")
@@ -16893,6 +17236,8 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         else:
             meta = public_auth_meta(auth)
             meta["can_add_router"] = False
+        if current and meta.get("can_add_router") and unified_xray_enabled():
+            meta["unified_xray_csrf"] = UNIFIED_XRAY_CSRF
         social = meta.get("social") if isinstance(meta.get("social"), dict) else {}
         for provider, item in social.items():
             if not isinstance(item, dict):
@@ -17510,7 +17855,7 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         if not row:
             self.send_text(404, "router not found")
             return
-        if int(row["ssh_entry_port"] or 0) <= 0:
+        if router_channel_port(row, ssh=True) <= 0:
             self.send_text(400, "router has no ssh_entry_port")
             return
         ws_token = ssh_ws_token(self.app.session_token, router_id)
@@ -17782,18 +18127,14 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         except OSError:
             pass
         router_id = self.router_id_from_path("/ssh-ws/")
-        if self.ssh_token_ok(router_id):
-            allowed = True
-        elif is_vps_terminal_id(router_id):
+        if is_vps_terminal_id(router_id):
             allowed = self.owner_ok()
+        elif self.ssh_token_ok(router_id):
+            allowed = True
         else:
             allowed = self.router_access_allowed(router_id, "B")
         if not allowed:
             self.send_response(403 if self.admin_ok() else 401)
-            self.end_headers()
-            return
-        if is_vps_terminal_id(router_id) and DOCKER_RUNTIME:
-            self.send_response(409)
             self.end_headers()
             return
         if not is_vps_terminal_id(router_id):
@@ -17803,7 +18144,7 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
                 self.send_response(404)
                 self.end_headers()
                 return
-            port = int(row["ssh_entry_port"] or 0)
+            port = router_channel_port(row, ssh=True)
             if port <= 0:
                 self.send_response(400)
                 self.end_headers()
@@ -17828,27 +18169,24 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         router_id = self.router_id_from_path("/api/ssh/")
         if router_id.endswith("/check"):
             router_id = router_id[:-6].rstrip("/")
-        if self.ssh_token_ok(router_id):
-            allowed = True
-        elif is_vps_terminal_id(router_id):
+        if is_vps_terminal_id(router_id):
             allowed = self.owner_ok()
+        elif self.ssh_token_ok(router_id):
+            allowed = True
         else:
             allowed = self.router_access_allowed(router_id, "B")
         if not allowed:
             self.send_json(403, {"ok": False, "error": "not authorized", "tcp_ok": False})
             return
         if is_vps_terminal_id(router_id):
-            if DOCKER_RUNTIME:
-                self.send_json(409, {"ok": False, "router_id": router_id, "tcp_ok": False, "error": "Host VPS terminal adapter required"})
-                return
-            self.send_json(200, {"ok": True, "router_id": router_id, "tcp_ok": True, "mode": "local-shell"})
+            self.send_json(200, {"ok": True, "router_id": router_id, "tcp_ok": True, "mode": "host-ssh" if DOCKER_RUNTIME else "local-shell"})
             return
         with self.app.conn() as conn:
             row = get_active_router(conn, router_id)
         if not row:
             self.send_json(404, {"ok": False, "error": "router not found", "tcp_ok": False})
             return
-        port = int(row["ssh_entry_port"] or 0)
+        port = router_channel_port(row, ssh=True)
         if port <= 0:
             self.send_json(200, {"ok": False, "error": "router has no ssh_entry_port", "tcp_ok": False})
             return
@@ -17912,7 +18250,7 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         return env, args
 
     def router_ssh_tcp_status(self, row, timeout=2):
-        port = int(row["ssh_entry_port"] or 0) if row else 0
+        port = router_channel_port(row, ssh=True)
         if port <= 0:
             return False, 0, "router has no ssh_entry_port"
         try:
@@ -17926,22 +18264,14 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         password = str(ssh_password or "")
         if not password:
             return None
-        askpass_dir = Path(tempfile.mkdtemp(prefix="owrt-askpass-"))
-        askpass_script = askpass_dir / "askpass.sh"
-        try:
-            askpass_script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$OWRT_REMOTE_SSH_PASSWORD\"\n",
-                encoding="utf-8",
-            )
-            os.chmod(askpass_script, 0o700)
-            env["SSH_ASKPASS"] = str(askpass_script)
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            env["DISPLAY"] = env.get("DISPLAY") or "owrt-remote:0"
-            env["OWRT_REMOTE_SSH_PASSWORD"] = password
-        except BaseException:
-            shutil.rmtree(askpass_dir)
-            raise
-        return askpass_dir
+        helper = "/opt/owrt-remote/bin/askpass.sh"
+        if not os.access(helper, os.X_OK):
+            raise RuntimeError("SSH askpass helper is not executable")
+        env["SSH_ASKPASS"] = helper
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY") or "owrt-remote:0"
+        env["OWRT_REMOTE_SSH_PASSWORD"] = password
+        return None
 
     def normalize_wol_mac(self, value):
         mac = str(value or "").strip().upper().replace("-", ":")
@@ -17957,14 +18287,22 @@ a{{display:inline-flex;margin-top:18px;color:#93c5fd}}
         return mac
 
     def run_router_ssh_script(self, row, script, script_args=None, timeout=15, ssh_password=""):
-        port = int(row["ssh_entry_port"] or 0) if row else 0
+        port = router_channel_port(row, ssh=True)
         if port <= 0:
             raise RuntimeError("router has no ssh_entry_port")
         password = str(ssh_password or "")
         env, args = self.ssh_exec_args(port, allow_password=bool(password))
         askpass_dir = self.prepare_ssh_askpass(env, password)
         try:
-            argv = args + ["sh", "-s", "--"] + [str(item) for item in (script_args or [])]
+            # OpenSSH joins command arguments into a remote shell string.
+            # Quote each argument before invoking the remote shell, including
+            # the arbitrary path, SNI and profile fields from owner input.
+            remote_command = "sh -s --"
+            if script_args:
+                remote_command += " " + " ".join(
+                    shlex.quote(str(item)) for item in script_args
+                )
+            argv = args + [remote_command]
             result = subprocess.run(
                 argv,
                 input=str(script),
@@ -18696,7 +19034,20 @@ exit 127
 
     def vps_shell_args(self):
         if DOCKER_RUNTIME:
-            raise RuntimeError("VPS host shell is unavailable in Docker without an audited host terminal adapter")
+            env = os.environ.copy()
+            env["TERM"] = "xterm-256color"
+            return env, [
+                "ssh", "-tt",
+                "-i", "/opt/owrt-remote/.host-terminal-key",
+                "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "UserKnownHostsFile=/opt/owrt-remote/.host-terminal-known",
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "ServerAliveInterval=15",
+                "-o", "ConnectTimeout=5",
+                "roterm@127.0.0.1",
+            ]
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         shell = env.get("SHELL", "")
@@ -18814,10 +19165,10 @@ exit 127
 
     def ssh_http_session(self):
         router_id = self.router_id_from_path("/api/ssh/")
-        if self.ssh_token_ok(router_id):
-            allowed = True
-        elif is_vps_terminal_id(router_id):
+        if is_vps_terminal_id(router_id):
             allowed = self.owner_ok()
+        elif self.ssh_token_ok(router_id):
+            allowed = True
         else:
             allowed = self.router_access_allowed(router_id, "B")
         if not allowed:
@@ -18837,7 +19188,7 @@ exit 127
         if not row:
             self.send_json(404, {"ok": False, "error": "router not found"})
             return
-        port = int(row["ssh_entry_port"] or 0)
+        port = router_channel_port(row, ssh=True)
         if port <= 0:
             self.send_json(400, {"ok": False, "error": "router has no ssh_entry_port"})
             return
@@ -18855,6 +19206,14 @@ exit 127
         if not session:
             self.send_json(404, {"ok": False, "error": "terminal session not found", "alive": False, "data": ""})
             return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
+            return
         with session["lock"]:
             data = "".join(session["buffer"])
             session["buffer"].clear()
@@ -18867,6 +19226,14 @@ exit 127
             session = SSH_HTTP_SESSIONS.get(sid)
         if not session:
             self.send_json(404, {"ok": False, "error": "terminal session not found"})
+            return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
             return
         if payload is None:
             payload = self.read_payload()
@@ -18898,6 +19265,14 @@ exit 127
         if not session:
             self.send_json(404, {"ok": False, "error": "terminal session not found"})
             return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
+            return
         if payload is None:
             payload = self.read_payload()
         with session["lock"]:
@@ -18920,10 +19295,20 @@ exit 127
 
     def ssh_http_close(self, sid):
         with SSH_HTTP_LOCK:
-            session = SSH_HTTP_SESSIONS.pop(sid, None)
+            session = SSH_HTTP_SESSIONS.get(sid)
         if not session:
             self.send_json(200, {"ok": True})
             return
+        router_id = str(session.get("router_id") or "")
+        if is_vps_terminal_id(router_id):
+            allowed = self.owner_ok()
+        else:
+            allowed = self.router_access_allowed(router_id, "B")
+        if not allowed:
+            self.send_json(403, {"ok": False, "error": "not authorized"})
+            return
+        with SSH_HTTP_LOCK:
+            SSH_HTTP_SESSIONS.pop(sid, None)
         with session["lock"]:
             session["alive"] = False
         self.send_json(200, {"ok": True})
@@ -19128,8 +19513,157 @@ exit 127
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
 
+    def unified_xray_csrf(self):
+        if (not secrets.compare_digest(self.headers.get("X-Unified-Xray-CSRF", "").encode("utf-8"),
+                                       UNIFIED_XRAY_CSRF.encode("ascii")) or
+                (self.headers.get("Origin") and self.headers["Origin"] != self.request_origin())):
+            self.send_json(403, {"ok": False, "error": "invalid CSRF or origin"})
+            return False
+        return True
+
     def do_GET(self):
         path = self.parsed().path
+        if unified_xray_enabled() and path in (
+                "/secure-profiles", "/secure-profiles/", "/transport-configurator", "/transport-configurator/"):
+            if not self.require_owner():
+                return
+            source = Path(__file__).resolve().parent / "static" / "transport-manager.html"
+            page = source.read_text(encoding="utf-8").replace(
+                "__UNIFIED_XRAY_CSRF__", html.escape(UNIFIED_XRAY_CSRF))
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
+        if path in ("/secure-profiles", "/secure-profiles/"):
+            if not self.require_owner():
+                return
+            source = Path(__file__).resolve().parent / "static" / "secure-profiles.html"
+            page = source.read_text(encoding="utf-8").replace(
+                "__TRANSPORT_CSRF__", html.escape(TRANSPORT_STAGE_ACTION_CSRF))
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
+        if path in ("/api/secure-profiles", "/api/secure-profiles/router", "/api/secure-profiles/job"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                if unified_xray_enabled():
+                    self.get_unified_transport_catalog(path)
+                    return
+                if path == "/api/secure-profiles/job":
+                    result = host_adapter_request("secure.catalog.job")
+                elif path == "/api/secure-profiles":
+                    result = host_adapter_request("secure.catalog.list")
+                    with self.app.conn() as conn:
+                        rows = list_router_rows(conn)
+                    result["routers"] = [{"id": row_str_value(row, "id"),
+                                          "name": row_str_value(row, "name"),
+                                          "transport": row_str_value(row, "vps_transport", "tcp")}
+                                         for row in rows if not router_deleted(row)]
+                else:
+                    from urllib.parse import parse_qs
+                    query = parse_qs(self.parsed().query)
+                    router_id = query.get("router_id", [""])[0]
+                    with self.app.conn() as conn:
+                        row = get_active_router(conn, router_id)
+                    if not row:
+                        raise ValueError("active router not found")
+                    result = host_adapter_request("secure.catalog.preferences", {"router_id": router_id})
+                self.send_json(200, result)
+            except Exception:
+                self.send_json(400, {"ok": False, "error": "catalog unavailable or router not found"})
+            return
+        if path in ("/transport-configurator", "/transport-configurator/"):
+            if not self.require_owner():
+                return
+            source = Path(__file__).resolve().parent / "static" / "transport-configurator.html"
+            template = source.read_text(encoding="utf-8")
+            stage_enabled = os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") == "1"
+            page = template.replace("__TRANSPORT_CSRF__", html.escape(TRANSPORT_STAGE_ACTION_CSRF))
+            page = page.replace("__TRANSPORT_STAGE_ENABLED__", "1" if stage_enabled else "0")
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
+        if path in ("/xray-core", "/xray-core/"):
+            if not self.require_owner():
+                return
+            template = (Path(__file__).resolve().parent / "static" / "xray-core-manager.html").read_text(encoding="utf-8")
+            page = template.replace("__CSRF_TOKEN__", html.escape(XRAY_CORE_ACTION_CSRF))
+            self.send_bytes(200, page.encode("utf-8"), "text/html; charset=utf-8",
+                            [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+            return
+        if path in {"/api/xray/status", "/api/xray/version", "/api/xray/health"}:
+            if not self.require_owner(json_mode=True):
+                return
+            if not unified_xray_enabled():
+                self.send_json(200, {"ok": True, "backend": os.environ.get(
+                    "OWRT_REMOTE_XRAY_CONTROL_BACKEND", "systemd"), "ready": None, "operations": []})
+                return
+            try:
+                result = unified_xray_request(path.rsplit("/", 1)[-1])
+                if "pending" in result:
+                    result["pending"] = bool(result["pending"])
+                self.send_json(200, result)
+            except RuntimeError:
+                self.send_json(503, {"ok": False, "ready": None, "operations": []})
+            return
+        if path == "/api/xray/core/info":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                self.send_json(200, core_adapter_request("xray.core.info"))
+            except Exception as exc:
+                self.send_json(500, {"ok": False, "error": str(exc)[:150]})
+            return
+        if path == "/api/xray/core/versions":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                from xray_releases import stable_release_tags
+                self.send_json(200, {"ok": True, "versions": stable_release_tags()})
+            except RuntimeError as exc:
+                self.send_json(503, {"ok": False, "error": str(exc)[:160]})
+            except Exception:
+                self.send_json(503, {"ok": False, "error": "GitHub release lookup unavailable"})
+            return
+        if path.startswith("/api/xray/core/job/"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                job_id = path.rsplit("/", 1)[-1]
+                self.send_json(200, core_adapter_request("xray.core.job", {"job_id": job_id}))
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:150]})
+            return
+        if path == "/api/transports/routers":
+            if not self.require_owner(json_mode=True):
+                return
+            with self.app.conn() as conn:
+                rows = list_router_rows(conn)
+            routers = [{"id": row_str_value(row, "id"),
+                        "name": row_str_value(row, "name"),
+                        "transport": row_str_value(row, "vps_transport", "tcp")}
+                       for row in rows if not router_deleted(row)]
+            self.send_json(200, {"ok": True, "routers": routers})
+            return
+        if path == "/api/transports/stage/status":
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                self.send_json(200, host_adapter_request("xray.transport.stage.status"))
+            except Exception:
+                self.send_json(503, {"ok": False, "error": "stage status unavailable"})
+            return
+        if path.startswith("/api/transports/stage/job/"):
+            if not self.require_owner(json_mode=True):
+                return
+            try:
+                job_id = path.rsplit("/", 1)[-1]
+                self.send_json(200, host_adapter_request(
+                    "xray.transport.stage.job", {"job_id": job_id}
+                ))
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:150]})
+            return
         if path == "/health":
             result = {"ok": True}
             if self.query().get('panel-update') == ['1']:
@@ -19387,8 +19921,165 @@ exit 127
     def do_HEAD(self):
         self.do_GET()
 
+    def get_unified_transport_catalog(self, path):
+        if path != "/api/secure-profiles":
+            self.send_json(409, {"ok": False, "error": "Operation unavailable for unified drafts"})
+            return
+        result = unified_xray_request("transport.list")
+        with self.app.conn() as conn:
+            rows = list_router_rows(conn)
+            identities = {row[0] for row in conn.execute(
+                "select router_id from transport_router_identity where active_hash is not null")}
+            tasks = {row["router_id"]: {field: row[field] for field in ("action", "state", "updated_at")}
+                     for row in conn.execute("select router_id,action,state,updated_at from transport_router_task")}
+        result["managed_routers"] = [
+            {"id": row["id"], "name": row["name"], "identity_bound": row["id"] in identities,
+             "active_profile": json.loads(row["transport_active_ref"]) if row["transport_active_ref"] else None,
+             "task": tasks.get(row["id"]), **reported_rollback_target(row)}
+            for row in rows if row["vps_transport"] == "ws"
+        ]
+        result["legacy_routers"] = [
+            {"id": row_str_value(row, "id"), "name": row_str_value(row, "name")}
+            for row in rows if not router_deleted(row) and row_str_value(row, "vps_transport", "tcp") == "tcp"
+        ]
+        result["backend"] = "unified_adapter"
+        self.send_json(200, result)
+
+    def post_unified_transport_catalog(self, operation):
+        if not self.unified_xray_csrf():
+            return
+        fields = {
+            "draft": {"profile", "label", "remote_host", "public_port"},
+            **{op: {"profile_id", "revision"} for op in ("detail", "validate", "plan", "stage", "confirm_delete")},
+            "approve": {"profile_id", "revision", "stage_sha256", "confirmed"},
+            "publish": {"profile_id", "revision", "stage_sha256", "confirmed"},
+            **{op: {"profile_id", "revision", "confirmed"} for op in ("activate", "disable", "rollback")},
+            "identity": {"router_id", "confirmed"},
+            "assign": {"router_id", "profiles", "confirmed"},
+            "unassign": {"router_id", "confirmed"},
+            "agent_action": {"router_id", "action", "slot", "target", "confirmed"},
+            "delete": {"profile_id", "revision", "confirmation"},
+        }.get(operation)
+        if fields is None:
+            self.send_json(409, {"ok": False, "error": "Operation unavailable for unified drafts"})
+            return
+        try:
+            payload = self.read_payload(max_bytes=8192)
+            if not isinstance(payload, dict) or set(payload) != fields:
+                raise ValueError("invalid fields")
+            if operation in {"identity", "assign", "unassign", "agent_action"}:
+                router_id = payload["router_id"]
+                if payload["confirmed"] is not True or not isinstance(router_id, str) or clean_router_id(router_id) != router_id:
+                    raise ValueError("invalid router identity request")
+                with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                    if operation == "identity":
+                        if self.request_scheme() != "https":
+                            raise ValueError("router credentials require HTTPS")
+                        token = issue_transport_identity(conn, router_id)
+                        conn.commit()
+                        self.send_json(200, {"ok": True, "router_token": token})
+                        return
+                    router = get_active_router(conn, router_id)
+                    if not router or not conn.execute(
+                            "select 1 from transport_router_identity where router_id=? and active_hash is not null",
+                            (router_id,)).fetchone():
+                        raise ValueError("router must first authenticate with its own credential")
+                    if operation == "agent_action":
+                        health = unified_xray_request("status")
+                        if health["maintenance_hold"] or not health["ready"]:
+                            raise ValueError("Transport operations are held")
+                        queue_transport_task(conn, router_id, payload["action"], payload["slot"], payload["target"])
+                        conn.commit()
+                        self.send_json(202, {"ok": True, "queued": True})
+                        return
+                    if conn.execute("""select 1 from transport_router_task where router_id=?
+                            and state in ('queued','running')""", (router_id,)).fetchone():
+                        raise ValueError("Wait for the router transport action to finish")
+                    if operation == "unassign" and (router["transport_active_ref"] or
+                            not self.agent_transport_probe(conn, router_id, None, activate=False)["ok"]):
+                        raise ValueError("Restore and verify the router enrollment channel first")
+                    result = unified_xray_request("transport." + operation, **payload)
+                self.send_json(200, result)
+                return
+            self.send_json(200, unified_xray_request("transport." + operation, **payload))
+        except (ValueError, TypeError, RuntimeError, OSError, sqlite3.Error):
+            self.send_json(400, {"ok": False, "error": "Transport operation rejected"})
+
+    def agent_transport_probe(self, conn, router_id, profile, *, activate):
+        row = get_active_router(conn, router_id)
+        if not row or now_ts() - int(row["last_seen"] or 0) > 90:
+            raise RuntimeError("Fresh authenticated heartbeat required")
+        status = unified_xray_request("status")
+        if status["maintenance_hold"] or not status["ready"]:
+            raise RuntimeError("Transport operations are held")
+        ports = unified_xray_request("transport.router_portals", router_id=router_id, profile=profile)["ports"]
+        latency = probe_transport_channels(ports)
+        if latency is None:
+            return {"ok": False}
+        if activate:
+            status = unified_xray_request("status")
+            if status["maintenance_hold"] or not status["ready"]:
+                raise RuntimeError("Transport operations are held")
+            conn.execute("""update routers set transport_luci_port=?, transport_ssh_port=?,
+                         transport_active_ref=? where id=?""",
+                         (*((0, 0) if profile is None else ports),
+                          "" if profile is None else json.dumps(profile, sort_keys=True), router_id))
+            conn.commit()
+        return {"ok": True, "latency_ms": latency}
+
     def do_POST(self):
         path = self.parsed().path
+        if path in ("/api/secure-profiles/draft", "/api/secure-profiles/select", "/api/secure-profiles/validate", "/api/secure-profiles/plan", "/api/secure-profiles/stage", "/api/secure-profiles/approve", "/api/secure-profiles/publish", "/api/secure-profiles/detail", "/api/secure-profiles/confirm_delete", "/api/secure-profiles/delete", "/api/secure-profiles/activate", "/api/secure-profiles/disable", "/api/secure-profiles/rollback", "/api/secure-profiles/identity", "/api/secure-profiles/assign", "/api/secure-profiles/unassign", "/api/secure-profiles/agent_action"):
+            if not self.require_owner(json_mode=True):
+                return
+            operation = path.rsplit("/", 1)[-1]
+            if unified_xray_enabled():
+                self.post_unified_transport_catalog(operation)
+                return
+            if operation in {"detail", "stage", "confirm_delete", "delete", "activate", "disable", "rollback",
+                             "identity", "assign", "unassign", "agent_action"}:
+                self.send_json(409, {"ok": False, "error": "Operation requires unified adapter"})
+                return
+            if not secrets.compare_digest(self.headers.get("X-Transport-Action-CSRF", "").encode("utf-8"),
+                                           TRANSPORT_STAGE_ACTION_CSRF.encode("ascii")):
+                self.send_json(403, {"ok": False, "error": "invalid transport CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                if path.endswith("/draft"):
+                    result = host_adapter_request("secure.catalog.draft", {
+                        "profile": payload.get("profile"), "label": payload.get("label"),
+                        "remote_host": payload.get("remote_host"), "public_port": payload.get("public_port")})
+                elif path.endswith("/publish"):
+                    result = host_adapter_request("secure.catalog.publish", {
+                        "profile_id": payload.get("profile_id"), "revision": payload.get("revision"),
+                        "artifact_sha256": payload.get("artifact_sha256"),
+                        "confirmed": payload.get("confirmed") is True})
+                elif path.endswith("/approve"):
+                    result = host_adapter_request("secure.catalog.approve", {
+                        "profile_id": payload.get("profile_id"), "revision": payload.get("revision"),
+                        "confirmed": payload.get("confirmed") is True})
+                elif path.endswith(("/validate", "/plan")):
+                    operation = "secure.catalog.plan" if path.endswith("/plan") else "secure.catalog.validate"
+                    result = host_adapter_request(operation, {
+                        "profile_id": payload.get("profile_id"), "revision": payload.get("revision")})
+                else:
+                    router_id = payload.get("router_id")
+                    if not isinstance(router_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", router_id):
+                        raise ValueError("invalid router ID")
+                    with self.app.conn() as conn:
+                        row = get_active_router(conn, router_id)
+                    if not row:
+                        raise ValueError("active router not found")
+                    result = host_adapter_request("secure.catalog.select", {
+                        "router_id": router_id, "profiles": payload.get("profiles")})
+                self.send_json(200, result)
+            except (TypeError, ValueError, KeyError, RuntimeError, OSError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
         if path in {'/api/hub-update/check', '/api/hub-update/start'}:
             self.hub_update_api(path.rsplit('/', 1)[-1])
             return
@@ -19419,18 +20110,92 @@ exit 127
         if path == '/api/router-logs':
             self.receive_router_logs_api()
             return
+        if path in {"/api/agent/transport-profiles", "/api/agent/transport-probe",
+                    "/api/agent/transport-activate", "/api/agent/transport-task",
+                    "/api/agent/transport-identity"} and unified_xray_enabled():
+            try:
+                payload = self.read_payload(max_bytes=1024)
+                listing = path.endswith("-profiles")
+                task = path.endswith("-task")
+                identity = path.endswith("-identity")
+                valid = ({"id", "protocol"}, {"id", "task_id", "target", "succeeded"}) if task else (
+                    ({"id"},) if listing or identity else ({"id", "profile"},))
+                if (not isinstance(payload, dict) or set(payload) not in valid
+                        or not isinstance(payload["id"], str) or clean_router_id(payload["id"]) != payload["id"]):
+                    raise ValueError("invalid payload")
+                with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                    router_id = payload["id"]
+                    https = self.request_scheme() == "https"
+                    if identity and https:
+                        conn.execute("begin immediate")
+                        authorized, _ = transport_identity(conn, router_id, self.headers.get("Authorization", ""),
+                                                           promote=True)
+                        conn.commit()
+                        self.send_json(200, {"ok": True, "identity_accepted": authorized})
+                        return
+                    authorized, _ = transport_identity(conn, router_id, self.headers.get("Authorization", ""))
+                    if not authorized or not https:
+                        self.send_json(401, {"ok": False, "error": "bad router credential"})
+                        return
+                    if task:
+                        if "task_id" in payload:
+                            conn.execute("begin immediate")
+                            acknowledge_transport_task(conn, router_id, payload["task_id"],
+                                                       payload["target"], payload["succeeded"])
+                            result = {"ok": True}
+                        else:
+                            if type(payload["protocol"]) is not int or payload["protocol"] != 2:
+                                raise ValueError("Unsupported transport task protocol")
+                            health = unified_xray_request("status")
+                            if health["maintenance_hold"] or not health["ready"]:
+                                raise RuntimeError("Transport operations are held")
+                            result = {"ok": True, "task": claim_transport_task(conn, router_id)}
+                        conn.commit()
+                    elif listing:
+                        result = unified_xray_request("transport.router_profiles", router_id=router_id)
+                        result["maintenance_hold"] = unified_xray_request("status")["maintenance_hold"]
+                    else:
+                        result = self.agent_transport_probe(conn, router_id, payload["profile"],
+                                                            activate=path.endswith("-activate"))
+                self.send_json(200, result)
+            except (ValueError, TypeError, RuntimeError, OSError, sqlite3.Error):
+                self.send_json(409, {"ok": False, "error": "Router profile state unavailable"})
+            return
         if path == "/api/heartbeat":
-            if not self.agent_ok():
+            unified = unified_xray_enabled()
+            shared = self.agent_ok()
+            if not shared and not unified:
                 self.send_json(401, {"ok": False, "error": "bad agent token"})
                 return
             try:
                 payload = self.read_payload()
-                with self.app.conn() as conn:
+                transport_task_waiting = False
+                with (_XRAY_RELOAD_LOCK if unified else nullcontext()), self.app.conn() as conn:
+                    if unified:
+                        conn.execute("begin immediate")
+                        router_id = clean_router_id(payload.get("id"))
+                        authorized = bound = False
+                        if router_id == payload.get("id"):
+                            auth = self.headers.get("Authorization", "") if self.request_scheme() == "https" else ""
+                            authorized, bound = transport_identity(conn, router_id, auth, promote=True)
+                        if router_id != payload.get("id") or (not authorized and (bound or not shared)):
+                            self.send_json(401, {"ok": False, "error": "bad router credential"})
+                            return
+                        if not authorized:
+                            payload.pop("transport_rollback_target", None)
+                        elif "transport_rollback_target" in payload:
+                            transport_target(payload["transport_rollback_target"])
                     router = heartbeat(conn, payload)
+                    if unified and authorized:
+                        transport_task_waiting = bool(conn.execute("""select 1 from transport_router_task
+                            where router_id=? and state in ('queued','running')""", (router_id,)).fetchone())
                     if router and router.get('_became_online'):
                         record_router_connection_log(conn, router['id'], True)
                 if router and router.pop("_became_online", False):
                     notify_router_online(router)
+                if unified and router:
+                    router.pop("vless_uuid", None)
+                    router.pop("ssh_vless_uuid", None)
                 xray_reload = None
                 if router and router.pop("_xray_reload_required", False):
                     try:
@@ -19453,6 +20218,7 @@ exit 127
                         "hub_update": canonical_router_hub_update(router, self.app.public_url, self.request_origin()),
                         "xray_reload": xray_reload,
                         "xray_restart": xray_restart,
+                        **({"transport_task_waiting": transport_task_waiting} if transport_task_waiting else {}),
                     },
                 )
             except Exception as exc:
@@ -19715,6 +20481,301 @@ exit 127
             except Exception as exc:
                 self.send_json(400, {"ok": False, "error": str(exc)})
             return
+        if path == "/api/xray/core/start":
+            if not self.require_owner(json_mode=True):
+                return
+            token = self.headers.get("X-Core-Action-CSRF", "")
+            if not secrets.compare_digest(token, XRAY_CORE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                self.send_json(200, core_adapter_request(
+                    "xray.core.start",
+                    {"action": payload.get("action"), "version": payload.get("version") or "",
+                     "confirmed": payload.get("confirmed") is True},
+                ))
+            except Exception as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/router/pilot/start":
+            if not self.require_owner(json_mode=True):
+                return
+            if os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") != "1":
+                self.send_json(403, {"ok": False, "error": "shadow pilot is disabled"})
+                return
+            csrf = self.headers.get("X-Transport-Action-CSRF", "")
+            if not secrets.compare_digest(csrf, TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                router_id = clean_router_id(payload.get("router_id"))
+                stage = host_adapter_request("xray.transport.stage.status")
+                if stage.get("phase") != "STAGED" or stage.get("router_id") != router_id:
+                    raise ValueError("matching server shadow pilot is not staged")
+                if int(stage.get("seconds_remaining") or 0) < 100:
+                    raise ValueError("pilot lease too short; start a new server pilot")
+                client = stage.get("client")
+                test_ports = stage.get("test_ports")
+                if not isinstance(client, dict) or not isinstance(test_ports, dict):
+                    raise ValueError("server pilot client metadata unavailable")
+                from transport_profiles import _host, _port
+                _host(str(client["host"]))
+                _port(client["port"])
+                ssh_test_port = _port(test_ports["ssh"])
+                with self.app.conn() as conn:
+                    row = get_active_router(conn, router_id)
+                if not row:
+                    raise ValueError("router is unavailable")
+                # The staged server is the only source of client transport
+                # fields. No browser-supplied reverse tags or UUIDs are used.
+                variables = [
+                    "OWRT_REMOTE_CANDIDATE_TRANSPORT",
+                    "OWRT_REMOTE_CANDIDATE_HOST",
+                    "OWRT_REMOTE_CANDIDATE_PORT",
+                    "OWRT_REMOTE_CANDIDATE_SNI",
+                    "OWRT_REMOTE_CANDIDATE_WS_PATH",
+                    "OWRT_REMOTE_CANDIDATE_XHTTP_PATH",
+                    "OWRT_REMOTE_CANDIDATE_GRPC_SERVICE",
+                    "OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY",
+                    "OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID",
+                    "OWRT_REMOTE_CANDIDATE_REVERSE_TAG",
+                    "OWRT_REMOTE_CANDIDATE_SSH_REVERSE_TAG",
+                ]
+                values = [
+                    client["transport"], client["host"], str(client["port"]),
+                    client.get("sni") or "", client.get("ws_path") or "/owrt-ws/",
+                    client.get("xhttp_path") or "/owrt-xhttp/",
+                    client.get("grpc_service") or "owrt_remote",
+                    client.get("reality_public_key") or "",
+                    client.get("reality_short_id") or "",
+                    client["reverse_tag"], client["ssh_reverse_tag"],
+                ]
+                remote_script = "set -eu\n" + "".join(
+                    'export ' + name + '="${' + str(i) + '}"\n'
+                    for i, name in enumerate(variables, start=1)
+                ) + "exec /usr/sbin/owrt-remote transport-pilot-start\n"
+                password = str(payload.get("ssh_password") or "")
+                result = self.run_router_ssh_script(
+                    row, remote_script, values, timeout=28, ssh_password=password
+                )
+                if "TRANSPORT PILOT: STARTED" not in result:
+                    raise RuntimeError("OpenWrt did not confirm shadow Xray start")
+                verified = False
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    current = host_adapter_request("xray.transport.stage.status")
+                    if (current.get("phase") != "STAGED" or
+                        int(current.get("seconds_remaining") or 0) < 20):
+                        break
+                    try:
+                        with socket.create_connection(
+                            ("127.0.0.1", ssh_test_port), timeout=2
+                        ) as conn:
+                            conn.settimeout(3)
+                            if conn.recv(48).startswith(b"SSH-"):
+                                verified = True
+                                break
+                    except OSError:
+                        pass
+                    time.sleep(2)
+                if not verified:
+                    # Stop only the temporary OpenWrt pilot. Primary Xray
+                    # remains untouched even if the pilot cannot connect.
+                    try:
+                        self.run_router_ssh_script(
+                            row, "exec /usr/sbin/owrt-remote transport-pilot-stop\n",
+                            timeout=8, ssh_password=password
+                        )
+                    except Exception:
+                        pass
+                    raise RuntimeError("shadow reverse SSH did not become reachable")
+                self.send_json(200, {"ok": True, "router_id": router_id,
+                                     "verified": True, "ssh_reverse": True,
+                                     "primary_uci_changed": False,
+                                     "pilot_ttl_seconds": 180})
+            except Exception as exc:
+                self.send_json(409, {"ok": False,
+                                     "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/stage/rollback":
+            if not self.require_owner(json_mode=True):
+                return
+            if os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") != "1":
+                self.send_json(403, {"ok": False, "error": "shadow staging is disabled"})
+                return
+            csrf = self.headers.get("X-Transport-Action-CSRF", "")
+            if not secrets.compare_digest(csrf, TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                request = self.read_payload()
+                self.send_json(200, host_adapter_request(
+                    "xray.transport.stage.rollback",
+                    {"confirmed": request.get("confirmed") is True},
+                ))
+            except Exception:
+                self.send_json(409, {"ok": False, "error": "pilot rollback unavailable or already running"})
+            return
+        if path == "/api/transports/stage/start":
+            if not self.require_owner(json_mode=True):
+                return
+            if os.environ.get("RO_ENABLE_TRANSPORT_STAGE", "0") != "1":
+                self.send_json(403, {"ok": False, "error": "shadow staging is disabled in server settings"})
+                return
+            csrf = self.headers.get("X-Transport-Action-CSRF", "")
+            if not secrets.compare_digest(csrf, TRANSPORT_STAGE_ACTION_CSRF):
+                self.send_json(403, {"ok": False, "error": "invalid transport action CSRF"})
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                from transport_profiles import validate_profiles
+                validate_profiles(payload.get("profiles"))
+                baseline = host_adapter_request("xray.current")
+                request = {
+                    "profiles": payload.get("profiles"),
+                    "router_id": payload.get("router_id"),
+                    "remote_host": payload.get("remote_host"),
+                    "admin_test_port": payload.get("admin_test_port"),
+                    "ssh_test_port": payload.get("ssh_test_port"),
+                    "expected_sha256": baseline["sha256"],
+                    "confirmed": payload.get("confirmed") is True,
+                }
+                self.send_json(200, host_adapter_request(
+                    "xray.transport.stage.start", request
+                ))
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/router/preflight":
+            if not self.require_owner(json_mode=True):
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                from transport_profiles import validate_profiles, render_router_outbound, _host
+                payload = self.read_payload()
+                profiles = payload.get("profiles")
+                if not isinstance(profiles, list) or len(profiles) != 1:
+                    raise ValueError("exactly one transport profile required")
+                validate_profiles(profiles)
+                profile = profiles[0]
+                router_id = clean_router_id(payload.get("router_id"))
+                with self.app.conn() as conn:
+                    row = get_active_router(conn, router_id)
+                if not row:
+                    raise ValueError("active router not found")
+                vps_host = _host(str(payload.get("remote_host") or row_str_value(row, "vps_host")))
+                # Validates reality public key as well as supported client stream.
+                render_router_outbound(
+                    profile, router_uuid=row_str_value(row, "vless_uuid"),
+                    remote_host=vps_host,
+                    reverse_tag=row_str_value(row, "reverse_tag", "reverse-in"),
+                )
+                script = (
+                    "set -eu\n"
+                    "export OWRT_REMOTE_CANDIDATE_TRANSPORT=\"$1\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_HOST=\"$2\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_PORT=\"$3\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_SNI=\"$4\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_WS_PATH=\"$5\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_XHTTP_PATH=\"$6\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_GRPC_SERVICE=\"$7\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_REALITY_PUBLIC_KEY=\"$8\"\n"
+                    "export OWRT_REMOTE_CANDIDATE_REALITY_SHORT_ID=\"$9\"\n"
+                    "exec /usr/sbin/owrt-remote transport-preflight\n"
+                )
+                if profile["transport"].startswith("reality-") and not (profile.get("short_ids") or [""])[0]:
+                    raise ValueError("REALITY pilot requires a nonempty shortId")
+                values = [
+                    ("ws" if profile["transport"] == "wss" else profile["transport"]), vps_host, str(profile["port"]),
+                    profile.get("server_name", vps_host),
+                    profile.get("path", "/owrt-ws/"),
+                    profile.get("path", "/owrt-xhttp/"),
+                    profile.get("service_name", "owrt_remote"),
+                    profile.get("public_key") or "none",
+                    (profile.get("short_ids") or [""])[0] or "none",
+                ]
+                if any(not isinstance(value, str) or
+                       not re.fullmatch(r"[A-Za-z0-9._:/~-]{1,255}", value)
+                       for value in values):
+                    raise ValueError("unsafe router preflight input")
+                output = self.run_router_ssh_script(
+                    row, script, values, timeout=35,
+                    ssh_password=str(payload.get("ssh_password") or "")
+                )
+                if "TRANSPORT PREFLIGHT: PASS" not in output:
+                    raise RuntimeError("OpenWrt candidate did not confirm validation")
+                self.send_json(200, {"ok": True, "router_id": router_id,
+                                     "validated_on_router": True,
+                                     "applied": False, "restarted": False})
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/canary/preview":
+            if not self.require_owner(json_mode=True):
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                payload = self.read_payload()
+                config = payload.get("profiles")
+                from transport_profiles import validate_profiles
+                validate_profiles(config)
+                baseline = host_adapter_request("xray.current")
+                result = host_adapter_request("xray.transport.canary.preview", {
+                    "profiles": config,
+                    "router_id": payload.get("router_id"),
+                    "remote_host": payload.get("remote_host"),
+                    "admin_test_port": payload.get("admin_test_port"),
+                    "ssh_test_port": payload.get("ssh_test_port"),
+                    "expected_sha256": baseline["sha256"]
+                })
+                self.send_json(200, result)
+            except (TypeError, ValueError, KeyError, RuntimeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
+        if path == "/api/transports/preview":
+            if not self.require_owner(json_mode=True):
+                return
+            if self.headers.get("Origin") and self.headers["Origin"] != self.request_origin():
+                self.send_json(403, {"ok": False, "error": "invalid origin"})
+                return
+            try:
+                from transport_profiles import validate_profiles
+                payload = self.read_payload()
+                profiles = payload.get("profiles")
+                # Cheap local fail-closed check before requesting host adapter.
+                validate_profiles(profiles)
+                status = host_adapter_request("xray.current")
+                result = host_adapter_request(
+                    "xray.transport.preview",
+                    {"profiles": profiles, "expected_sha256": status["sha256"],
+                     "router_uuid": payload.get("router_uuid") or "",
+                     "remote_host": payload.get("remote_host") or ""},
+                )
+                self.send_json(200, {"ok": True, "preview": result["preview"],
+                                     "router_outbound": result.get("router_outbound"),
+                                     "validated_by_xray": result["validated"],
+                                     "applied": False, "restart_performed": False})
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)[:160]})
+            return
         if path == "/api/xray/reload":
             if not self.require_owner(json_mode=True):
                 return
@@ -19724,8 +20785,20 @@ exit 127
             except Exception as exc:
                 self.send_text(500, str(exc))
             return
+        if path == "/api/xray/recover" and unified_xray_enabled():
+            if not self.require_owner(json_mode=True) or not self.unified_xray_csrf():
+                return
+            try:
+                with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                    reconcile_unified_xray(conn)
+                self.send_json(200, {"ok": True})
+            except (RuntimeError, sqlite3.Error):
+                self.send_json(503, {"ok": False, "error": "Xray recovery is blocked"})
+            return
         if path == "/api/xray/restart":
             if not self.require_owner(json_mode=True):
+                return
+            if unified_xray_enabled() and not self.unified_xray_csrf():
                 return
             try:
                 result = restart_vps_xray()
@@ -19809,6 +20882,9 @@ exit 127
                 self.send_json(400, {"ok": False, "error": str(exc)})
             return
         if path.startswith("/api/router/") and path.endswith("/vps-host"):
+            if unified_xray_enabled():
+                self.send_json(409, {"ok": False, "error": "VPS endpoint is managed by the unified stack"})
+                return
             if not self.require_owner(json_mode=True):
                 return
             try:
@@ -19841,15 +20917,28 @@ exit 127
         if path == "/api/router":
             if not self.require_add_router(json_mode=True):
                 return
+            if unified_xray_enabled() and not self.unified_xray_csrf():
+                return
             try:
                 current = self.current_account_profile(touch=False) or {}
-                payload = self.read_payload()
+                payload = self.read_payload(max_bytes=16384 if unified_xray_enabled() else None)
                 router_id = clean_router_id(payload.get("id"))
                 payload["group_id"] = clean_router_group_id(payload.get("group_id"))
                 payload["vps_transport"] = str(payload.get("vps_transport") or "ws").strip().lower()
                 if payload["vps_transport"] not in ("ws", "tcp"):
                     raise ValueError("Недопустимый транспорт Xray")
                 payload["vless_port"] = 443 if payload["vps_transport"] == "ws" else DEFAULT_VLESS_PORT
+                if unified_xray_enabled():
+                    if payload["vps_transport"] != "ws":
+                        raise ValueError("Unified enrollment requires WSS")
+                    payload["ssh_entry_port"] = payload.get("ssh_entry_port") or int(payload.get("entry_port") or 0) + 1000
+                    with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                        row, result = unified_router_edit(conn, router_id, payload, create=True)
+                    if current and not current.get("is_owner"):
+                        grant_delegated_router_flag(load_auth(), current.get("username", ""), router_id, "G")
+                    self.send_json(200, {"ok": True, "router": row_to_router(row),
+                                         "xray": result, "auth": self.build_auth_meta()})
+                    return
                 if DOCKER_RUNTIME:
                     if payload["vps_transport"] != "ws":
                         self.send_json(409, {"ok": False, "error": "В Docker новые роутеры добавляются только по WSS/443"})
@@ -19917,12 +21006,35 @@ exit 127
                 self.send_json(200, {"ok": True, "router": router,
                                      "xray": xray_sync, "auth": self.build_auth_meta()})
             except Exception as exc:
-                self.send_text(400, str(exc))
+                self.send_text(409 if unified_xray_enabled() else 400,
+                               "Unified Xray registration failed" if unified_xray_enabled() else str(exc))
+            return
+        if path.startswith("/api/router/") and path.endswith("/xray/edit") and unified_xray_enabled():
+            if not self.require_owner(json_mode=True) or not self.unified_xray_csrf():
+                return
+            try:
+                router_id = urllib.parse.unquote(path.split("/")[3])
+                payload = self.read_payload(max_bytes=16384)
+                with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                    row, result = unified_router_edit(conn, router_id, payload)
+                self.send_json(200, {"ok": True, "router": row_to_router(row), "xray": result})
+            except (ValueError, RuntimeError, sqlite3.Error):
+                self.send_json(409, {"ok": False, "error": "Router Xray edit failed"})
             return
         if path.startswith("/api/router/") and path.endswith("/xray/sync"):
             if not self.require_owner(json_mode=True):
                 return
             router_id = urllib.parse.unquote(path.split("/")[3])
+            if unified_xray_enabled():
+                if not self.unified_xray_csrf():
+                    return
+                try:
+                    with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                        _, result = unified_router_edit(conn, router_id, {})
+                    self.send_json(200, {"ok": True, "router_id": router_id, "xray": result})
+                except (ValueError, RuntimeError, sqlite3.Error):
+                    self.send_json(409, {"ok": False, "error": "Router Xray sync failed"})
+                return
             if DOCKER_RUNTIME and os.environ.get("OWRT_REMOTE_XRAY_CONTROL_BACKEND") != "host_adapter":
                 self.send_json(503, {"ok": False, "error": "Host Xray adapter не включён"})
                 return
@@ -20073,6 +21185,24 @@ exit 127
             router_id = urllib.parse.unquote(path.split("/")[3])
             if not self.require_owner(json_mode=True):
                 return
+            if unified_xray_enabled():
+                if not self.unified_xray_csrf():
+                    return
+                try:
+                    with _XRAY_RELOAD_LOCK, self.app.conn() as conn:
+                        conn.execute("begin immediate")
+                        reconcile_unified_xray(conn)
+                        row = get_active_router(conn, router_id)
+                        if row:
+                            ts = now_ts()
+                            conn.execute("update routers set deleted_at=?, updated_at=? where id=?",
+                                         (ts, ts, router_id))
+                            conn.execute("delete from router_logs where router_id=?", (router_id,))
+                            commit_unified_router(conn, router_id, None)
+                    self.send_json(200, {"ok": True, "deleted": bool(row)})
+                except (ValueError, RuntimeError, sqlite3.Error):
+                    self.send_json(409, {"ok": False, "error": "Router Xray deletion failed"})
+                return
             deleted = False
             xray_result = None
             warnings = []
@@ -20123,19 +21253,17 @@ exit 127
             self.request_origin(),
             self.headers.get("Host", ""),
         )
-        if asset == "config":
-            self.send_text(
-                200,
-                make_openwrt_config(
-                    row,
-                    hub_url,
-                    vps_host_override=config_vps_host,
-                    public_url_override=hub_update.get("public_url", ""),
-                ),
-            )
-            return
-        if asset == "xray-client.json":
-            self.send_json(200, make_router_xray_config(row))
+        try:
+            if asset == "config":
+                self.send_text(200, make_openwrt_config(
+                    row, hub_url, vps_host_override=config_vps_host,
+                    public_url_override=hub_update.get("public_url", "")))
+                return
+            if asset == "xray-client.json":
+                self.send_json(200, make_router_xray_config(row))
+                return
+        except RuntimeError:
+            self.send_text(503, "Xray adapter unavailable")
             return
         self.send_text(404, "not found")
 
@@ -20153,7 +21281,7 @@ exit 127
         if not row:
             self.send_text(404, "router not found")
             return
-        port = int(row["entry_port"] or 0)
+        port = router_channel_port(row)
         if port <= 0:
             self.send_text(400, "router has no entry_port")
             return
@@ -20617,6 +21745,8 @@ def cmd_set_login(args):
 
 
 def cmd_add_router(args):
+    if unified_xray_enabled():
+        raise SystemExit("Use the authenticated HUB API for unified Xray enrollment")
     with connect(args.db) as conn:
         init_db(conn)
         row = upsert_router(
@@ -20650,6 +21780,8 @@ def cmd_add_router(args):
 
 def cmd_set_router_transport(args):
     """Staged TCP -> WSS migration, preserving UUIDs and reverse endpoints."""
+    if unified_xray_enabled():
+        raise SystemExit("Transport migration is disabled for unified Xray control")
     if not args.sync_xray:
         raise SystemExit("Transport migration requires --sync-xray; database-only changes are unsafe.")
     if sum(bool(v) for v in (args.stage, args.finalize, args.direct)) > 1:
@@ -20711,6 +21843,8 @@ def cmd_set_router_transport(args):
 
 
 def cmd_set_entry_port(args):
+    if unified_xray_enabled():
+        raise SystemExit("Use the authenticated HUB API for unified Xray enrollment")
     router_id = clean_router_id(args.id)
     with connect(args.db) as conn:
         init_db(conn)

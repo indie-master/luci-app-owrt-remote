@@ -1,0 +1,161 @@
+name: Router Orchestrator unified Docker checks
+
+on:
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'deploy/**'
+      - 'vps/**'
+      - 'tests/**'
+      - 'files/usr/lib/owrt-remote/logs.sh'
+      - 'files/usr/sbin/owrt-remote'
+      - '.github/workflows/transport-profiles.yml'
+  push:
+    branches:
+      - 'feature/router-orchestrator-unified-docker-transports-20261123'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax check production modules
+        run: |
+          python -m py_compile vps/owrt-remote-hub.py docker/host_adapter.py docker/transport_profiles.py docker/transport_canary.py docker/xray_lifecycle.py docker/xray_releases.py docker/core_job_runner.py deploy/prepare_belt.py deploy/apply_belt.py deploy/refresh_belt_candidate.py docker/xray_watchdog.py docker/transport_stage.py docker/transport_stage_job.py docker/cleanup.py
+          python -m py_compile tests/test_transport_profiles.py
+      - name: Pure transport tests
+        run: |
+          python -m unittest discover -s tests -p 'test_transport_profiles.py' -v
+          python -m unittest discover -s tests -p 'test_secure_ingress.py' -v
+          python -m unittest discover -s tests -p 'test_secure_certificate_inventory.py' -v
+          python -m unittest discover -s tests -p 'test_secure_certificate_import.py' -v
+          python -m unittest discover -s tests -p 'test_secure_reverse_probe.py' -v
+          python -m unittest discover -s tests -p 'test_secure_reverse_target.py' -v
+          python -m py_compile tools/rehearse_secure_reverse.py
+          python -m unittest discover -s tests -p 'test_secure_profile_catalog.py' -v
+          python -m unittest discover -s tests -p 'test_secure_profile_store.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_transaction.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_commit.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_lock.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_worker.py' -v
+          python -m unittest discover -s tests -p 'test_secure_publication_job.py' -v
+          python -m unittest discover -s tests -p 'test_active_upgrade_prepare.py' -v
+          python -m unittest discover -s tests -p 'test_active_upgrade_apply.py' -v
+          python -m unittest discover -s tests -p 'test_active_upgrade_fleet.py' -v
+          python -m py_compile deploy/active_upgrade_fleet.py
+          python -m py_compile deploy/apply_active_upgrade.py
+          python -m py_compile deploy/prepare_active_upgrade.py docker/secure_publication_job.py
+          python -m py_compile docker/secure_publication_worker.py docker/secure_live_probe.py
+          python -m unittest discover -s tests -p 'test_secure_nginx_preflight.py' -v
+          python -m unittest discover -s tests -p 'test_secure_ingress_inventory.py' -v
+          python -m unittest discover -s tests -p 'test_secure_ingress_audit.py' -v
+          python -m unittest discover -s tests -p 'test_external_ingress_bootstrap.py' -v
+          python -m unittest discover -s tests -p 'test_transport_canary.py' -v
+          python -m unittest discover -s tests -p 'test_transport_stage_recovery.py' -v
+          python -m unittest discover -s tests -p 'test_openwrt_transport_pilot.py' -v
+          python -m unittest discover -s tests -p 'test_ssh_command_quoting.py' -v
+          python -m unittest discover -s tests -p 'test_web_ui_javascript.py' -v
+          python -m unittest discover -s tests -p 'test_xray_core_manager.py' -v
+      - name: Validate guarded client preparation
+        run: |
+          sh -n tools/router_bundle_guard.sh
+          python -m py_compile tools/router_fleet_prepare.py
+          python -m unittest discover -s tests -p 'test_router_bundle_guard.py' -v
+          python -m unittest discover -s tests -p 'test_router_fleet_prepare.py' -v
+          sh -n tools/router_client_transaction.sh
+          python -m unittest discover -s tests -p 'test_router_client_transaction.py' -v
+          sh -n tools/router_client_boot_trial.sh
+          python -m unittest discover -s tests -p 'test_router_client_boot_trial.py' -v
+      - name: Global Logs persistence and delivery regression
+        run: |
+          python -m unittest discover -s tests -p 'test_global_logs.py' -v
+          python -m unittest discover -s tests -p 'test_router_log_transport.py' -v
+      - name: Validate OpenWrt transport client POSIX shell
+        run: |
+          sh -n files/usr/sbin/owrt-remote
+          grep -Fq 'transport-preflight)' files/usr/sbin/owrt-remote
+          grep -Fq 'vps_transport" in tcp|tcp-tls|ws|reality-tcp|xhttp|grpc|reality-xhttp|reality-grpc)' files/usr/sbin/owrt-remote
+      - name: Validate systemd worker and watchdog units
+        run: |
+          systemd-analyze verify deploy/systemd/router-orchestrator-host-adapter.service deploy/systemd/router-orchestrator-core-job@.service deploy/systemd/router-orchestrator-xray-watchdog.service deploy/systemd/router-orchestrator-xray-watchdog.timer deploy/systemd/router-orchestrator-transport-expiry.service deploy/systemd/router-orchestrator-transport-expiry.timer deploy/systemd/router-orchestrator-transport-stage@.service deploy/systemd/router-orchestrator-transport-rollback.service deploy/systemd/router-orchestrator-publication-recovery.service deploy/systemd/router-orchestrator-publication-recovery.timer deploy/systemd/router-orchestrator-publication-job.service
+      - name: Validate embedded nginx configuration
+        run: |
+          docker run --rm -v "$PWD/deploy/nginx/embedded.conf:/etc/nginx/nginx.conf:ro" nginx:1.29-alpine nginx -t
+      - name: Validate embedded TLS stream nginx syntax
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout privkey.pem -out fullchain.pem -days 1 -nodes -subj '/CN=router.example.org' >/dev/null 2>&1
+          mkdir -p /tmp/ro-test-tls
+          # The hardened nginx master has no DAC override capability.
+          # Model deployment with a root-owned private key, not a runner-owned key.
+          sudo install -o root -g root -m 0644 fullchain.pem /tmp/ro-test-tls/fullchain.pem
+          sudo install -o root -g root -m 0600 privkey.pem /tmp/ro-test-tls/privkey.pem
+          docker run --rm -v "$PWD/deploy/nginx/embedded-stream-tls.conf:/etc/nginx/nginx.conf:ro" -v "/tmp/ro-test-tls:/etc/router-orchestrator/tls:ro" nginx:1.29-alpine nginx -t
+      - name: Validate consolidated Compose
+        env:
+          RO_HUB_IMAGE: router-orchestrator-hub:test
+          RO_XRAY_IMAGE: router-orchestrator-xray:26.3.27-test
+          RO_PUBLIC_URL: https://router.example.org
+          RO_STATE_DIR: /tmp/router-orchestrator-state
+          RO_TERMINAL_KEY_PATH: /tmp/router-orchestrator-key
+          RO_TERMINAL_KNOWN_HOSTS: /tmp/router-orchestrator-known
+          RO_NGINX_CONF: /tmp/router-orchestrator-nginx.conf
+          RO_TLS_DIR: /tmp/router-orchestrator-tls
+        run: |
+          docker compose -f deploy/docker-compose.yml config --quiet
+          test "$(docker compose -f deploy/docker-compose.yml config --services | sort | tr '\n' ' ')" = "hub nginx xray "
+      - name: Smoke test real nginx Compose runtime
+        env:
+          RO_HUB_IMAGE: router-orchestrator-hub:test
+          RO_XRAY_IMAGE: router-orchestrator-xray:test
+          RO_PUBLIC_URL: https://router.example.org
+          RO_STATE_DIR: /tmp/router-orchestrator-state
+          RO_TERMINAL_KEY_PATH: /tmp/router-orchestrator-key
+          RO_TERMINAL_KNOWN_HOSTS: /tmp/router-orchestrator-known
+          RO_TLS_DIR: /tmp/ro-test-tls
+        run: |
+          set -euo pipefail
+          override=$(mktemp)
+          printf 'services:\n  nginx:\n    network_mode: none\n' > "$override"
+          cleanup() { docker rm -f router-orchestrator-nginx >/dev/null 2>&1 || true; rm -f "$override"; }
+          trap cleanup EXIT
+          for profile in embedded embedded-stream-tls standalone; do
+            export RO_NGINX_CONF="$PWD/deploy/nginx/$profile.conf"
+            docker compose -f deploy/docker-compose.yml -f "$override" up -d --no-deps nginx
+            ready=0
+            for attempt in $(seq 1 30); do
+              if docker exec router-orchestrator-nginx wget -q -T 2 -O /dev/null http://127.0.0.1:18089/healthz; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" != 1 ]; then
+              docker logs router-orchestrator-nginx
+              exit 1
+            fi
+            if [ "$profile" != embedded ]; then
+              port=443
+              [ "$profile" != embedded-stream-tls ] || port=18445
+              # A TLS response, including upstream 502, proves the TLS worker accepted the request.
+              docker exec router-orchestrator-nginx wget --no-check-certificate -S -T 3 -O /dev/null "https://127.0.0.1:$port/" > /tmp/ro-nginx-tls-response 2>&1 || true
+              grep -Eq 'HTTP/1\.[01] (200|502)' /tmp/ro-nginx-tls-response
+            fi
+            echo "NGINX RUNTIME PASS: $profile"
+            docker rm -f router-orchestrator-nginx
+          done
+      - name: Build portable HUB image
+        run: |
+          SHA=$(sha256sum vps/owrt-remote-hub.py | awk '{print $1}')
+          docker build --file docker/hub/Dockerfile --build-arg HUB_SOURCE_SHA256="$SHA" -t router-orchestrator-hub:ci .
+      - name: Validate WoL helper in image
+        run: |
+          test "$(docker run --rm --entrypoint /opt/owrt-remote/bin/askpass.sh -e OWRT_REMOTE_SSH_PASSWORD=TEST_TOKEN_ONLY router-orchestrator-hub:ci)" = TEST_TOKEN_ONLY

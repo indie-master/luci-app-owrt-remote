@@ -104,6 +104,16 @@ printf '%s\n' "$stamp" >"$STAMP_FILE"
 	sleep 2
 	[ "$(cat "$STAMP_FILE" 2>/dev/null)" = "$stamp" ] || exit 0
 
+	# The supervised startup already retries while WAN/DNS is coming up.
+	# Do not kill it (or start a competing bootstrap) during cold boot.
+	boot_age="$(awk 'NR==1 {print int($1)}' /proc/uptime 2>/dev/null)"
+	case "$boot_age" in ''|*[!0-9]*) ;; *)
+		if [ "$boot_age" -lt 180 ]; then
+			log "WAN event $ACTION: startup recovery owns first 180s; restart skipped"
+			exit 0
+		fi ;;
+	esac
+
 	if [ "$direct_wan" = 1 ]; then
 		# Heartbeat prepares the selected uplink and reconnects Xray only if its
 		# binding changed. A restored primary must not interrupt a healthy backup.
